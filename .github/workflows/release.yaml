@@ -218,7 +218,10 @@ jobs:
         for wheel in wheels:
             archive = zipfile.ZipFile(wheel)
             files = archive.namelist()
-            licenses = sorted(f.split("/licenses/", 1)[1] for f in files if "/licenses/" in f)
+            # auditwheel and delocate also write a directory entry for licenses/
+            # itself, which names no file.
+            licenses = sorted(f.split("/licenses/", 1)[1] for f in files
+                              if "/licenses/" in f and not f.endswith("/"))
             metadata = archive.read(next(f for f in files if f.endswith(".dist-info/METADATA"))).decode()
             declared = sorted(line.split(": ", 1)[1] for line in metadata.splitlines() if line.startswith("License-File: "))
             assert licenses == declared, (wheel.name, licenses, declared)
