@@ -1,0 +1,154 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    branches:
+      - 'master'
+  schedule:
+    - cron: '0 0 * * 1'
+  # Any branch, on demand: the ThreadSanitizer job below, or a pull request
+  # that did not trigger a run.
+  workflow_dispatch:
+
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+# A push to a pull request supersedes the run before it. Every other event
+# gets a group of its own, so each master commit keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  Test:
+    runs-on: ubuntu-latest
+    # A cold Arrow build takes about 45 minutes and a warm run about 17. The
+    # default is six hours, which a hung test would otherwise spend.
+    timeout-minutes: 90
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      # Every uv sync and uv run refuses an out-of-date uv.lock instead of
+      # updating it, so CI lints and tests with the versions the lock pins.
+      UV_LOCKED: "1"
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+    - name: Install build tools
+      run: sudo apt-get update && sudo apt-get install -y bison pkg-config g++-14
+    - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      with:
+        # The uv that wrote uv.lock.
+        version: "0.13.6"
+        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
+        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
+    # The install tree is the only thing worth caching: every build directory
+    # (Python module and C++ tests) links against this one copy. It is saved
+    # right after the build so a failing test never throws the build away.
+    - name: Restore the static Arrow build
+      id: arrow-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/fast-feature-transform/vcpkg_installed
+        key: vcpkg-installed-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'triplets/*.cmake') }}
+    - name: Build static Arrow
+      run: make vcpkg
+    - name: Save the static Arrow build
+      if: steps.arrow-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/fast-feature-transform/vcpkg_installed
+        key: ${{ steps.arrow-cache.outputs.cache-primary-key }}
+    - name: Test
+      timeout-minutes: 30
+      run: |
+        uv sync
+        make python-lint
+        make audit
+        make python-test
+        make cpp-lint
+        make cpp-test
+    - name: Native sanitizers
+      timeout-minutes: 30
+      run: make cpp-sanitize
+
+  # requires-python admits both builds of CPython 3.14, and the standard one,
+  # with a GIL, is what python.org, Homebrew and Linux distributions install.
+  # The job above builds the free-threaded extension .python-version names;
+  # this one runs the Python suite against the other build, the only place a
+  # test that the bindings release the GIL can fail.
+  Standard-CPython:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      UV_LOCKED: "1"
+      # "+gil" never matches a free-threaded interpreter, but uv 0.13 cannot
+      # download for it, so the Test step below installs the standard build.
+      UV_PYTHON: "3.14+gil"
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+    - name: Install build tools
+      run: sudo apt-get update && sudo apt-get install -y bison pkg-config g++-14
+    - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      with:
+        version: "0.13.6"
+        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
+        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
+    - name: Restore the static Arrow build
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/fast-feature-transform/vcpkg_installed
+        key: vcpkg-installed-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'triplets/*.cmake') }}
+    - name: Build static Arrow
+      run: make vcpkg
+    - name: Test
+      timeout-minutes: 30
+      run: |
+        uv python install 3.14
+        uv sync
+        uv run python -c "import sys; assert sys._is_gil_enabled(), 'expected the standard build, got free-threaded'"
+        make python-test
+
+  # ThreadSanitizer cannot share a build with AddressSanitizer, so it gets a
+  # job of its own, which runs on the weekly schedule and on demand rather
+  # than on every pull request.
+  Thread-sanitizer:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      UV_LOCKED: "1"
+      # The native suite needs cmake and ninja from the dev group, not the
+      # Python extension, so nothing below may build or install the project.
+      UV_NO_SYNC: "1"
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+    - name: Install build tools
+      run: sudo apt-get update && sudo apt-get install -y bison pkg-config g++-14
+    - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+      with:
+        version: "0.13.6"
+        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
+        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
+    - name: Restore the static Arrow build
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/fast-feature-transform/vcpkg_installed
+        key: vcpkg-installed-v2-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'triplets/*.cmake') }}
+    - name: Build static Arrow
+      run: make vcpkg
+    - name: ThreadSanitizer
+      timeout-minutes: 30
+      run: |
+        uv sync --no-install-project
+        make cpp-tsan

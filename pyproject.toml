@@ -1,0 +1,227 @@
+[build-system]
+requires = ["scikit-build-core>=1.0", "nanobind>=2.15,<3", "setuptools-scm>=8"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fast-feature-transform"
+dynamic = ["version", "readme"]
+description = "Feature preprocessing for machine learning, written in C++ with a Python API"
+requires-python = ">=3.14"
+# The project's own code is MIT. The wheels also contain the libraries that THIRD_PARTY_NOTICES.txt lists, linked
+# statically, and code adapted from scipy, so the expression names their licenses too.
+license = "MIT AND Apache-2.0 AND BSD-3-Clause AND BSD-2-Clause AND Zlib AND bzip2-1.0.6 AND BSD-Attribution-HPND-disclaimer AND BSL-1.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
+authors = [{ name = "Max Lei" }]
+keywords = ["feature engineering", "preprocessing", "machine learning", "category_encoders", "scikit-learn", "parquet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# The extension carries its own private static Arrow (vcpkg); no runtime deps.
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/mxlei01/fast-feature-transform"
+Issues = "https://github.com/mxlei01/fast-feature-transform/issues"
+Changelog = "https://github.com/mxlei01/fast-feature-transform/blob/master/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    { include-group = "wheel-tests" },
+    "bandit>=1.7.9",
+    "clang-format==23.1.0",
+    "cmake>=3.28",
+    "ninja>=1.11",
+    "pytest-cov>=5.0.0",
+    "scikit-build-core>=1.0",
+    "ty>=0.0.75",
+]
+# What the test suite needs, which release.yaml also installs to test each
+# wheel: make release-requirements exports it from uv.lock with its hashes.
+wheel-tests = [
+    "hypothesis>=6.100",
+    "nanobind>=2.15,<3",
+    "numpy",
+    "pyarrow>=22.0.0",
+    "pytest>=9.1",
+    "ruff~=0.16.4",
+    "scikit-learn>=1.9",
+]
+
+[tool.scikit-build]
+minimum-version = "1.0"
+# scikit-build-core 1.1 passes Python_FIND_ABI for free-threaded builds, which
+# CMake's Python discovery mishandles before 4.1.2. An older CMake on PATH (the
+# CI runner ships 3.31.6) is then passed over for a wheel from PyPI.
+cmake.version = ">=4.1.2"
+ninja.version = ">=1.11"
+ninja.make-fallback = false
+build-dir = "build/{wheel_tag}"
+
+[[tool.dynamic-metadata]]
+field = "version"
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+# After the version, which it reads: PyPI shows the README without the repository's files, so its relative links
+# and images become absolute ones at the release tag.
+[[tool.dynamic-metadata]]
+field = "readme"
+provider = "scikit_build_core.metadata.fancy_pypi_readme"
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+# PyPI shows the README without its Development section, which is about working on the repository.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+end-before = "## Development"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+start-at = "## License"
+
+# Markdown images become the raw file; this runs before the link rule, which would match them too.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(!\[[^\]]*\])\((?!https?://)([^)\s]+)\)'
+replacement = '\1(https://raw.githubusercontent.com/mxlei01/fast-feature-transform/v$HFPR_VERSION/\2)'
+
+# The icon's <img src>.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(<img\b[^>]*?\bsrc=")(?!https?://)([^"]+)"'
+replacement = '\1https://raw.githubusercontent.com/mxlei01/fast-feature-transform/v$HFPR_VERSION/\2"'
+
+# A link to a README section goes to the README on GitHub, since PyPI leaves the Development section out.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(#([^)\s]+)\)'
+replacement = '](https://github.com/mxlei01/fast-feature-transform/blob/v$HFPR_VERSION/README.md#\1)'
+
+# Every other relative link becomes the page on GitHub.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|#|mailto:)([^)\s]+)\)'
+replacement = '](https://github.com/mxlei01/fast-feature-transform/blob/v$HFPR_VERSION/\1)'
+
+[tool.uv]
+# The extension builds in an isolated environment that uv.lock does not pin,
+# so its requirements would otherwise resolve afresh on every build, and a new
+# release of one could reach CI unannounced. uv records these in uv.lock. To
+# move one, change it here and run uv lock.
+build-constraint-dependencies = [
+    "cmake==4.4.2",
+    "hatch-fancy-pypi-readme==25.1.0",
+    "hatchling==1.32.4",
+    "nanobind==2.15.0",
+    "ninja==1.13.0",
+    "scikit-build-core==1.1.0",
+    "setuptools-scm==10.3.4",
+    "vcs-versioning==2.5.0",
+]
+# uv rebuilds a path project only when one of these changes; without the
+# source globs, editing the C++ leaves a stale extension installed.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "CMakeLists.txt" },
+    { file = "vcpkg.json" },
+    { file = "triplets/*.cmake" },
+    { file = "src/**/*" },
+    { git = { commit = true, tags = true } },
+]
+
+[tool.pytest.ini_options]
+addopts = "-rf --strict-config --strict-markers"
+testpaths = ["test"]
+# A warning fails the run: with the dev tools locked, a new deprecation from
+# pyarrow, numpy or scikit-learn appears when the lock is upgraded, which is
+# when to act on it.
+filterwarnings = ["error"]
+markers = [
+    "scale: large out-of-core test; skipped unless --run-scale is passed",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+extend-select = ["D", "C90", "I", "PT"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+# benchmark/measure.py and benchmark/line_profile.py are imported by the
+# benchmark scripts beside them, which run with their own directory on
+# sys.path; without this those imports sort in with the third-party ones.
+known-first-party = ["fast_feature_transform", "label_encoder", "line_profile", "measure"]
+
+[tool.ruff.lint.per-file-ignores]
+"test/**" = ["D100", "D103"]
+"fast_feature_transform/_core.pyi" = ["D"]
+
+[tool.bandit]
+# B101: assert narrows types; B301/B403: pickle support is a designed feature
+# (delegates to the JSON artifact manifest; we only load our own data).
+skips = ["B101", "B301", "B403"]
+exclude_dirs = [".venv", "build", "vcpkg", "vcpkg_installed"]
+
+[tool.setuptools_scm]
+# Version comes from git tags: v0.0.1 -> 0.0.1, commits past a tag ->
+# 0.0.2.devN+g<sha>; 0.0.0 only when no git metadata is available at all.
+fallback_version = "0.0.0"
+
+[tool.ty.src]
+# scripts/ runs under `uv run --isolated` with its own dependencies (see
+# `make parity-fixtures`), which this environment deliberately does not have.
+exclude = ["scripts"]
+
+# The release wheels (.github/workflows/release.yaml): CPython 3.14, standard and
+# free-threaded, on Linux x86_64 and arm64 and macOS arm64, and nothing else.
+[tool.cibuildwheel]
+build = ["cp314-manylinux_*", "cp314t-manylinux_*", "cp314-macosx_arm64", "cp314t-macosx_arm64"]
+# pypa/build installs the build requirements under these constraints: the pins of
+# [tool.uv] build-constraint-dependencies and everything they need, each with its
+# hashes (make release-requirements writes the file). Applying a constraint's
+# hashes to an unpinned requirement takes pip 26.1 or later; cibuildwheel 4.3.5's
+# manylinux images and virtualenv bring 26.2.2, and an older pip fails the build.
+build-frontend = { name = "build", args = ["--dependency-constraints-txt", ".github/requirements/build-constraints.txt"] }
+# cibuildwheel installs the tools it runs under these constraints, each with its
+# hashes, instead of its own pins, which have none: virtualenv, and on macOS also
+# pip, build and delocate. A hashed file hides the pip pin from cibuildwheel, so
+# on macOS it seeds virtualenv's bundled pip and then upgrades it from here.
+dependency-versions = ".github/requirements/cibuildwheel-tools.txt"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+# The wheel-tests dependency group at uv.lock's versions, each with the lock's
+# hashes, which test-requires cannot carry (make release-requirements exports
+# the file).
+before-test = "pip install --require-hashes --only-binary :all: -r {project}/.github/requirements/wheel-tests.txt"
+# The first command fails a free-threaded wheel whose import turns the GIL back
+# on; the second runs the suite against the installed wheel.
+test-command = [
+    'python -W error::RuntimeWarning -c "import fast_feature_transform"',
+    "pytest -p no:cacheprovider {project}/test",
+]
+
+[tool.cibuildwheel.linux]
+# AlmaLinux 8 lacks some of what vcpkg needs; perl brings the core modules
+# OpenSSL's build uses (vcpkg still builds it for Arrow and Thrift).
+before-all = "dnf install -y bison flex zip pkgconf-pkg-config perl && make vcpkg"
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+before-all = "make vcpkg"
+# The minimum the wheels support, which std::from_chars for doubles requires.
+environment = { MACOSX_DEPLOYMENT_TARGET = "26.0" }

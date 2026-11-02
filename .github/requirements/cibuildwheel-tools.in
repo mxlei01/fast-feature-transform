@@ -1,0 +1,6 @@
+# The tools cibuildwheel installs for itself, at the versions cibuildwheel 4.3.5
+# pins in its constraints-python314.txt. Change them with cibuildwheel.in.
+build[virtualenv]==1.6.1
+delocate==0.13.0
+pip==26.2.2
+virtualenv==21.15.0

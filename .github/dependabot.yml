@@ -1,0 +1,14 @@
+# Dependabot proposes updates to the actions the workflows pin, in one pull
+# request a week. Each update waits until its release is three days old, so a
+# compromised release has time to be found and pulled first.
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: weekly
+  cooldown:
+    default-days: 3
+  groups:
+    actions:
+      patterns: ["*"]

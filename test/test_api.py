@@ -1,0 +1,346 @@
+"""Tests for the Python API surface: validation, nesting rules, pickling, and ergonomics."""
+
+import copy
+import json
+import pickle
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import fast_feature_transform
+from fast_feature_transform import EngineError, LabelEncoder, Pipeline, Select, Transformer
+
+# LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
+MOB_INDEX: int = 2
+
+
+@pytest.fixture
+def train_files(tmp_path: Path) -> list[str]:
+    """Write one Parquet file with two row groups.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+
+    Returns:
+        Paths of the written Parquet files.
+
+    """
+    table: pa.Table = pa.table(
+        {"device": ["mob", "desk", "mob", "tab"], "source": ["a", "b", "a", "a"], "price": [1.0, 2.0, 3.0, 4.0]}
+    )
+    path: Path = tmp_path / "train.parquet"
+    pq.write_table(table, path, row_group_size=2)
+    return [str(path)]
+
+
+def _nested() -> Pipeline:
+    return Pipeline(
+        [
+            ("features", Pipeline([("select", Select(columns=["device", "source"]))])),
+            ("encode", LabelEncoder(columns=["device", "source"])),
+        ]
+    )
+
+
+def test_package_exports_the_public_api() -> None:
+    assert fast_feature_transform.__all__ == [
+        "BackwardDifferenceEncoder",
+        "BaseNEncoder",
+        "Binarizer",
+        "BinaryEncoder",
+        "Cast",
+        "CatBoostEncoder",
+        "CountEncoder",
+        "EngineError",
+        "GrayEncoder",
+        "GroupAgg",
+        "HashingEncoder",
+        "HelmertEncoder",
+        "JamesSteinEncoder",
+        "KBinsDiscretizer",
+        "LabelEncoder",
+        "LeaveOneOutEncoder",
+        "MEstimateEncoder",
+        "MaxAbsScaler",
+        "MinMaxScaler",
+        "Normalizer",
+        "OneHotEncoder",
+        "OrdinalEncoder",
+        "Pipeline",
+        "PolynomialEncoder",
+        "PolynomialFeatures",
+        "PowerTransformer",
+        "QuantileEncoder",
+        "QuantileTransformer",
+        "RankHotEncoder",
+        "RobustScaler",
+        "Select",
+        "SplineTransformer",
+        "StandardScaler",
+        "SumEncoder",
+        "SummaryEncoder",
+        "TargetEncoder",
+        "Transformer",
+        "WOEEncoder",
+        "__version__",
+        "parquet_to_memmap",
+    ]
+    assert issubclass(Select, Transformer)
+    assert issubclass(EngineError, RuntimeError)
+    assert fast_feature_transform.__version__
+
+
+def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str]) -> None:
+    outer: Pipeline = _nested().fit(train_files)
+    features = outer["features"]
+    assert isinstance(features, Pipeline)
+    with pytest.raises(RuntimeError, match="'features' is a step of a larger pipeline; call this on the root pipeline"):
+        features.transform_dict({"device": "mob", "source": "a", "price": 1.0})
+    with pytest.raises(RuntimeError, match="call this on the root pipeline"):
+        features.transform_parquet(train_files)
+    assert outer.transform_dict({"device": "mob", "source": "a", "price": 1.0}) == {"device": MOB_INDEX, "source": 1}
+
+
+def test_stages_json_lists_every_step_in_execution_order(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    assert json.loads(pipeline.stages_json()) == [
+        {"stage": "features.select", "kernel": "select", "params": {"columns": ["device", "source"]}},
+        {"stage": "encode", "kernel": "label_encode", "params": {"columns": ["device", "source"], "min_count": 1}},
+    ]
+
+
+def test_stages_state_maps_every_stage_to_what_it_learned_in_order(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    states: dict[str, Any] = json.loads(pipeline.stages_state())
+    assert list(states) == ["features.select", "encode"]
+    assert states["features.select"] == {}
+    encoder = pipeline["encode"]
+    assert isinstance(encoder, LabelEncoder)
+    assert states["encode"]["label_maps"] == encoder.label_maps_
+    assert states["encode"]["label_maps"]["device"] == {"desk": 1, "mob": MOB_INDEX, "tab": 3}
+    # Each value is exactly the state the artifact stores for that stage.
+    manifest: dict[str, Any] = json.loads(pipeline._require_handle().manifest_json())
+    assert states == {op["stage"]: op["state"] for op in manifest["ops"]}
+
+
+def test_stages_json_and_stages_state_survive_save_load_and_pickle(train_files: list[str], tmp_path: Path) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    pipeline.save(tmp_path / "artifact")
+    loaded: Pipeline = Pipeline.load(tmp_path / "artifact")
+    assert loaded.stages_json() == pipeline.stages_json()
+    assert loaded.stages_state() == pipeline.stages_state()
+    # Each method is the first call on its own unpickled copy, since an
+    # unpickled pipeline loads its artifact on first use.
+    payload: bytes = pickle.dumps(pipeline)
+    for method in ("stages_json", "stages_state"):
+        restored: Pipeline = pickle.loads(payload)
+        assert restored._handle is None
+        assert getattr(restored, method)() == getattr(pipeline, method)()
+
+
+def test_stages_json_and_stages_state_refuse_unfitted_and_nested_pipelines(train_files: list[str]) -> None:
+    with pytest.raises(RuntimeError, match="not fitted"):
+        _nested().stages_json()
+    with pytest.raises(RuntimeError, match="not fitted"):
+        _nested().stages_state()
+    features = _nested().fit(train_files)["features"]
+    assert isinstance(features, Pipeline)
+    with pytest.raises(RuntimeError, match="call this on the root pipeline"):
+        features.stages_json()
+    with pytest.raises(RuntimeError, match="call this on the root pipeline"):
+        features.stages_state()
+
+
+def test_transform_parquet_rejects_a_bare_path_and_non_paths(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit(train_files)
+    bare_path: Any = Path(train_files[0])
+    records: Any = [{"device": "mob"}]
+    for target in (pipeline, encoder):
+        with pytest.raises(TypeError, match="wrap it in a list"):
+            target.transform_parquet(bare_path)
+        with pytest.raises(TypeError, match="element"):
+            target.transform_parquet(records)
+    with pytest.raises(TypeError, match="wrap it in a list"):
+        pipeline.fit(bare_path)
+
+
+def test_constructor_arguments_are_validated() -> None:
+    bare_string: Any = "device"
+    numbers: Any = [1, 2]
+    text_count: Any = "2"
+    a_class: Any = Select
+    not_a_pair: Any = [Select(columns=["a"])]
+    with pytest.raises(TypeError, match="not a single string"):
+        Select(columns=bare_string)
+    with pytest.raises(ValueError, match="at least one column"):
+        Select(columns=[])
+    with pytest.raises(TypeError, match="list of column names"):
+        LabelEncoder(columns=numbers)
+    with pytest.raises(TypeError, match="min_count must be an integer"):
+        LabelEncoder(min_count=text_count)
+    with pytest.raises(ValueError, match="min_count must be >= 1"):
+        LabelEncoder(min_count=0)
+    # REGRESSION: the kernels read an integer argument as an int64, and 2**63
+    # used to reach them, where it was read wrapped or refused only at fit.
+    with pytest.raises(ValueError, match=r"LabelEncoder: min_count must be an integer from -2\*\*63 to 2\*\*63 - 1"):
+        LabelEncoder(min_count=2**63)
+    with pytest.raises(TypeError, match="must be a Transformer or Pipeline instance"):
+        Pipeline([("s", a_class)])
+    with pytest.raises(TypeError, match="pair"):
+        Pipeline(not_a_pair)
+
+
+def test_threads_are_validated_and_accepted_everywhere(train_files: list[str], tmp_path: Path) -> None:
+    for threads in (-1, 2**32):
+        with pytest.raises(ValueError, match=r"threads must be an integer from 0 to 4294967295 \(0 uses all cores\)"):
+            _nested().fit(train_files, threads=threads)
+    encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit(train_files, threads=1)
+    assert encoder.label_maps_["device"]["mob"] == MOB_INDEX
+    pipeline: Pipeline = _nested().fit(train_files, threads=2)
+    pipeline.save(tmp_path / "artifact")
+    for threads in (-1, 2**32):
+        with pytest.raises(ValueError, match="threads must be an integer from 0 to 4294967295"):
+            Pipeline.load(tmp_path / "artifact", threads=threads)
+        with pytest.raises(ValueError, match="threads must be an integer from 0 to 4294967295"):
+            fast_feature_transform.parquet_to_memmap(train_files, threads=threads)
+    assert Pipeline.load(tmp_path / "artifact", threads=1).transform_dict({"device": "tab", "source": "b"}) == {
+        "device": 3,
+        "source": 2,
+    }
+
+
+def test_fit_refuses_a_temp_dir_that_does_not_exist(train_files: list[str], tmp_path: Path) -> None:
+    """A temp_dir that does not exist is refused before the fit starts.
+
+    REGRESSION: the engine opens temp_dir only when the fit first spills, so a
+    typo used to pass on small data and fail on data big enough to spill.
+    """
+    with pytest.raises(ValueError, match="temp_dir must be an existing directory"):
+        _nested().fit(train_files, temp_dir=tmp_path / "missing")
+    assert _nested().fit(train_files, temp_dir=tmp_path).transform_dict({"device": "tab", "source": "b"})
+
+
+def test_pipeline_indexing_length_and_repr(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested()
+    assert len(pipeline) == 2
+    assert pipeline[0] is pipeline["features"]
+    assert pipeline[-1] is pipeline["encode"]
+    with pytest.raises(KeyError):
+        pipeline["nope"]
+    with pytest.raises(IndexError):
+        pipeline[5]
+    assert repr(Select(columns=["a"])) == "Select(columns=['a'])"
+    assert repr(LabelEncoder()) == "LabelEncoder(columns=None, min_count=1)"
+    assert repr(pipeline).startswith("Pipeline(steps=[('features', Pipeline(steps=[('select', Select(")
+
+
+def test_nested_pipeline_pickle_stores_the_manifest_once(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    payload: bytes = pickle.dumps(pipeline)
+    assert payload.count(b'"schema_version"') == 1
+    restored: Pipeline = pickle.loads(payload)
+    assert restored.transform_dict({"device": "mob", "source": "a"}) == {"device": MOB_INDEX, "source": 1}
+    encoder = restored["encode"]
+    assert isinstance(encoder, LabelEncoder)
+    assert encoder.label_maps_["device"]["mob"] == MOB_INDEX
+    # The nested pipeline restored inside the root shares the root's handle.
+    features = restored["features"]
+    assert isinstance(features, Pipeline)
+    assert features._handle is restored._handle
+
+
+def test_ownership_is_known_without_parsing_the_manifest(train_files: list[str]) -> None:
+    standalone: LabelEncoder = LabelEncoder(columns=["device"]).fit(train_files)
+    assert standalone._standalone is True
+    bound = _nested().fit(train_files)["encode"]
+    assert isinstance(bound, LabelEncoder)
+    assert bound._standalone is False
+    restored: LabelEncoder = pickle.loads(pickle.dumps(standalone))
+    assert restored._standalone is True
+    assert restored.transform_dict({"device": "mob"}) == {"device": MOB_INDEX}
+
+
+def test_generator_steps_are_materialized_before_validation() -> None:
+    pipeline: Pipeline = Pipeline((name, Select(columns=["a"])) for name in ("s", "t"))
+    assert len(pipeline) == 2
+    assert [name for name, _ in pipeline.steps] == ["s", "t"]
+
+
+def test_unpickled_root_binds_on_any_public_path(train_files: list[str]) -> None:
+    restored: Pipeline = pickle.loads(pickle.dumps(_nested().fit(train_files)))
+    encoder = restored.steps[1][1]  # the public attribute, not __getitem__
+    assert isinstance(encoder, LabelEncoder)
+    assert encoder.label_maps_["device"]["mob"] == MOB_INDEX
+    features = restored.steps[0][1]
+    assert isinstance(features, Pipeline)
+    assert features._handle is restored._handle
+
+
+def test_unpickled_root_binds_safely_under_concurrent_first_use(train_files: list[str]) -> None:
+    payload: bytes = pickle.dumps(_nested().fit(train_files))
+    record: dict[str, object] = {"device": "mob", "source": "a"}
+    for _ in range(20):
+        restored: Pipeline = pickle.loads(payload)
+
+        def probe(index: int, restored: Pipeline = restored) -> object:
+            if index % 2 == 0:
+                return restored.transform_dict(record)["device"]
+            encoder = restored["encode"]
+            assert isinstance(encoder, LabelEncoder)
+            return encoder.vocab_size("device")
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(probe, range(16)))
+        assert results == [MOB_INDEX, 4] * 8
+        features = restored["features"]
+        assert isinstance(features, Pipeline)
+        assert features._handle is restored._handle
+
+
+def test_pickle_after_refit_serializes_the_current_fit(train_files: list[str], tmp_path: Path) -> None:
+    outer: Pipeline = _nested().fit(train_files)
+    inner = outer["features"]
+    assert isinstance(inner, Pipeline)
+    pickle.dumps((inner, outer))  # pickles the nested pipeline before the root
+    other: Path = tmp_path / "other.parquet"
+    pq.write_table(pa.table({"device": ["zzz", "desk"], "source": ["a", "b"]}), other)
+    outer.fit([str(other)])
+    restored: Pipeline = pickle.loads(pickle.dumps(inner))
+    assert isinstance(restored["select"], Select)  # binds the view to its artifact
+    handle = restored._handle
+    assert handle is not None
+    assert json.loads(handle.manifest_json())["ops"][1]["state"]["label_maps"]["device"] == {"desk": 1, "zzz": 2}
+
+
+def test_shallow_copy_shares_the_handle_and_leaves_the_original_bound(train_files: list[str]) -> None:
+    pipeline: Pipeline = _nested().fit(train_files)
+    clone: Pipeline = copy.copy(pipeline)
+    assert clone.transform_dict({"device": "mob", "source": "a"}) == {"device": MOB_INDEX, "source": 1}
+    assert clone._handle is pipeline._handle
+    encoder = pipeline["encode"]
+    assert isinstance(encoder, LabelEncoder)
+    assert encoder._handle is pipeline._handle
+
+
+def test_numpy_integers_are_accepted_for_counts_and_threads(train_files: list[str]) -> None:
+    count: Any = np.int64(2)
+    threads: Any = np.int32(1)
+    encoder: LabelEncoder = LabelEncoder(columns=["device"], min_count=count).fit(train_files, threads=threads)
+    assert encoder.min_count == 2
+    assert encoder.label_maps_["device"] == {"mob": 1}
+
+
+def test_fitted_state_is_read_once_per_binding(train_files: list[str]) -> None:
+    encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit(train_files)
+    first = encoder.label_maps_
+    assert encoder.label_maps_ is first
+    assert encoder.vocab_size("device") == len(first["device"]) + 1
+    encoder.fit(train_files)  # a new binding invalidates the cached view
+    assert encoder.label_maps_ is not first
+    assert encoder.label_maps_ == first

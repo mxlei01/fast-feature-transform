@@ -1,0 +1,14 @@
+{
+  "name": "fast-feature-transform",
+  "builtin-baseline": "61d7eaeb094a6acbc23d9c2e54de9208175fda47",
+  "dependencies": [
+    {
+      "name": "arrow",
+      "default-features": false,
+      "features": ["parquet"]
+    }
+  ],
+  "vcpkg-configuration": {
+    "overlay-triplets": ["triplets"]
+  }
+}

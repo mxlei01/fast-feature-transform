@@ -1,0 +1,22 @@
+# ThreadSanitizer suppressions for `make cpp-tsan`.
+#
+# Arrow and Parquet are prebuilt without instrumentation, so ThreadSanitizer
+# cannot see the synchronization inside them: the guard that makes a
+# function-local static thread-safe, and the atomic compare-and-swap that
+# publishes a cached fingerprint, both run in code it does not observe, while
+# the std::string and std::shared_ptr code touching the same memory comes from
+# our instrumented objects. Arrow documents its types as immutable and safe to
+# share across threads. Each entry names one such mechanism inside Arrow;
+# none matches our own functions, so a race between two accesses in our own
+# code is still reported.
+
+# Type and field fingerprints, computed lazily and published atomically.
+race:arrow::detail::Fingerprintable
+race:ComputeFingerprint
+
+# Function-local statics initialized on first use by whichever worker gets
+# there first: Arrow's type singletons (arrow::binary()::result and its
+# siblings) and Parquet's writer-version constants.
+race:arrow::*()::result
+race:arrow::TypeTraits
+race:parquet::ApplicationVersion

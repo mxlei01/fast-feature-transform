@@ -1,0 +1,7947 @@
+{
+  "category_encoders": "2.10.0",
+  "datasets": {
+    "plain": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ]
+    },
+    "nulls": {
+      "color": [
+        "amber",
+        "amber",
+        null,
+        "blue",
+        null,
+        "cyan"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        null,
+        "l",
+        "m"
+      ]
+    },
+    "rare": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "rare-null": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        null
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "rare-nulls": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "cyan",
+        null,
+        null,
+        null
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "ratio-edge": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        "cyan",
+        "cyan",
+        "cyan",
+        "cyan",
+        "cyan",
+        "cyan"
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "ratio-edge-null": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "group-sum": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        null,
+        null
+      ],
+      "size": [
+        "l",
+        "l",
+        "l",
+        "l",
+        "l",
+        "m",
+        "m",
+        "m",
+        "m",
+        "m"
+      ]
+    },
+    "unseen": {
+      "color": [
+        "amber",
+        "zulu",
+        "blue",
+        null
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ]
+    },
+    "shuffled": {
+      "color": [
+        "echo",
+        "cyan",
+        "amber",
+        "delta",
+        "blue",
+        "echo",
+        "cyan"
+      ],
+      "size": [
+        "s",
+        "m",
+        "l",
+        "s",
+        "m",
+        "l",
+        "s"
+      ]
+    },
+    "single": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "amber"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ]
+    },
+    "hashed": {
+      "color": [
+        "amber",
+        "blue",
+        "cyan",
+        "delta",
+        "echo",
+        "amber",
+        "zulu",
+        ""
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ]
+    },
+    "blend": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1,
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1
+      ]
+    },
+    "blend-float": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        2.5,
+        -1.25,
+        0.5,
+        3.0,
+        1.75,
+        -0.5,
+        0.25,
+        4.0
+      ]
+    },
+    "blend-binary-float": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ]
+    },
+    "blend-nulls": {
+      "color": [
+        "amber",
+        "amber",
+        null,
+        "blue",
+        null,
+        "cyan",
+        "blue",
+        null
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1,
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        1
+      ]
+    },
+    "blend-unseen": {
+      "color": [
+        "amber",
+        "zulu",
+        "blue",
+        null
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ],
+      "y": [
+        1,
+        0,
+        1,
+        0
+      ]
+    },
+    "blend-ids": {
+      "color": [
+        "amber",
+        "blue",
+        "cyan",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ],
+      "y": [
+        1,
+        0,
+        1,
+        1
+      ]
+    },
+    "labelled": {
+      "color": [
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1.0,
+        3.0,
+        2.0,
+        8.0,
+        4.0,
+        5.0,
+        0.0,
+        6.0
+      ]
+    },
+    "labelled-nulls": {
+      "color": [
+        "amber",
+        "amber",
+        null,
+        "blue",
+        "blue",
+        null,
+        "cyan",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1.0,
+        3.0,
+        2.0,
+        8.0,
+        4.0,
+        5.0,
+        0.0,
+        6.0
+      ]
+    },
+    "labelled-binary": {
+      "color": [
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1,
+        0,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0
+      ]
+    },
+    "labelled-unseen": {
+      "color": [
+        "amber",
+        "zulu",
+        "blue",
+        null
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ],
+      "y": [
+        1.0,
+        2.0,
+        3.0,
+        4.0
+      ]
+    },
+    "target_plain": {
+      "color": [
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m"
+      ],
+      "y": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0
+      ]
+    },
+    "target_spread": {
+      "color": [
+        "amber",
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "blue",
+        "cyan",
+        "delta",
+        "delta"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s",
+        "l"
+      ],
+      "y": [
+        2.0,
+        9.0,
+        4.0,
+        1.0,
+        8.0,
+        3.0,
+        6.0,
+        5.0,
+        7.0,
+        0.5
+      ]
+    },
+    "target_nulls": {
+      "color": [
+        "amber",
+        "amber",
+        null,
+        "blue",
+        null,
+        "cyan"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s"
+      ],
+      "y": [
+        1.5,
+        2.5,
+        3.5,
+        4.5,
+        5.5,
+        6.5
+      ]
+    },
+    "target_unseen": {
+      "color": [
+        "amber",
+        "zulu",
+        "blue",
+        null
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l"
+      ],
+      "y": [
+        1.0,
+        2.0,
+        3.0,
+        4.0
+      ]
+    },
+    "target_integer": {
+      "color": [
+        "amber",
+        "amber",
+        "blue",
+        "blue",
+        "blue",
+        "cyan"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s",
+        "l",
+        "m",
+        "s"
+      ],
+      "y": [
+        10,
+        20,
+        30,
+        40,
+        50,
+        60
+      ]
+    },
+    "colliding-names": {
+      "a": [
+        "b_c",
+        "d",
+        "b_c"
+      ],
+      "a_b": [
+        "c",
+        "e",
+        "c"
+      ]
+    },
+    "colliding-names-unsorted": {
+      "z_b": [
+        "c",
+        "c",
+        "q",
+        "q"
+      ],
+      "z": [
+        "b_c",
+        "w",
+        "b_c",
+        "w"
+      ]
+    },
+    "late-nulls": {
+      "color": [
+        "amber",
+        null,
+        "blue"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s"
+      ]
+    },
+    "labelled-late-nulls": {
+      "color": [
+        "amber",
+        null,
+        "blue"
+      ],
+      "size": [
+        "l",
+        "m",
+        "s"
+      ],
+      "y": [
+        1.0,
+        2.0,
+        3.0
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "count/plain",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          3,
+          3,
+          3,
+          2,
+          2,
+          1,
+          2,
+          2
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/two-columns",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          3,
+          3,
+          3,
+          2,
+          2,
+          1,
+          2,
+          2
+        ],
+        "size": [
+          3,
+          3,
+          2,
+          3,
+          3,
+          2,
+          3,
+          3
+        ]
+      }
+    },
+    {
+      "name": "count/normalize",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "normalize": true
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          0.375,
+          0.375,
+          0.375,
+          0.25,
+          0.25,
+          0.125,
+          0.25,
+          0.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/nulls",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color": [
+          2,
+          2,
+          2,
+          1,
+          2,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/nulls-return-nan",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color": [
+          2.0,
+          2.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/unseen",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          3.0,
+          0.0,
+          2.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "count/unseen-fill",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": -1
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          3.0,
+          -1.0,
+          2.0,
+          -1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "count/unseen-return-nan",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          3.0,
+          null,
+          2.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "count/normalize-unseen-fill",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "normalize": true,
+        "handle_unknown": 7
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          0.375,
+          7.0,
+          0.25,
+          7.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "count/missing-error-at-transform",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "transform": "late-nulls",
+      "raises": true,
+      "raised": "Columns to be encoded cannot contain null"
+    },
+    {
+      "name": "count/min-group-size",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 3
+      },
+      "fit": "rare",
+      "expected": {
+        "color": [
+          6,
+          6,
+          6,
+          6,
+          6,
+          6,
+          4,
+          4,
+          4,
+          4
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-name",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 3,
+        "min_group_name": "other"
+      },
+      "fit": "rare",
+      "expected": {
+        "color": [
+          6,
+          6,
+          6,
+          6,
+          6,
+          6,
+          4,
+          4,
+          4,
+          4
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-null",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2
+      },
+      "fit": "rare-null",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          3,
+          3,
+          3,
+          2,
+          2
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-null-apart",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2,
+        "combine_min_nan_groups": false
+      },
+      "fit": "rare-null",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          3,
+          3,
+          3,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-null-forced",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2,
+        "combine_min_nan_groups": "force"
+      },
+      "fit": "rare-null",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          3,
+          3,
+          3,
+          2,
+          2
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-common-null",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2
+      },
+      "fit": "rare-nulls",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          2,
+          2,
+          3,
+          3,
+          3
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-common-null-apart",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2,
+        "combine_min_nan_groups": false
+      },
+      "fit": "rare-nulls",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          2,
+          2,
+          3,
+          3,
+          3
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/min-group-common-null-forced",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "min_group_size": 2,
+        "combine_min_nan_groups": "force"
+      },
+      "fit": "rare-nulls",
+      "expected": {
+        "color": [
+          4,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          5
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/normalize-min-group-ratio",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "normalize": true,
+        "min_group_size": 0.07
+      },
+      "fit": "ratio-edge",
+      "expected": {
+        "color": [
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/normalize-min-group-ratio-null",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "normalize": true,
+        "min_group_size": 0.07
+      },
+      "fit": "ratio-edge-null",
+      "expected": {
+        "color": [
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.86,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07,
+          0.07
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "count/normalize-min-group-sum",
+      "encoder": "CountEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "normalize": true,
+        "min_group_size": 3
+      },
+      "fit": "group-sum",
+      "tolerance": 1e-15,
+      "expected": {
+        "color": [
+          0.7,
+          0.7,
+          0.7,
+          0.7,
+          0.7,
+          0.7,
+          0.7,
+          0.30000000000000004,
+          0.30000000000000004,
+          0.30000000000000004
+        ],
+        "size": [
+          "l",
+          "l",
+          "l",
+          "l",
+          "l",
+          "m",
+          "m",
+          "m",
+          "m",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/plain",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          1,
+          1,
+          1,
+          2,
+          2,
+          3,
+          4,
+          4
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/nulls",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color": [
+          1,
+          1,
+          4,
+          2,
+          4,
+          3
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/index-start-0",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "index_start": 0
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          2,
+          3,
+          3
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/unseen",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          1.0,
+          -1.0,
+          2.0,
+          -2.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/unseen-return-nan",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color": [
+          1.0,
+          null,
+          2.0,
+          -2.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "ordinal/missing-error-at-transform",
+      "encoder": "OrdinalEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "transform": "late-nulls",
+      "raises": true,
+      "raised": "Columns to be encoded cannot contain null"
+    },
+    {
+      "name": "one-hot/plain",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_1": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/colliding-names",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "a",
+          "a_b"
+        ],
+        "use_cat_names": true
+      },
+      "fit": "colliding-names",
+      "expected": {
+        "a_b_c": [
+          1,
+          0,
+          1
+        ],
+        "a_d": [
+          0,
+          1,
+          0
+        ],
+        "a_b_c#": [
+          1,
+          0,
+          1
+        ],
+        "a_b_e": [
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "one-hot/colliding-names-derived",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": null,
+        "use_cat_names": true
+      },
+      "fit": "colliding-names-unsorted",
+      "expected": {
+        "z_b_c": [
+          1,
+          1,
+          0,
+          0
+        ],
+        "z_b_q": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "z_b_c#": [
+          1,
+          0,
+          1,
+          0
+        ],
+        "z_w": [
+          0,
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "one-hot/cat-names",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "use_cat_names": true
+      },
+      "fit": "plain",
+      "expected": {
+        "color_amber": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_blue": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color_cyan": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_delta": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/nulls",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_1": [
+          1,
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "color_4": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/unseen",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/indicator",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_-1": [
+          0,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/unseen-return-nan",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "color_2": [
+          0.0,
+          null,
+          1.0,
+          0.0
+        ],
+        "color_3": [
+          0.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "color_4": [
+          0.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/missing-return-nan",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          1.0,
+          null
+        ],
+        "color_3": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_4": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "one-hot/nulls-return-nan",
+      "encoder": "OneHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_1": [
+          1.0,
+          1.0,
+          null,
+          0.0,
+          null,
+          0.0
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          null,
+          1.0,
+          null,
+          0.0
+        ],
+        "color_3": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/plain",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_1": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/cat-names",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "use_cat_names": true
+      },
+      "fit": "plain",
+      "expected": {
+        "color_amber": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_blue": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_cyan": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1
+        ],
+        "color_delta": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/unseen",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/nulls",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_1": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_3": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          1
+        ],
+        "color_4": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/unseen-return-nan",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1.0,
+          null,
+          1.0,
+          null
+        ],
+        "color_2": [
+          0.0,
+          null,
+          1.0,
+          null
+        ],
+        "color_3": [
+          0.0,
+          null,
+          0.0,
+          null
+        ],
+        "color_4": [
+          0.0,
+          null,
+          0.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/missing-return-nan",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_1": [
+          1.0,
+          0.0,
+          1.0,
+          null
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          1.0,
+          null
+        ],
+        "color_3": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_4": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_-2": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/nulls-return-nan",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_1": [
+          1.0,
+          1.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_3": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          1.0
+        ],
+        "color_-2": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/cat-names-return-nan",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan",
+        "use_cat_names": true
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_amber": [
+          1.0,
+          1.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_blue": [
+          0.0,
+          0.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_cyan": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          1.0
+        ],
+        "color_nan": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "rank-hot/missing-error",
+      "encoder": "RankHotEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "expected": {
+        "color_1": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "backward-difference/plain",
+      "encoder": "BackwardDifferenceEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          -0.75,
+          -0.75,
+          -0.75,
+          0.25,
+          0.25,
+          0.25,
+          0.25,
+          0.25
+        ],
+        "color_1": [
+          -0.5,
+          -0.5,
+          -0.5,
+          -0.5,
+          -0.5,
+          0.5,
+          0.5,
+          0.5
+        ],
+        "color_2": [
+          -0.25,
+          -0.25,
+          -0.25,
+          -0.25,
+          -0.25,
+          -0.25,
+          0.75,
+          0.75
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "backward-difference/nulls",
+      "encoder": "BackwardDifferenceEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          -0.75,
+          -0.75,
+          0.25,
+          0.25,
+          0.25,
+          0.25
+        ],
+        "color_1": [
+          -0.5,
+          -0.5,
+          0.5,
+          -0.5,
+          0.5,
+          0.5
+        ],
+        "color_2": [
+          -0.25,
+          -0.25,
+          0.75,
+          -0.25,
+          0.75,
+          -0.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "backward-difference/unseen",
+      "encoder": "BackwardDifferenceEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          -0.75,
+          0.0,
+          0.25,
+          0.0
+        ],
+        "color_1": [
+          -0.5,
+          0.0,
+          -0.5,
+          0.0
+        ],
+        "color_2": [
+          -0.25,
+          0.0,
+          -0.25,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "backward-difference/nulls-return-nan",
+      "encoder": "BackwardDifferenceEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          -0.75,
+          -0.75,
+          null,
+          0.25,
+          null,
+          0.25
+        ],
+        "color_1": [
+          -0.5,
+          -0.5,
+          null,
+          -0.5,
+          null,
+          0.5
+        ],
+        "color_2": [
+          -0.25,
+          -0.25,
+          null,
+          -0.25,
+          null,
+          -0.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "backward-difference/missing-error",
+      "encoder": "BackwardDifferenceEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          -0.8,
+          -0.8,
+          -0.8,
+          0.2,
+          0.2,
+          0.2,
+          0.2,
+          0.2
+        ],
+        "color_1": [
+          -0.6,
+          -0.6,
+          -0.6,
+          -0.6,
+          -0.6,
+          0.4,
+          0.4,
+          0.4
+        ],
+        "color_2": [
+          -0.4,
+          -0.4,
+          -0.4,
+          -0.4,
+          -0.4,
+          -0.4,
+          0.6,
+          0.6
+        ],
+        "color_3": [
+          -0.2,
+          -0.2,
+          -0.2,
+          -0.2,
+          -0.2,
+          -0.2,
+          -0.2,
+          -0.2
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "helmert/plain",
+      "encoder": "HelmertEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          -1.0,
+          -1.0,
+          -1.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          2.0,
+          0.0,
+          0.0
+        ],
+        "color_2": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          3.0,
+          3.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "helmert/two-columns",
+      "encoder": "HelmertEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          -1.0,
+          -1.0,
+          -1.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          2.0,
+          0.0,
+          0.0
+        ],
+        "color_2": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          3.0,
+          3.0
+        ],
+        "size_0": [
+          -1.0,
+          1.0,
+          0.0,
+          -1.0,
+          1.0,
+          0.0,
+          -1.0,
+          1.0
+        ],
+        "size_1": [
+          -1.0,
+          -1.0,
+          2.0,
+          -1.0,
+          -1.0,
+          2.0,
+          -1.0,
+          -1.0
+        ]
+      }
+    },
+    {
+      "name": "helmert/unseen",
+      "encoder": "HelmertEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          -1.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        "color_1": [
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "color_2": [
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "helmert/indicator",
+      "encoder": "HelmertEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          -1.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        "color_1": [
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "color_2": [
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "color_3": [
+          -1.0,
+          4.0,
+          -1.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "sum/plain",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          1.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          -1.0,
+          -1.0
+        ],
+        "color_1": [
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          -1.0,
+          -1.0
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          -1.0,
+          -1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "sum/nulls",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          1.0,
+          1.0,
+          -1.0,
+          0.0,
+          -1.0,
+          0.0
+        ],
+        "color_1": [
+          0.0,
+          0.0,
+          -1.0,
+          1.0,
+          -1.0,
+          0.0
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          -1.0,
+          0.0,
+          -1.0,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "sum/unseen-return-nan",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          1.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          0.0,
+          null,
+          1.0,
+          0.0
+        ],
+        "color_2": [
+          0.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "sum/missing-return-nan",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          1.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_1": [
+          0.0,
+          0.0,
+          1.0,
+          null
+        ],
+        "color_2": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "color_3": [
+          0.0,
+          0.0,
+          0.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "sum/indicator-return-nan",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan",
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          1.0,
+          -1.0,
+          0.0,
+          null
+        ],
+        "color_1": [
+          0.0,
+          -1.0,
+          1.0,
+          null
+        ],
+        "color_2": [
+          0.0,
+          -1.0,
+          0.0,
+          null
+        ],
+        "color_3": [
+          0.0,
+          -1.0,
+          0.0,
+          null
+        ],
+        "color_4": [
+          0.0,
+          -1.0,
+          0.0,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "sum/single-level",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "single",
+      "expected": {
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "sum/single-level-return-nan",
+      "encoder": "SumEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "single",
+      "expected": {
+        "color_0": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "helmert/missing-error",
+      "encoder": "HelmertEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          -1.0,
+          -1.0,
+          -1.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          2.0,
+          0.0,
+          0.0
+        ],
+        "color_2": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          3.0,
+          3.0
+        ],
+        "color_3": [
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "polynomial/plain",
+      "encoder": "PolynomialEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "tolerance": 1e-12,
+      "expected": {
+        "color_0": [
+          -0.6708203932499369,
+          -0.6708203932499369,
+          -0.6708203932499369,
+          -0.22360679774997896,
+          -0.22360679774997896,
+          0.22360679774997902,
+          0.670820393249937,
+          0.670820393249937
+        ],
+        "color_1": [
+          0.5,
+          0.5,
+          0.5,
+          -0.5000000000000001,
+          -0.5000000000000001,
+          -0.5,
+          0.5,
+          0.5
+        ],
+        "color_2": [
+          -0.223606797749979,
+          -0.223606797749979,
+          -0.223606797749979,
+          0.6708203932499368,
+          0.6708203932499368,
+          -0.6708203932499369,
+          0.2236067977499791,
+          0.2236067977499791
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "polynomial/nulls",
+      "encoder": "PolynomialEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "tolerance": 1e-12,
+      "expected": {
+        "color_0": [
+          -0.6708203932499369,
+          -0.6708203932499369,
+          0.670820393249937,
+          -0.22360679774997896,
+          0.670820393249937,
+          0.22360679774997902
+        ],
+        "color_1": [
+          0.5,
+          0.5,
+          0.5,
+          -0.5000000000000001,
+          0.5,
+          -0.5
+        ],
+        "color_2": [
+          -0.223606797749979,
+          -0.223606797749979,
+          0.2236067977499791,
+          0.6708203932499368,
+          0.2236067977499791,
+          -0.6708203932499369
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "polynomial/two-columns",
+      "encoder": "PolynomialEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "fit": "plain",
+      "tolerance": 1e-12,
+      "expected": {
+        "color_0": [
+          -0.6708203932499369,
+          -0.6708203932499369,
+          -0.6708203932499369,
+          -0.22360679774997896,
+          -0.22360679774997896,
+          0.22360679774997902,
+          0.670820393249937,
+          0.670820393249937
+        ],
+        "color_1": [
+          0.5,
+          0.5,
+          0.5,
+          -0.5000000000000001,
+          -0.5000000000000001,
+          -0.5,
+          0.5,
+          0.5
+        ],
+        "color_2": [
+          -0.223606797749979,
+          -0.223606797749979,
+          -0.223606797749979,
+          0.6708203932499368,
+          0.6708203932499368,
+          -0.6708203932499369,
+          0.2236067977499791,
+          0.2236067977499791
+        ],
+        "size_0": [
+          -0.7071067811865476,
+          -1.6940279406976732e-17,
+          0.7071067811865476,
+          -0.7071067811865476,
+          -1.6940279406976732e-17,
+          0.7071067811865476,
+          -0.7071067811865476,
+          -1.6940279406976732e-17
+        ],
+        "size_1": [
+          0.4082482904638631,
+          -0.816496580927726,
+          0.408248290463863,
+          0.4082482904638631,
+          -0.816496580927726,
+          0.408248290463863,
+          0.4082482904638631,
+          -0.816496580927726
+        ]
+      }
+    },
+    {
+      "name": "polynomial/indicator",
+      "encoder": "PolynomialEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "tolerance": 1e-12,
+      "expected": {
+        "color_0": [
+          -0.6324555320336759,
+          0.632455532033676,
+          -0.31622776601683783,
+          0.0
+        ],
+        "color_1": [
+          0.5345224838248487,
+          0.5345224838248488,
+          -0.2672612419124244,
+          0.0
+        ],
+        "color_2": [
+          -0.3162277660168379,
+          0.31622776601683783,
+          0.632455532033676,
+          0.0
+        ],
+        "color_3": [
+          0.11952286093343933,
+          0.11952286093343943,
+          -0.4780914437337574,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "polynomial/missing-return-nan",
+      "encoder": "PolynomialEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "tolerance": 1e-12,
+      "expected": {
+        "color_0": [
+          -0.6324555320336759,
+          0.0,
+          -0.31622776601683783,
+          null
+        ],
+        "color_1": [
+          0.5345224838248487,
+          0.0,
+          -0.2672612419124244,
+          null
+        ],
+        "color_2": [
+          -0.3162277660168379,
+          0.0,
+          0.632455532033676,
+          null
+        ],
+        "color_3": [
+          0.11952286093343933,
+          0.0,
+          -0.4780914437337574,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "hash/plain",
+      "encoder": "HashingEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "col_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_1": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_2": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "col_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_5": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_6": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_7": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "hash/two-columns",
+      "encoder": "HashingEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "n_components": 4
+      },
+      "fit": "plain",
+      "expected": {
+        "col_0": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "col_1": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_2": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_3": [
+          1,
+          1,
+          0,
+          2,
+          2,
+          1,
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "name": "hash/wide",
+      "encoder": "HashingEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "n_components": 16
+      },
+      "fit": "hashed",
+      "expected": {
+        "col_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_1": [
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0
+        ],
+        "col_2": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "col_3": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_5": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0
+        ],
+        "col_6": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_7": [
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_8": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_9": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_10": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_11": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_12": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_13": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_14": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "col_15": [
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "hash/single-bucket",
+      "encoder": "HashingEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "n_components": 1
+      },
+      "fit": "hashed",
+      "expected": {
+        "col_0": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "hash/unseen",
+      "encoder": "HashingEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "n_components": 6
+      },
+      "fit": "plain",
+      "transform": "hashed",
+      "expected": {
+        "col_0": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          1
+        ],
+        "col_1": [
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0
+        ],
+        "col_2": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_3": [
+          0,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          0
+        ],
+        "col_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "col_5": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/default",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6314360527118139,
+          0.6314360527118139,
+          0.6314360527118139,
+          0.607268616887439,
+          0.607268616887439,
+          0.5436822035231264,
+          0.6781941493376829,
+          0.6781941493376829
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/tuned",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "min_samples_leaf": 2,
+        "smoothing": 1.5
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6525315153652425,
+          0.6525315153652425,
+          0.6525315153652425,
+          0.5625,
+          0.5625,
+          0.4129727304786357,
+          0.8125,
+          0.8125
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/two-columns",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y",
+        "min_samples_leaf": 2,
+        "smoothing": 1.0
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6554607741095835,
+          0.6554607741095835,
+          0.6554607741095835,
+          0.5625,
+          0.5625,
+          0.45691161164375305,
+          0.8125,
+          0.8125
+        ],
+        "size": [
+          0.8991469669862518,
+          0.4117745812329152,
+          0.5625,
+          0.8991469669862518,
+          0.4117745812329152,
+          0.5625,
+          0.8991469669862518,
+          0.4117745812329152
+        ]
+      }
+    },
+    {
+      "name": "target/float-target",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "min_samples_leaf": 2,
+        "smoothing": 1.0
+      },
+      "fit": "blend-float",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.7710320336644758,
+          0.7710320336644758,
+          0.7710320336644758,
+          1.828125,
+          1.828125,
+          0.8021980931846961,
+          1.703125,
+          1.703125
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/nulls",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "min_samples_leaf": 2,
+        "smoothing": 1.0
+      },
+      "fit": "blend-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.5625,
+          0.5625,
+          0.6554607741095835,
+          0.8125,
+          0.6554607741095835,
+          0.45691161164375305,
+          0.8125,
+          0.6554607741095835
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/nulls-return-nan",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "return_nan"
+      },
+      "fit": "blend-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.607268616887439,
+          0.607268616887439,
+          null,
+          0.6781941493376829,
+          null,
+          0.5436822035231264,
+          0.6781941493376829,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "target/unseen",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "min_samples_leaf": 2,
+        "smoothing": 1.0
+      },
+      "fit": "blend",
+      "transform": "blend-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6554607741095835,
+          0.625,
+          0.5625,
+          0.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "target/unseen-return-nan",
+      "encoder": "TargetEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_unknown": "return_nan"
+      },
+      "fit": "blend",
+      "transform": "blend-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6314360527118139,
+          null,
+          0.607268616887439,
+          0.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/default",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.65625,
+          0.65625,
+          0.65625,
+          0.5416666666666666,
+          0.5416666666666666,
+          0.3125,
+          0.875,
+          0.875
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/m-large",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y",
+        "m": 12.5
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6330645161290323,
+          0.6330645161290323,
+          0.6330645161290323,
+          0.6077586206896551,
+          0.6077586206896551,
+          0.5787037037037037,
+          0.6767241379310345,
+          0.6767241379310345
+        ],
+        "size": [
+          0.6975806451612904,
+          0.5685483870967742,
+          0.6077586206896551,
+          0.6975806451612904,
+          0.5685483870967742,
+          0.6077586206896551,
+          0.6975806451612904,
+          0.5685483870967742
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/m-zero",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "m": 0.0
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.6666666666666666,
+          0.6666666666666666,
+          0.6666666666666666,
+          0.5,
+          0.5,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/float-target",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "m": 3.0
+      },
+      "fit": "blend-float",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.9322916666666666,
+          0.9322916666666666,
+          0.9322916666666666,
+          1.71875,
+          1.71875,
+          0.8359375,
+          1.61875,
+          1.61875
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/nulls",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.5416666666666666,
+          0.5416666666666666,
+          0.65625,
+          0.875,
+          0.65625,
+          0.3125,
+          0.875,
+          0.65625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/unseen",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend",
+      "transform": "blend-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.65625,
+          0.625,
+          0.5416666666666666,
+          0.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "m-estimate/id-like",
+      "encoder": "MEstimateEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend-ids",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.75,
+          0.75,
+          0.75,
+          0.75
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "woe/default",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.06899287148695142,
+          0.06899287148695142,
+          0.06899287148695142,
+          -0.33647223662121306,
+          -0.33647223662121306,
+          0.0,
+          0.7621400520468967,
+          0.7621400520468967
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "woe/regularization",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y",
+        "regularization": 0.25
+      },
+      "fit": "blend",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.13580154115906182,
+          0.13580154115906182,
+          0.13580154115906182,
+          -0.45198512374305727,
+          -0.45198512374305727,
+          0.0,
+          1.7452394535931621,
+          1.7452394535931621
+        ],
+        "size": [
+          2.1129642337184795,
+          -1.0397717886451765,
+          -0.45198512374305727,
+          2.1129642337184795,
+          -1.0397717886451765,
+          -0.45198512374305727,
+          2.1129642337184795,
+          -1.0397717886451765
+        ]
+      }
+    },
+    {
+      "name": "woe/float-target",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend-binary-float",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.06899287148695142,
+          0.06899287148695142,
+          0.06899287148695142,
+          -0.33647223662121306,
+          -0.33647223662121306,
+          0.0,
+          0.7621400520468967,
+          0.7621400520468967
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "woe/nulls",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          -0.33647223662121306,
+          -0.33647223662121306,
+          0.06899287148695142,
+          0.7621400520468967,
+          0.06899287148695142,
+          0.0,
+          0.7621400520468967,
+          0.06899287148695142
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "woe/nulls-return-nan",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "return_nan"
+      },
+      "fit": "blend-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          -0.33647223662121306,
+          -0.33647223662121306,
+          null,
+          0.7621400520468967,
+          null,
+          0.0,
+          0.7621400520468967,
+          null
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "woe/unseen",
+      "encoder": "WOEEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "blend",
+      "transform": "blend-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.06899287148695142,
+          0.0,
+          -0.33647223662121306,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/independent",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1187214611872145,
+          2.1187214611872145,
+          4.469760900140647,
+          4.469760900140647,
+          4.469760900140647,
+          5.0,
+          3.1492537313432836,
+          3.1492537313432836
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/pooled",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "model": "pooled"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.963728323699422,
+          2.963728323699422,
+          4.0488921001926785,
+          4.0488921001926785,
+          4.0488921001926785,
+          4.184537572254335,
+          3.370664739884393,
+          3.370664739884393
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/beta",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "model": "beta"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          3.3000000000000003,
+          3.3000000000000003,
+          3.909090909090909,
+          3.909090909090909,
+          3.909090909090909,
+          3.7777777777777777,
+          3.5000000000000004,
+          3.5000000000000004
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/two-columns",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1187214611872145,
+          2.1187214611872145,
+          4.469760900140647,
+          4.469760900140647,
+          4.469760900140647,
+          5.0,
+          3.1492537313432836,
+          3.1492537313432836
+        ],
+        "size": [
+          3.0,
+          4.333333333333333,
+          3.5,
+          3.0,
+          4.333333333333333,
+          3.5,
+          3.0,
+          4.333333333333333
+        ]
+      }
+    },
+    {
+      "name": "james-stein/integer-target",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-binary",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.5,
+          0.5,
+          0.6367521367521367,
+          0.6367521367521367,
+          0.6367521367521367,
+          1.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/nulls",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1780821917808217,
+          2.1780821917808217,
+          3.5241935483870965,
+          5.371900826446281,
+          5.371900826446281,
+          3.5241935483870965,
+          0.0,
+          6.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/nulls-return-nan",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "return_nan"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1780821917808217,
+          2.1780821917808217,
+          null,
+          5.371900826446281,
+          5.371900826446281,
+          null,
+          0.0,
+          6.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/unseen",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1187214611872145,
+          3.625,
+          4.469760900140647,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/unseen-return-nan",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_unknown": "return_nan"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.1187214611872145,
+          null,
+          4.469760900140647,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/plain",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.0,
+          2.0,
+          4.666666666666667,
+          4.666666666666667,
+          4.666666666666667,
+          3.625,
+          3.0,
+          3.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/integer-target",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-binary",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.5,
+          0.5,
+          0.6666666666666666,
+          0.6666666666666666,
+          0.6666666666666666,
+          0.5,
+          0.0,
+          0.0
+        ],
+        "size": [
+          0.6666666666666666,
+          0.0,
+          1.0,
+          0.6666666666666666,
+          0.0,
+          1.0,
+          0.6666666666666666,
+          0.0
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/nulls",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.0,
+          2.0,
+          3.5,
+          6.0,
+          6.0,
+          3.5,
+          3.625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/nulls-return-nan",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "return_nan"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.0,
+          2.0,
+          null,
+          6.0,
+          6.0,
+          null,
+          3.625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/unseen",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.0,
+          3.625,
+          4.666666666666667,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "leave-one-out/unseen-return-nan",
+      "encoder": "LeaveOneOutEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_unknown": "return_nan"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.0,
+          null,
+          4.666666666666667,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/plain",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.5416666666666665,
+          2.5416666666666665,
+          4.40625,
+          4.40625,
+          4.40625,
+          3.625,
+          3.2083333333333335,
+          3.2083333333333335
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/smoothing",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "a": 2.5
+      },
+      "fit": "labelled",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.9027777777777777,
+          2.9027777777777777,
+          4.193181818181818,
+          4.193181818181818,
+          4.193181818181818,
+          3.625,
+          3.3472222222222223,
+          3.3472222222222223
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/integer-target",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-binary",
+      "target": "y",
+      "expected": {
+        "color": [
+          0.5,
+          0.5,
+          0.625,
+          0.625,
+          0.625,
+          0.5,
+          0.16666666666666666,
+          0.16666666666666666
+        ],
+        "size": [
+          0.625,
+          0.125,
+          0.8333333333333334,
+          0.625,
+          0.125,
+          0.8333333333333334,
+          0.625,
+          0.125
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/nulls",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.5416666666666665,
+          2.5416666666666665,
+          3.5416666666666665,
+          5.208333333333333,
+          5.208333333333333,
+          3.5416666666666665,
+          3.625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/nulls-return-nan",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "return_nan"
+      },
+      "fit": "labelled-nulls",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.5416666666666665,
+          2.5416666666666665,
+          null,
+          5.208333333333333,
+          5.208333333333333,
+          null,
+          3.625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/unseen",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.5416666666666665,
+          3.625,
+          4.40625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "cat-boost/unseen-return-nan",
+      "encoder": "CatBoostEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_unknown": "return_nan"
+      },
+      "fit": "labelled",
+      "transform": "labelled-unseen",
+      "target": "y",
+      "expected": {
+        "color": [
+          2.5416666666666665,
+          null,
+          4.40625,
+          3.625
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/median",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "expected": {
+        "color": [
+          2.5,
+          2.5,
+          4.125,
+          4.125,
+          4.125,
+          5.25,
+          6.5,
+          6.5
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "quantile/two-columns",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "expected": {
+        "color": [
+          2.5,
+          2.5,
+          4.125,
+          4.125,
+          4.125,
+          5.25,
+          6.5,
+          6.5
+        ],
+        "size": [
+          4.125,
+          4.875,
+          4.5,
+          4.125,
+          4.875,
+          4.5,
+          4.125,
+          4.875
+        ]
+      }
+    },
+    {
+      "name": "quantile/odd-and-even-groups",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_spread",
+      "expected": {
+        "color": [
+          4.125,
+          4.125,
+          4.125,
+          4.5,
+          4.5,
+          4.5,
+          4.5,
+          4.75,
+          4.0,
+          4.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/q25",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "quantile": 0.25
+      },
+      "target": "y",
+      "fit": "target_spread",
+      "expected": {
+        "color": [
+          2.8125,
+          2.8125,
+          2.8125,
+          2.45,
+          2.45,
+          2.45,
+          2.45,
+          3.625,
+          2.1666666666666665,
+          2.1666666666666665
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/q90-smoothed",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "quantile": 0.9,
+        "m": 2.5
+      },
+      "target": "y",
+      "fit": "target_spread",
+      "expected": {
+        "color": [
+          8.045454545454545,
+          8.045454545454545,
+          8.045454545454545,
+          7.6692307692307695,
+          7.6692307692307695,
+          7.6692307692307695,
+          7.6692307692307695,
+          7.214285714285714,
+          7.322222222222223,
+          7.322222222222223
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/m-zero",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "m": 0
+      },
+      "target": "y",
+      "fit": "target_spread",
+      "expected": {
+        "color": [
+          4.0,
+          4.0,
+          4.0,
+          4.5,
+          4.5,
+          4.5,
+          4.5,
+          5.0,
+          3.75,
+          3.75
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/integer-target",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "quantile": 0.25
+      },
+      "target": "y",
+      "fit": "target_integer",
+      "expected": {
+        "color": [
+          15.833333333333334,
+          15.833333333333334,
+          31.875,
+          31.875,
+          31.875,
+          41.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s"
+        ]
+      }
+    },
+    {
+      "name": "quantile/nulls",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_nulls",
+      "expected": {
+        "color": [
+          2.6666666666666665,
+          2.6666666666666665,
+          4.333333333333333,
+          4.25,
+          4.333333333333333,
+          5.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s"
+        ]
+      }
+    },
+    {
+      "name": "quantile/nulls-return-nan",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "target": "y",
+      "fit": "target_nulls",
+      "expected": {
+        "color": [
+          2.6666666666666665,
+          2.6666666666666665,
+          null,
+          4.25,
+          null,
+          5.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s"
+        ]
+      }
+    },
+    {
+      "name": "quantile/unseen",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "transform": "target_unseen",
+      "expected": {
+        "color": [
+          2.5,
+          4.5,
+          4.125,
+          4.5
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "quantile/unseen-return-nan",
+      "encoder": "QuantileEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "transform": "target_unseen",
+      "expected": {
+        "color": [
+          2.5,
+          null,
+          4.125,
+          4.5
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "summary/default-quantiles",
+      "encoder": "SummaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "expected": {
+        "color_25": [
+          1.75,
+          1.75,
+          3.3125,
+          3.3125,
+          3.3125,
+          4.375,
+          5.75,
+          5.75
+        ],
+        "color_75": [
+          3.25,
+          3.25,
+          4.9375,
+          4.9375,
+          4.9375,
+          6.125,
+          7.25,
+          7.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "summary/two-columns",
+      "encoder": "SummaryEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "expected": {
+        "color_25": [
+          1.75,
+          1.75,
+          3.3125,
+          3.3125,
+          3.3125,
+          4.375,
+          5.75,
+          5.75
+        ],
+        "color_75": [
+          3.25,
+          3.25,
+          4.9375,
+          4.9375,
+          4.9375,
+          6.125,
+          7.25,
+          7.25
+        ],
+        "size_25": [
+          2.5625,
+          3.3125,
+          3.4166666666666665,
+          2.5625,
+          3.3125,
+          3.4166666666666665,
+          2.5625,
+          3.3125
+        ],
+        "size_75": [
+          5.6875,
+          6.4375,
+          5.583333333333333,
+          5.6875,
+          6.4375,
+          5.583333333333333,
+          5.6875,
+          6.4375
+        ]
+      }
+    },
+    {
+      "name": "summary/three-quantiles",
+      "encoder": "SummaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "quantiles": [
+          0.1,
+          0.5,
+          0.9
+        ],
+        "m": 2.0
+      },
+      "target": "y",
+      "fit": "target_spread",
+      "expected": {
+        "color_10": [
+          1.8199999999999998,
+          1.8199999999999998,
+          1.8199999999999998,
+          1.3833333333333335,
+          1.3833333333333335,
+          1.3833333333333335,
+          1.3833333333333335,
+          2.3000000000000003,
+          1.0499999999999998,
+          1.0499999999999998
+        ],
+        "color_50": [
+          4.2,
+          4.2,
+          4.2,
+          4.5,
+          4.5,
+          4.5,
+          4.5,
+          4.666666666666667,
+          4.125,
+          4.125
+        ],
+        "color_90": [
+          8.040000000000001,
+          8.040000000000001,
+          8.040000000000001,
+          7.633333333333333,
+          7.633333333333333,
+          7.633333333333333,
+          7.633333333333333,
+          7.066666666666666,
+          7.225,
+          7.225
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "summary/nulls",
+      "encoder": "SummaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "target": "y",
+      "fit": "target_nulls",
+      "expected": {
+        "color_25": [
+          2.0833333333333335,
+          2.0833333333333335,
+          3.5833333333333335,
+          3.625,
+          3.5833333333333335,
+          4.625
+        ],
+        "color_75": [
+          3.25,
+          3.25,
+          5.083333333333333,
+          4.875,
+          5.083333333333333,
+          5.875
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s"
+        ]
+      }
+    },
+    {
+      "name": "summary/unseen",
+      "encoder": "SummaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "quantiles": [
+          0.25,
+          0.5,
+          0.75
+        ]
+      },
+      "target": "y",
+      "fit": "target_plain",
+      "transform": "target_unseen",
+      "expected": {
+        "color_25": [
+          1.75,
+          2.75,
+          3.3125,
+          2.75
+        ],
+        "color_50": [
+          2.5,
+          4.5,
+          4.125,
+          4.5
+        ],
+        "color_75": [
+          3.25,
+          6.25,
+          4.9375,
+          6.25
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "basen/plain",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          0,
+          0
+        ],
+        "color_2": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/base-1",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "base": 1
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_1": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_2": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        "color_3": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_4": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/base-3",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "base": 3
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1
+        ],
+        "color_1": [
+          1,
+          1,
+          1,
+          2,
+          2,
+          0,
+          1,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/base-10",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "base": 10
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          1,
+          1,
+          1,
+          2,
+          2,
+          3,
+          4,
+          4
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/nulls",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          0,
+          1
+        ],
+        "color_2": [
+          1,
+          1,
+          0,
+          0,
+          0,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/nulls-return-nan",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          0.0
+        ],
+        "color_1": [
+          0.0,
+          0.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_2": [
+          1.0,
+          1.0,
+          null,
+          0.0,
+          null,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "basen/two-columns",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ],
+        "base": 3
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1
+        ],
+        "color_1": [
+          1,
+          1,
+          1,
+          2,
+          2,
+          0,
+          1,
+          1
+        ],
+        "size_0": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "size_1": [
+          1,
+          2,
+          0,
+          1,
+          2,
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "basen/unseen",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "basen/unseen-return-nan",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "return_nan"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          0.0,
+          null,
+          1.0,
+          0.0
+        ],
+        "color_2": [
+          1.0,
+          null,
+          0.0,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "basen/indicator",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "basen/size-missing-return-nan",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "size"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          "amber",
+          "amber",
+          "amber",
+          "blue",
+          "blue",
+          "cyan",
+          "delta",
+          "delta"
+        ],
+        "size_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size_1": [
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "size_2": [
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "name": "basen/size-missing-error",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "size"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          "amber",
+          "amber",
+          "amber",
+          "blue",
+          "blue",
+          "cyan",
+          "delta",
+          "delta"
+        ],
+        "size_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "size_1": [
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          0,
+          1
+        ],
+        "size_2": [
+          1,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "basen/single-level-return-nan",
+      "encoder": "BaseNEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "single",
+      "expected": {
+        "color_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "color_1": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "james-stein/missing-error-at-transform",
+      "encoder": "JamesSteinEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "target": "y",
+        "handle_missing": "error"
+      },
+      "fit": "labelled",
+      "transform": "labelled-late-nulls",
+      "target": "y",
+      "raises": true,
+      "raised": "Columns to be encoded cannot contain null"
+    },
+    {
+      "name": "binary/plain",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          0,
+          0
+        ],
+        "color_2": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "binary/missing-error-at-transform",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "error"
+      },
+      "fit": "plain",
+      "transform": "late-nulls",
+      "raises": true,
+      "raised": "Columns to be encoded cannot contain null"
+    },
+    {
+      "name": "binary/nulls",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          0,
+          1
+        ],
+        "color_2": [
+          1,
+          1,
+          0,
+          0,
+          0,
+          1
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "binary/two-columns",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          0,
+          0
+        ],
+        "color_2": [
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        "size_0": [
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          0,
+          1
+        ],
+        "size_1": [
+          1,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "binary/unseen",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "binary/indicator",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "binary/size-missing-return-nan",
+      "encoder": "BinaryEncoder",
+      "params": {
+        "columns": [
+          "size"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "plain",
+      "expected": {
+        "color": [
+          "amber",
+          "amber",
+          "amber",
+          "blue",
+          "blue",
+          "cyan",
+          "delta",
+          "delta"
+        ],
+        "size_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size_1": [
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "size_2": [
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0,
+          1.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "name": "gray/plain",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1
+        ],
+        "color_1": [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l",
+          "m",
+          "s",
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "gray/unsorted",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color",
+          "size"
+        ]
+      },
+      "fit": "shuffled",
+      "expected": {
+        "color_0": [
+          1,
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "color_1": [
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          1,
+          0,
+          1,
+          0,
+          1,
+          1,
+          0
+        ],
+        "size_0": [
+          1,
+          1,
+          0,
+          1,
+          1,
+          0,
+          1
+        ],
+        "size_1": [
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "gray/nulls",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "color_2": [
+          1,
+          1,
+          0,
+          1,
+          0,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "gray/nulls-return-nan",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_missing": "return_nan"
+      },
+      "fit": "nulls",
+      "expected": {
+        "color_0": [
+          0.0,
+          0.0,
+          null,
+          0.0,
+          null,
+          0.0
+        ],
+        "color_1": [
+          0.0,
+          0.0,
+          null,
+          1.0,
+          null,
+          1.0
+        ],
+        "color_2": [
+          1.0,
+          1.0,
+          null,
+          1.0,
+          null,
+          0.0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          null,
+          "l",
+          "m"
+        ]
+      }
+    },
+    {
+      "name": "gray/unseen",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ]
+      },
+      "fit": "plain",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          0,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          0,
+          1,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    },
+    {
+      "name": "gray/indicator",
+      "encoder": "GrayEncoder",
+      "params": {
+        "columns": [
+          "color"
+        ],
+        "handle_unknown": "indicator"
+      },
+      "fit": "shuffled",
+      "transform": "unseen",
+      "expected": {
+        "color_0": [
+          0,
+          1,
+          0,
+          0
+        ],
+        "color_1": [
+          0,
+          1,
+          1,
+          0
+        ],
+        "color_2": [
+          1,
+          0,
+          1,
+          0
+        ],
+        "size": [
+          "l",
+          "m",
+          "s",
+          "l"
+        ]
+      }
+    }
+  ]
+}

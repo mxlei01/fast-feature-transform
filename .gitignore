@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Build output (the C++ extension builds into build/, wheels into dist/ or, from
+# cibuildwheel, wheelhouse/)
+build/
+compile_commands.json
+.cache/
+dist/
+wheelhouse/
+*.egg-info/
+
+# C++ dependencies build into ~/.cache/fast-feature-transform (make vcpkg); these
+# entries only cover a checkout that points FFT_DEPS_DIR at the repo itself.
+vcpkg/
+vcpkg_installed/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+.nvim.lua
+nvim.log
+
+# Local-only
+CLAUDE.md
+
+# Secrets: credentials never belong in the repository
+*.token
+.*-token*
+.env
+.env.*
+*.pem
+*.key
+.pypirc

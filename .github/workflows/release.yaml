@@ -1,0 +1,493 @@
+name: Release
+
+# Publishing a GitHub release runs this. It checks the release, builds the six
+# wheels, checks them, uploads them to PyPI through trusted publishing (no
+# token), attaches the same files to the release, and confirms by sha256 that
+# the release and PyPI hold exactly the files it built. Run it by hand on any
+# branch for a dry run: the same build and wheel checks, without the release
+# check or any upload.
+#
+# A release with a new tag also pushes that tag, and this workflow ignores the
+# push: a second run would build different bytes.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Nothing workflow-wide: each job asks for what it needs.
+permissions: {}
+
+# Publishing the same release again waits for the first run instead of racing it.
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Check the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      if: github.event_name == 'release'
+      with:
+        # Every tag and master, for the version and master checks below.
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Check the release, its tag and its commit
+      if: github.event_name == 'release'
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+        PRERELEASE: ${{ github.event.release.prerelease }}
+        IMMUTABLE: ${{ github.event.release.immutable }}
+        VISIBILITY: ${{ github.event.repository.visibility }}
+      run: |
+        python3 - <<'PY'
+        import os, re, subprocess, sys
+        tag = os.environ["TAG"]
+
+        # A re-run sees the release as it was first published, and editing a
+        # release starts no run, so each refusal says what to do instead. The
+        # visibility, immutability, tag, pre-release box and ref come from that
+        # first publication; master and the tags are read as they are now.
+        def refuse(problem, remedy):
+            sys.exit(f"{problem}\n{remedy}")
+
+        # PyPI's trusted publisher doesn't check visibility: a release in a
+        # private copy of this repository would publish for real.
+        if os.environ["VISIBILITY"] != "public":
+            refuse(f"This repository is {os.environ['VISIBILITY']}, and releases publish to PyPI only from the "
+                   "public one.",
+                   "Re-running repeats this. Delete this release and its tag, and publish again once the repository is "
+                   "public. For a dry run, use Actions, Release, Run workflow.")
+        if os.environ["IMMUTABLE"] == "true":
+            refuse(f"{tag} is an immutable release: it takes no files once published, and its tag name can't be "
+                   "used again. Nothing was built or uploaded.",
+                   "Turn immutable releases off in the repository's settings and publish the next version.")
+        # setuptools-scm drops the v, and the README's links on PyPI point at
+        # v<version>, so the tag must be v and a version PEP 440 spells the
+        # same way.
+        number = "(?:0|[1-9][0-9]*)"
+        match = re.fullmatch(rf"v{number}\.{number}\.{number}((?:a|b|rc){number})?", tag)
+        if not match:
+            refuse(f"The tag {tag!r} is not v<major>.<minor>.<patch>, optionally followed by a<n>, b<n> or rc<n>.",
+                   "Re-running repeats this. Delete this release and its tag, then publish a new release with a tag "
+                   "like v0.0.1.")
+        prerelease = match.group(1) is not None
+        if prerelease != (os.environ["PRERELEASE"] == "true"):
+            refuse(f"The pre-release box doesn't match {tag}: PyPI goes by the version, so tick it exactly for an "
+                   "a, b or rc tag.",
+                   f"Re-running repeats this, and editing the release starts no run. Delete this release, keep the "
+                   f"tag, and publish a new release on {tag} with the box {'ticked' if prerelease else 'clear'}.")
+        # GitHub sometimes starts a release run without its tag ref
+        # (actions/runner#2788). The pypi environment's tag rule reads that
+        # ref, and a re-run keeps it.
+        if os.environ["GITHUB_REF"] != f"refs/tags/{tag}":
+            refuse(f"GitHub started this run with ref {os.environ['GITHUB_REF']!r} instead of refs/tags/{tag}.",
+                   "Re-running keeps the empty ref. Delete this release, keep the tag, and publish the release again.")
+        # Pull requests into master run the tests; a commit elsewhere never had them.
+        if subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", "origin/master"]).returncode != 0:
+            refuse(f"{tag} points at {os.environ['GITHUB_SHA']}, which is not on master.",
+                   "Delete this release and its tag, then publish again with master as the target.")
+        # setuptools-scm takes the version from the tag git describe picks,
+        # which can be another tag on the same commit. This reads the tags as
+        # they are now, so deleting the other tag and re-running this job is
+        # enough.
+        picked = subprocess.run(["git", "describe", "--tags", "--exact-match", "--match", "*[0-9]*", "HEAD"],
+                                stdout=subprocess.PIPE, text=True).stdout.strip()
+        if picked != tag:
+            refuse(f"setuptools-scm would take its version from the tag {picked or '(none)'} on this commit, "
+                   f"not {tag}.",
+                   "Delete that tag, then re-run this job.")
+        print(f"{tag} is a {'pre-' if prerelease else ''}release of {os.environ['GITHUB_SHA']} on master")
+        PY
+
+  wheels:
+    name: Wheels (${{ matrix.os }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    # Each runner builds Arrow cold: about 45 minutes on Linux.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # Linux builds run natively in manylinux_2_28 containers; macOS 26 has
+        # the SDK whose C++ library parses doubles with std::from_chars.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        # setuptools-scm reads the version from the tag.
+        fetch-depth: 0
+        persist-credentials: false
+    # cibuildwheel and its dependencies install from a list pinned with hashes;
+    # pypa/cibuildwheel's action installs its dependencies by version range,
+    # without hashes. The tools cibuildwheel installs for itself, the build
+    # requirements and the tests' packages are pinned the same way (see
+    # [tool.cibuildwheel] in pyproject.toml).
+    # An exact patch release: "3.14" would take whichever 3.14 the runner image
+    # caches, which lags behind CPython's security releases.
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      with:
+        python-version: "3.14.10"
+        update-environment: false
+      id: python
+    - name: Install cibuildwheel
+      env:
+        PYTHON: ${{ steps.python.outputs.python-path }}
+      run: |
+        "$PYTHON" -m venv "$RUNNER_TEMP/cibuildwheel"
+        "$RUNNER_TEMP/cibuildwheel/bin/pip" install --require-hashes --only-binary :all: \
+          -r .github/requirements/cibuildwheel.txt
+    - name: Build the wheels
+      run: |
+        "$RUNNER_TEMP/cibuildwheel/bin/cibuildwheel" --output-dir wheelhouse
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: wheels-${{ matrix.os }}
+        path: wheelhouse/*.whl
+        if-no-files-found: error
+
+  check:
+    name: Check the wheels
+    needs: wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    outputs:
+      files: ${{ steps.files.outputs.files }}
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
+    # The two upload jobs upload only files with these names and hashes: code
+    # in a later job of this run, such as twine's, can replace an artifact.
+    # This job runs only GitHub's download action and Python's standard
+    # library, so nothing in it can change the record.
+    - name: Record the files
+      id: files
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib
+        files = {path.relative_to("dist").as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in sorted(pathlib.Path("dist").rglob("*")) if path.is_file()}
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            print(f"files={json.dumps(files)}", file=output)
+        print(json.dumps(files, indent=2))
+        PY
+    - name: Check the wheels
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        TAG: ${{ github.event.release.tag_name }}
+        REF_TYPE: ${{ github.ref_type }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        python3 - <<'PY'
+        import os, pathlib, re, zipfile
+        wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+        names = [w.name for w in wheels]
+        print(*names, sep="\n")
+        assert len(wheels) == 6, f"expected 6 wheels, got {len(wheels)}"
+        everything = sorted(path.relative_to("dist").as_posix() for path in pathlib.Path("dist").rglob("*")
+                            if path.is_file())
+        assert everything == names, f"dist holds more than the wheels: {everything}"
+        # A free-threaded wheel is tagged cp314-cp314t; the hyphens keep the
+        # standard pattern from matching it.
+        for abi in ("-cp314-cp314-", "-cp314-cp314t-"):
+            for platform in ("manylinux_2_28_x86_64", "manylinux_2_28_aarch64", "macosx_26_0_arm64"):
+                assert any(abi in n and platform in n for n in names), f"no {abi} wheel for {platform}"
+        versions = {n.split("-")[1] for n in names}
+        assert len(versions) == 1, versions
+        version = versions.pop()
+        # A release names its tag in the event, which stays right when GitHub
+        # leaves the run's ref empty; a hand run on a tag takes it from the ref.
+        if os.environ["EVENT_NAME"] == "release":
+            assert version == os.environ["TAG"].removeprefix("v"), (version, os.environ["TAG"])
+        elif os.environ["REF_TYPE"] == "tag":
+            assert version == os.environ["REF_NAME"].removeprefix("v"), (version, os.environ["REF_NAME"])
+        else:
+            assert re.fullmatch(r"\d+\.\d+\.\d+\.dev\d+\+g[0-9a-f]+", version), version
+        # Every wheel ships the license files its metadata declares, the same
+        # set in all six, including LICENSE and THIRD_PARTY_NOTICES.txt.
+        shipped = set()
+        for wheel in wheels:
+            archive = zipfile.ZipFile(wheel)
+            files = archive.namelist()
+            licenses = sorted(f.split("/licenses/", 1)[1] for f in files if "/licenses/" in f)
+            metadata = archive.read(next(f for f in files if f.endswith(".dist-info/METADATA"))).decode()
+            declared = sorted(line.split(": ", 1)[1] for line in metadata.splitlines() if line.startswith("License-File: "))
+            assert licenses == declared, (wheel.name, licenses, declared)
+            assert {"LICENSE", "THIRD_PARTY_NOTICES.txt"} <= set(licenses), (wheel.name, licenses)
+            shipped.add(tuple(licenses))
+        assert len(shipped) == 1, shipped
+        print("version", version, "- all checks passed")
+        PY
+
+  twine:
+    name: Check the metadata with twine
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read  # to read the hashed list twine installs from
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        sparse-checkout: .github/requirements
+        persist-credentials: false
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
+    - name: Check the metadata with twine
+      run: |
+        # A venv keeps twine and its dependencies off the runner's system Python.
+        python3 -m venv "$RUNNER_TEMP/twine"
+        "$RUNNER_TEMP/twine/bin/pip" install --quiet --require-hashes --only-binary :all: \
+          -r .github/requirements/twine.txt
+        "$RUNNER_TEMP/twine/bin/twine" check --strict dist/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: [check, twine]
+    # Only a published release publishes; a hand run, even on a tag, stops
+    # after the check. PyPI goes before the release because it is the strict
+    # side: it can refuse a file, and a file it takes stays for good, while the
+    # release can still be edited.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Trusted publishing: PyPI accepts this job's OIDC token because its
+    # publisher names this repository, release.yaml and this environment.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fast-feature-transform
+    permissions:
+      contents: read  # to read the release again before uploading
+      id-token: write  # the OIDC token trusted publishing trades for a PyPI token
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
+    - name: Compare the files with the recorded ones
+      env:
+        RECORDED: ${{ needs.check.outputs.files }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, sys
+        recorded = json.loads(os.environ["RECORDED"] or "{}")
+        downloaded = {path.relative_to("dist").as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(pathlib.Path("dist").rglob("*")) if path.is_file()}
+        if downloaded != recorded:
+            sys.exit("The downloaded files differ from the ones the check job recorded, so this run uploads "
+                     f"nothing.\nrecorded: {recorded}\ndownloaded: {downloaded}")
+        print(f"the {len(downloaded)} files the check job recorded")
+        PY
+    # The build took about an hour, and this may be a re-run days later. Upload
+    # only while the release is published and its tag still names the commit
+    # this run built. The check is in this job, not one before it, because
+    # Re-run failed jobs would skip a job that passed. It runs no third-party
+    # code next to the OIDC token: only gh and Python's standard library.
+    - name: Check the release is still there
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        python3 - <<'PY'
+        import json, os, subprocess, sys
+        tag, repo, built = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+
+        def api(path):
+            # gh prints its own error; only the body is captured.
+            result = subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, text=True)
+            return json.loads(result.stdout) if result.returncode == 0 else None
+
+        # By tag rather than by id: a release deleted and published again on
+        # the same commit can still take this run's wheels.
+        release = api(f"repos/{repo}/releases/tags/{tag}")
+        if release is None:
+            sys.exit(f"No published release with the tag {tag} could be read (gh's error is above), so this run "
+                     "uploads nothing. If the release is still published, re-run this job.")
+        if release.get("immutable"):
+            sys.exit(f"The release {tag} is immutable and can take no files: turn immutable releases off and "
+                     "release a new version.")
+        commit = api(f"repos/{repo}/commits/refs/tags/{tag}")
+        if commit is None:
+            sys.exit(f"The tag {tag} could not be read (gh's error is above), so this run uploads nothing. If the "
+                     "tag still exists, re-run this job.")
+        if commit["sha"] != built:
+            sys.exit(f"The tag {tag} now points at {commit['sha']}, not at {built}, which this run built, so this "
+                     "run uploads nothing.")
+        print(f"{tag} is still a published release of {built}")
+        PY
+    - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+
+  attach:
+    name: Attach to the release and compare
+    needs: [check, publish]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write  # to attach files to the release
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
+    # The same two checks as in Publish to PyPI, for a re-run of this job.
+    - name: Compare the files with the recorded ones
+      env:
+        RECORDED: ${{ needs.check.outputs.files }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, sys
+        recorded = json.loads(os.environ["RECORDED"] or "{}")
+        downloaded = {path.relative_to("dist").as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(pathlib.Path("dist").rglob("*")) if path.is_file()}
+        if downloaded != recorded:
+            sys.exit("The downloaded files differ from the ones the check job recorded, so this run uploads "
+                     f"nothing.\nrecorded: {recorded}\ndownloaded: {downloaded}")
+        print(f"the {len(downloaded)} files the check job recorded")
+        PY
+    - name: Check the release is still there
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        python3 - <<'PY'
+        import json, os, subprocess, sys
+        tag, repo, built = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+
+        def api(path):
+            # gh prints its own error; only the body is captured.
+            result = subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, text=True)
+            return json.loads(result.stdout) if result.returncode == 0 else None
+
+        # By tag rather than by id: a release deleted and published again on
+        # the same commit can still take this run's wheels.
+        release = api(f"repos/{repo}/releases/tags/{tag}")
+        if release is None:
+            sys.exit(f"No published release with the tag {tag} could be read (gh's error is above), so this run "
+                     "uploads nothing. If the release is still published, re-run this job.")
+        if release.get("immutable"):
+            sys.exit(f"The release {tag} is immutable and can take no files: turn immutable releases off and "
+                     "release a new version.")
+        commit = api(f"repos/{repo}/commits/refs/tags/{tag}")
+        if commit is None:
+            sys.exit(f"The tag {tag} could not be read (gh's error is above), so this run uploads nothing. If the "
+                     "tag still exists, re-run this job.")
+        if commit["sha"] != built:
+            sys.exit(f"The tag {tag} now points at {commit['sha']}, not at {built}, which this run built, so this "
+                     "run uploads nothing.")
+        print(f"{tag} is still a published release of {built}")
+        PY
+    - name: Attach the wheels
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, subprocess, sys
+        tag, repo = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"]
+
+        def api(path):
+            return json.loads(subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, text=True, check=True).stdout)
+
+        # The release's asset list, unlike the release itself, also shows an
+        # upload that never finished. One page holds 100 assets.
+        release = api(f"repos/{repo}/releases/tags/{tag}")
+        assets = {asset["name"]: asset for asset in api(f"repos/{repo}/releases/{release['id']}/assets?per_page=100")}
+        # A re-run uploads only what is missing and never replaces a file.
+        for wheel in sorted(pathlib.Path("dist").glob("*.whl")):
+            asset = assets.get(wheel.name)
+            if asset and asset["state"] == "uploaded":
+                if asset["digest"] != "sha256:" + hashlib.sha256(wheel.read_bytes()).hexdigest():
+                    sys.exit(f"The release already holds a different {wheel.name}. If it was attached by hand, "
+                             "delete it from the release and use Re-run failed jobs.")
+                print(f"already attached: {wheel.name}")
+                continue
+            if asset:
+                # An interrupted upload leaves an asset that never received its
+                # file. It holds nothing, but it takes the name, so it goes.
+                subprocess.run(["gh", "api", "--method", "DELETE", f"repos/{repo}/releases/assets/{asset['id']}"],
+                               check=True)
+            subprocess.run(["gh", "release", "upload", tag, str(wheel), "--repo", repo], check=True)
+        PY
+    - name: Compare the release and PyPI with the build
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, http.client, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
+        tag, repo = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"]
+        built = {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()
+                 for wheel in pathlib.Path("dist").glob("*.whl")}
+
+        def api(path):
+            return json.loads(subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, text=True, check=True).stdout)
+
+        # The release's wheels, downloaded from the published release itself.
+        release = api(f"repos/{repo}/releases/tags/{tag}")
+        released = {}
+        for asset in api(f"repos/{repo}/releases/{release['id']}/assets?per_page=100"):
+            if not asset["name"].endswith(".whl"):
+                continue
+            if asset["state"] != "uploaded":
+                released[asset["name"]] = asset["state"]
+                continue
+            body = subprocess.run(["gh", "api", "-H", "Accept: application/octet-stream",
+                                   f"repos/{repo}/releases/assets/{asset['id']}"],
+                                  stdout=subprocess.PIPE, check=True).stdout
+            released[asset["name"]] = hashlib.sha256(body).hexdigest()
+        if released != built:
+            sys.exit(f"The release's wheels differ from the build.\nrelease: {released}\nbuild: {built}")
+
+        # PyPI's JSON API is cached and can lag an upload by minutes, so a
+        # missing file, or PyPI not answering, means wait. A different file is
+        # final: PyPI never replaces one.
+        url = f"https://pypi.org/pypi/fast-feature-transform/{tag.removeprefix('v')}/json"
+        deadline = time.monotonic() + 30 * 60
+        last = "none"
+        while True:
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    on_pypi = {file["filename"]: file["digests"]["sha256"] for file in json.load(response)["urls"]}
+                last = "a listing"
+            except urllib.error.HTTPError as error:
+                if error.code not in (404, 429) and error.code < 500:
+                    raise
+                last = f"HTTP {error.code}"
+                on_pypi = {}
+            # A dropped connection, a timeout, a TLS error or a cut-off body
+            # says nothing about the files either.
+            except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
+                last = repr(error)
+                print(f"PyPI didn't answer: {last}; trying again")
+                on_pypi = {}
+            different = sorted(name for name in on_pypi if on_pypi[name] != built.get(name))
+            if different:
+                sys.exit(f"PyPI holds files that differ from the build: {different}")
+            if on_pypi == built:
+                break
+            if time.monotonic() > deadline:
+                sys.exit(f"PyPI still lacks {sorted(set(built) - set(on_pypi))} after 30 minutes "
+                         f"(last answer: {last}).")
+            time.sleep(30)
+
+        rows = "\n".join(f"| {name} | `{digest}` |" for name, digest in sorted(built.items()))
+        summary = ("The release and PyPI hold exactly the wheels this run built:\n\n"
+                   f"| Wheel | sha256 |\n| --- | --- |\n{rows}\n")
+        pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(summary)
+        print(summary)
+        PY
