@@ -7,6 +7,8 @@
 Feature preprocessing for machine learning, written in C++ with a Python API. Fit a pipeline on Parquet files, save
 it, then transform one record at a time when serving or whole files when training.
 
+Demo: https://fare.fast-feature-transform.dev
+
 - **Feature parity** with category_encoders and scikit-learn's preprocessors.
 - **Fast:** one record takes 0.13 to 1.2 µs, where scikit-learn takes 32 to 219 µs and category_encoders 0.31 to
   1.2 ms.
