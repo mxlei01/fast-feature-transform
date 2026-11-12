@@ -14,6 +14,7 @@ step that rebuilt its list from object keys fails.
 
 import json
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,23 @@ _DERIVING: list[Transformer] = [
     KBinsDiscretizer(n_bins=2, encode="onehot", strategy="uniform"),
 ]
 
+# The steps that take every number when given no columns, and steps whose
+# generated columns, all numbers, are known only once they are fitted.
+_NUMBERS_FROM_SCHEMA: dict[str, Callable[[], Transformer]] = {
+    "StandardScaler": StandardScaler,
+    "MinMaxScaler": MinMaxScaler,
+    "MaxAbsScaler": MaxAbsScaler,
+    "RobustScaler": RobustScaler,
+    "QuantileTransformer": lambda: QuantileTransformer(n_quantiles=3),
+    "KBinsDiscretizer": lambda: KBinsDiscretizer(n_bins=2, encode="ordinal", strategy="uniform"),
+}
+_EXPANDING: dict[str, Callable[[], Transformer]] = {
+    "OneHotEncoder": lambda: OneHotEncoder(columns=["z_text"]),
+    "BinaryEncoder": lambda: BinaryEncoder(columns=["z_text"]),
+    "HelmertEncoder": lambda: HelmertEncoder(columns=["z_text"]),
+    "KBinsDiscretizer": lambda: KBinsDiscretizer(columns=["z_num"], n_bins=2, encode="onehot", strategy="uniform"),
+}
+
 
 @pytest.fixture
 def mixed(tmp_path: Path) -> str:
@@ -179,6 +197,30 @@ def test_a_collision_suffix_keeps_its_value_across_an_artifact_and_a_pickle(coll
     for restored in _round_trips(pipeline, tmp_path, "collide"):
         assert restored.transform_dict(dict(record)) == fitted
         assert list(restored.transform_dict(dict(record))) == list(fitted)
+
+
+@pytest.mark.parametrize("expanding", _EXPANDING)
+@pytest.mark.parametrize("numbers", _NUMBERS_FROM_SCHEMA)
+def test_a_step_given_no_columns_takes_the_columns_known_when_the_fit_starts(
+    numbers: str, expanding: str, mixed: str
+) -> None:
+    # REGRESSION: a step given no columns never takes the columns an expanding
+    # step generates at fit. It used to take them when it fitted a pass later
+    # than the expanding step, which a step in front of both decides.
+    def steps() -> list[tuple[str, Transformer]]:
+        return [("expand", _EXPANDING[expanding]()), ("step", _NUMBERS_FROM_SCHEMA[numbers]())]
+
+    alone: Pipeline = Pipeline(steps()).fit([mixed])
+    # The scaler in front leaves a_num as it is. The last step reads what it
+    # writes, so it fits one pass later, after the expanding step is fitted.
+    wait: Transformer = StandardScaler(columns=["a_num"], with_mean=False, with_std=False)
+    waiting: Pipeline = Pipeline([("wait", wait), *steps()]).fit([mixed])
+
+    state: dict[str, Any] = json.loads(alone.stages_state())["step"]
+    consumed: str = "z_num" if expanding == "KBinsDiscretizer" else "z_text"
+    assert state["columns"] == [name for name in [*_NUMBERS, *_TARGET] if name != consumed]
+    assert json.loads(waiting.stages_state())["step"] == state
+    assert waiting.transform_dict(_RECORD) == alone.transform_dict(_RECORD)
 
 
 @pytest.mark.parametrize("transformer", _DERIVING, ids=lambda t: type(t).__name__)

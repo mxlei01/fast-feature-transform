@@ -118,21 +118,7 @@ class LabelEncode final : public Kernel {
   }
 
   void resolve(Schema& schema) override {
-    // A fitted (artifact-loaded) encoder's column bindings come from its
-    // state and must never be re-derived from a new schema.
-    if (!fitted && !explicit_columns_) {
-      columns_.clear();
-      for (const auto& [name, type] : schema.cols) {
-        if (type == "utf8") columns_.push_back(name);
-      }
-      if (columns_.empty()) throw Error(stage + ": no utf8 columns to label-encode");
-    }
-    for (const std::string& name : columns_) {
-      const std::string* type = schema.find(name);
-      if (type == nullptr) throw Error(stage + ": column '" + name + "' not found in input");
-      if (*type != "utf8")
-        throw Error(stage + ": column '" + name + "' is " + *type + ", expected utf8 (cast it to utf8 first)");
-    }
+    bind_columns(schema, stage, columns_, explicit_columns_, fitted, "label-encode");
     for (auto& [name, type] : schema.cols) {
       if (std::find(columns_.begin(), columns_.end(), name) != columns_.end()) type = "i64";
     }

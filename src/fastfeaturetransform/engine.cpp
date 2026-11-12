@@ -499,9 +499,11 @@ FittedPipeline Engine::fit(const std::string& plan_json, const std::vector<std::
 
   // Resolving the whole list gives every op its column bindings and tells the
   // segment scheduler which columns each one changes. It runs again after
-  // every fit pass, because a kernel may only learn what it emits from the
-  // data — a one-hot column per category, say — and the ops after it resolve
-  // against those columns.
+  // every fit pass, because some kernels learn what they emit only from the
+  // data, as a one-hot encoder learns its column per category, and the ops
+  // after them resolve against those columns. An op given no columns takes
+  // its list at the first of these resolves and keeps it (bind_columns in
+  // kernels/categories.hpp), so the generated columns never join it.
   std::vector<std::vector<std::string>> deltas;
   BatchSizing sizing(source->schema(), *source);
   auto resolve_all = [&] {
