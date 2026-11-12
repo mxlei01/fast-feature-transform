@@ -259,7 +259,6 @@ NB_MODULE(_core, m) {
       .def(nb::init<unsigned, std::string>(), "threads"_a = 0, "temp_dir"_a = "")
       .def("fit", &Engine::fit, "plan_json"_a, "sources"_a, nb::call_guard<nb::gil_scoped_release>());
 
-  m.def("list_kernels", &fastfeaturetransform::list_kernels);
   m.def("library_version", &fastfeaturetransform::library_version);
   m.def("parquet_to_memmap", &fastfeaturetransform::write_memmap, "sources"_a, "output_dir"_a, "threads"_a = 0,
         nb::call_guard<nb::gil_scoped_release>());

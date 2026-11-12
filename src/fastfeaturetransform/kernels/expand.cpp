@@ -32,33 +32,12 @@ namespace {
 
 // --- the numeric substrate -------------------------------------------------
 
-// An integer column read as f64. Widening is exact up to 2^53 and an error
-// above it, which is the rule Cast follows: sklearn's own validate_data
-// widens an integer frame to float64 silently, and a silently rounded id is
-// worse than a refusal.
-double exact_double(int64_t value, const std::string& where) {
-  constexpr int64_t kExact = int64_t{1} << 53;
-  if (value > kExact || value < -kExact) {
-    throw Error(where + ": value " + std::to_string(value) +
-                " is beyond 2^53 in magnitude, where f64 no longer holds every integer exactly");
-  }
-  return static_cast<double>(value);
-}
-
 // A float column's value. A NaN or an infinity is an error. sklearn refuses
 // NaN too, except where it reads NaN as missing (PowerTransformer, and
 // SplineTransformer with handle_missing='zeros'); a null takes that role
 // here. Refusing both also keeps the fitted tables JSON-serializable.
-//
-// The throw is a function of its own: std::format's buffer would otherwise
-// give every call a stack frame and a stack-protector check, and this runs
-// once per value read.
-[[noreturn]] void refuse_non_finite(double value, const std::string& where) {
-  throw Error(where + ": value " + std::format("{}", value) + " is not finite");
-}
-
 double finite_value(double value, const std::string& where) {
-  if (!std::isfinite(value)) refuse_non_finite(value, where);
+  if (!std::isfinite(value)) refuse_non_finite(value, where, false);
   return value;
 }
 
@@ -101,7 +80,7 @@ void drop_expanded_columns(const std::vector<std::string>& columns, Batch& batch
 //
 // Both transform paths call this, so a record and a batch refuse the same row.
 // It runs once per generated value, so the throw is out of line for the same
-// reason as refuse_non_finite's.
+// reason as numeric.hpp's refuse_non_finite.
 [[noreturn]] void refuse_generated(double value, const std::string& stage, const std::string& name) {
   throw Error(stage + ": column '" + name + "' generates the value " + std::format("{}", value) +
               ", which is not finite");
@@ -139,23 +118,6 @@ double exact_sum(const SpillVector<double>& values, const std::string& where, F&
     }
   });
   return sum.value();
-}
-
-// numpy's default percentile method ("linear") over an ascending vector, with
-// the rank in 0..100 as np.percentile takes it: the divide by 100 is done
-// here, not by the caller, because 100*t/100 is not always t.
-double percentile_of(const SpillVector<double>& sorted, double rank) {
-  const double quantile = rank / 100.0;
-  const auto last = static_cast<double>(sorted.size() - 1);
-  const double index = quantile * last;
-  if (index <= 0.0) return sorted.front();
-  if (index >= last) return sorted.back();
-  const auto lower = static_cast<std::size_t>(index);  // index is positive and finite, so this floors
-  const double weight = index - static_cast<double>(lower);
-  const double left = sorted[lower];
-  const double right = sorted[lower + 1];
-  const double span = right - left;
-  return weight >= 0.5 ? right - span * (1.0 - weight) : left + span * weight;
 }
 
 // A fitted number read back out of a manifest.
@@ -200,18 +162,8 @@ class PolynomialFeatures final : public Kernel {
       }
     }
     read_degree(params);
-    if (params.contains("interaction_only") && !params.at("interaction_only").is_null()) {
-      if (!params.at("interaction_only").is_boolean()) {
-        throw Error("polynomial_features: 'interaction_only' must be true or false");
-      }
-      interaction_only_ = params.at("interaction_only").get<bool>();
-    }
-    if (params.contains("include_bias") && !params.at("include_bias").is_null()) {
-      if (!params.at("include_bias").is_boolean()) {
-        throw Error("polynomial_features: 'include_bias' must be true or false");
-      }
-      include_bias_ = params.at("include_bias").get<bool>();
-    }
+    interaction_only_ = bool_param(params, "interaction_only", false, "polynomial_features");
+    include_bias_ = bool_param(params, "include_bias", true, "polynomial_features");
     if (max_degree_ == 0 && !include_bias_) {
       throw Error("polynomial_features: degree 0 with include_bias false would generate no columns");
     }
@@ -652,11 +604,7 @@ class SplineTransform final : public Kernel {
         throw Error(kExtrapolationMessage);
       }
     }
-    if (params.contains("include_bias") && !params.at("include_bias").is_null()) {
-      if (!params.at("include_bias").is_boolean())
-        throw Error("spline_transform: 'include_bias' must be true or false");
-      include_bias_ = params.at("include_bias").get<bool>();
-    }
+    include_bias_ = bool_param(params, "include_bias", true, "spline_transform");
     if (params.contains("handle_missing") && !params.at("handle_missing").is_null()) {
       const nlohmann::json& missing = params.at("handle_missing");
       if (!missing.is_string() || (missing.get<std::string>() != "error" && missing.get<std::string>() != "zeros")) {
@@ -700,92 +648,44 @@ class SplineTransform final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
-  struct State final : AccState {
-    struct Column {
-      double low = std::numeric_limits<double>::infinity();
-      double high = -std::numeric_limits<double>::infinity();
-      int64_t count = 0;
-      int64_t nulls = 0;
-      SpillVector<double> buffer;  // quantile knots only
-    };
-    std::unordered_map<std::string, Column> columns;
-  };
+  std::unique_ptr<AccState> make_state() const override { return std::make_unique<Values>(); }
 
-  std::unique_ptr<AccState> make_state() const override { return std::make_unique<State>(); }
-
+  // The numeric family's buffered fit state, with the buffers filled for
+  // quantile knots only. An integer past 2^53 is refused, as everywhere in
+  // this file, and a value that is not finite is refused without the hint to
+  // write a null, which this step refuses too unless handle_missing is
+  // 'zeros'.
   void consume(AccState& raw, const Batch& batch) const override {
-    auto& state = static_cast<State&>(raw);
-    for (const std::string& name : columns_) {
-      State::Column& column = state.columns[name];
-      const arrow::Array& array = column_array(batch, stage, name);
-      for_each_number(array, stage, name, [&](int64_t, bool is_null, double value) {
-        if (is_null) {
-          ++column.nulls;
-          return;
-        }
-        ++column.count;
-        // One zero: min() and max() return their first argument on a tie and
-        // std::sort is not stable, so -0.0 would make both the extremes and
-        // the ends of the sorted buffer depend on the row-group split. Every
-        // reader treats -0.0 and 0.0 alike, so only the artifact bytes move.
-        if (value == 0.0) value = 0.0;
-        column.low = std::min(column.low, value);
-        column.high = std::max(column.high, value);
-        if (by_quantile_) column.buffer.push_back(value);
-      });
-    }
+    consume_values(columns_, stage, by_quantile_, false, true, static_cast<Values&>(raw), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
-    // Adopt the first worker's state rather than copying into a fresh one:
-    // the largest buffer is then never duplicated, which is one whole extra
-    // O(rows) buffer at the peak of the fit.
-    std::unique_ptr<State> owned;
-    for (auto& raw : states) {
-      if (raw == nullptr) continue;
-      if (owned == nullptr) {
-        owned.reset(static_cast<State*>(raw.release()));
-        continue;
-      }
-      auto& state = static_cast<State&>(*raw);
-      for (auto& [name, column] : state.columns) {
-        State::Column& into = owned->columns[name];
-        into.low = std::min(into.low, column.low);
-        into.high = std::max(into.high, column.high);
-        into.count += column.count;
-        into.nulls += column.nulls;
-        into.buffer.append(std::move(column.buffer));
-      }
-      raw.reset();
-    }
-    if (owned == nullptr) owned = std::make_unique<State>();
-    State& merged = *owned;
-
+    const std::unique_ptr<Values> merged = merge_values(states, false);
     splines_.clear();
     for (const std::string& name : columns_) {
-      State::Column& column = merged.columns[name];
-      if (!zero_missing_ && column.nulls > 0) {
+      if (!zero_missing_ && merged->nulls[name] > 0) {
         throw Error(stage + ": column '" + name + "' has nulls and handle_missing is 'error'");
       }
       // sklearn's fit takes at least two samples, and one value would put
       // every knot in the same place and encode the whole column as zeros.
-      if (column.count < 2) {
+      if (merged->counts[name] < 2) {
         throw Error(stage + ": column '" + name + "' has fewer than two non-null values to place knots between");
       }
       Spline spline;
       if (by_quantile_) {
+        SpillVector<double>& buffer = merged->buffers[name];
         const auto references = linspace(0.0, 1.0, static_cast<std::size_t>(n_knots_));
         std::vector<std::size_t> ranks;
         ranks.reserve(references.size() * 2);
-        for (double rank : references) linear_quantile_ranks(column.buffer.size(), 100.0 * rank / 100.0, ranks);
-        select_numeric_ranks(column.buffer, std::move(ranks));
+        // np.percentile takes each rank times 100 and divides it by 100
+        // again, and 100 * t / 100 is not always t, so the round trip is kept.
+        for (double rank : references) linear_quantile_ranks(buffer.size(), 100.0 * rank / 100.0, ranks);
+        select_numeric_ranks(buffer, std::move(ranks));
         spline.base.reserve(static_cast<std::size_t>(n_knots_));
-        for (double rank : references) {
-          spline.base.push_back(percentile_of(column.buffer, 100.0 * rank));
-        }
-        column.buffer.release();
+        for (double rank : references) spline.base.push_back(linear_quantile(buffer, 100.0 * rank / 100.0));
+        buffer.release();
       } else {
-        spline.base = linspace(column.low, column.high, static_cast<std::size_t>(n_knots_));
+        spline.base = linspace(merged->low.at(name), merged->high.at(name), static_cast<std::size_t>(n_knots_));
       }
       for (double knot : spline.base) serializable(knot, stage, name);
       // Over a span of a few subnormal units, linspace's step can round up
@@ -1673,10 +1573,7 @@ class PowerTransform final : public Kernel {
       }
       box_cox_ = method.get<std::string>() == "box-cox";
     }
-    if (params.contains("standardize") && !params.at("standardize").is_null()) {
-      if (!params.at("standardize").is_boolean()) throw Error("power_transform: 'standardize' must be true or false");
-      standardize_ = params.at("standardize").get<bool>();
-    }
+    standardize_ = bool_param(params, "standardize", true, "power_transform");
     inputs = columns_;
     outputs = columns_;
   }
@@ -1698,14 +1595,13 @@ class PowerTransform final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
-  struct State final : AccState {
-    std::unordered_map<std::string, SpillVector<double>> buffers;
-  };
+  std::unique_ptr<AccState> make_state() const override { return std::make_unique<Values>(); }
 
-  std::unique_ptr<AccState> make_state() const override { return std::make_unique<State>(); }
-
+  // Of the numeric family's buffered fit state only the buffers are filled,
+  // by a loop of this kernel's own: it refuses a value Box-Cox cannot take,
+  // and it keeps -0.0 as it is.
   void consume(AccState& raw, const Batch& batch) const override {
-    auto& state = static_cast<State&>(raw);
+    auto& state = static_cast<Values&>(raw);
     for (const std::string& name : columns_) {
       SpillVector<double>& buffer = state.buffers[name];
       const std::string where = stage + ": column '" + name + "'";
@@ -1722,28 +1618,10 @@ class PowerTransform final : public Kernel {
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
-    // Adopt the first worker's buffers instead of copying into a fresh state:
-    // the largest buffer is then never duplicated at the peak of the fit.
-    std::unique_ptr<State> owned;
-    for (auto& raw : states) {
-      if (raw == nullptr) continue;
-      if (owned == nullptr) {
-        owned.reset(static_cast<State*>(raw.release()));
-        continue;
-      }
-      auto& state = static_cast<State&>(*raw);
-      for (auto& [name, buffer] : state.buffers) {
-        SpillVector<double>& into = owned->buffers[name];
-        into.append(std::move(buffer));
-      }
-      raw.reset();
-    }
-    if (owned == nullptr) owned = std::make_unique<State>();
-    State& merged = *owned;
-
+    const std::unique_ptr<Values> merged = merge_values(states, false);
     fits_.clear();
     for (const std::string& name : columns_) {
-      SpillVector<double>& buffer = merged.buffers[name];
+      SpillVector<double>& buffer = merged->buffers[name];
       const std::string where = stage + ": column '" + name + "'";
       if (buffer.size() < 2) {
         throw Error(where + " has fewer than two non-null values to fit a power transform from");

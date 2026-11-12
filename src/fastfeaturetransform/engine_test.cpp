@@ -27,6 +27,7 @@ using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::Equals;
 using fft::testing::f64_column;
 using fft::testing::make_batch;
+using fft::testing::read_task;
 using fft::testing::TempDir;
 using fft::testing::utf8_column;
 
@@ -356,8 +357,8 @@ TEST_CASE("pure C++ end to end: fit over parquet, save, load, transform") {
   // The parts hold the batch-path output, which must equal the record path.
   auto written = fft::open_source(parts);
   std::vector<int64_t> batch_values;
-  for (const auto& task : written->plan_tasks()) {
-    fft::Batch batch = written->read_task(task, nullptr);
+  for (std::size_t task = 0; task < written->plan_tasks().size(); ++task) {
+    fft::Batch batch = read_task(*written, task);
     REQUIRE(batch.names == std::vector<std::string>{"device"});
     const auto& values = static_cast<const arrow::Int64Array&>(*batch.cols[0]);
     for (int64_t i = 0; i < values.length(); ++i) batch_values.push_back(values.Value(i));
@@ -418,8 +419,8 @@ TEST_CASE("a fit whose second encoder depends on the first runs in two passes") 
   std::vector<std::string> parts = fitted.transform_batch(sources, (dir.path / "out").string());
   auto written = fft::open_source(parts);
   std::vector<std::pair<int64_t, int64_t>> batch_rows;
-  for (const auto& task : written->plan_tasks()) {
-    fft::Batch batch = written->read_task(task, nullptr);
+  for (std::size_t task = 0; task < written->plan_tasks().size(); ++task) {
+    fft::Batch batch = read_task(*written, task);
     REQUIRE(batch.names == std::vector<std::string>{"a", "b"});
     const auto& a = static_cast<const arrow::Int64Array&>(*batch.cols[0]);
     const auto& b = static_cast<const arrow::Int64Array&>(*batch.cols[1]);

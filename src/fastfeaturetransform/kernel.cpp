@@ -88,42 +88,4 @@ std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json&
   return kernel;
 }
 
-std::vector<std::string> list_kernels() {
-  return {"select",
-          "cast",
-          "label_encode",
-          "group_agg",
-          "count_encode",
-          "ordinal_encode",
-          "one_hot_encode",
-          "rank_hot_encode",
-          "hash_encode",
-          "target_encode",
-          "m_estimate_encode",
-          "woe_encode",
-          "james_stein_encode",
-          "leave_one_out_encode",
-          "cat_boost_encode",
-          "quantile_encode",
-          "summary_encode",
-          "basen_encode",
-          "binary_encode",
-          "gray_encode",
-          "backward_difference_encode",
-          "helmert_encode",
-          "sum_encode",
-          "polynomial_encode",
-          "standard_scale",
-          "min_max_scale",
-          "max_abs_scale",
-          "binarize",
-          "normalize",
-          "robust_scale",
-          "quantile_transform",
-          "k_bins_discretize",
-          "polynomial_features",
-          "spline_transform",
-          "power_transform"};
-}
-
 }  // namespace fastfeaturetransform

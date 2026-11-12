@@ -21,7 +21,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -94,15 +93,13 @@ using StringValues = ankerl::unordered_dense::map<std::string, double, Transpare
 template <typename Record>
 class RecordLookup {
  public:
-  using Pointer = std::conditional_t<std::is_const_v<Record>, const RowValue*, RowValue*>;
-
   RecordLookup(Record& row, std::size_t lookups) : row_(row), next_(row.size()) {
     if (row.size() < 128 || lookups < 16) return;
     positions_.emplace(row.size());
     for (std::size_t i = 0; i < row.size(); ++i) positions_->try_emplace(row[i].first, i);
   }
 
-  Pointer find(const std::string& name) const {
+  RowValue* find(const std::string& name) const {
     if (positions_) {
       const auto found = positions_->find(name);
       return found == positions_->end() ? nullptr : &row_[found->second].second;

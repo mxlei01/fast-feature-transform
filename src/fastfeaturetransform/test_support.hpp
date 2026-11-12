@@ -1,19 +1,25 @@
-// Shared helpers for the C++ unit tests: a self-cleaning temporary directory
-// and builders for hand-made Arrow columns/batches.
+// Shared helpers for the C++ unit tests: a self-cleaning temporary directory,
+// builders for hand-made Arrow columns/batches, and a reader of one task of a
+// source.
 #pragma once
 
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_primitive.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "fastfeaturetransform/core.hpp"
+#include "fastfeaturetransform/io.hpp"
 
 namespace fastfeaturetransform::testing {
 
@@ -128,6 +134,23 @@ inline Batch make_batch(std::vector<std::string> names, std::vector<std::shared_
   batch.names = std::move(names);
   batch.cols = std::move(cols);
   return batch;
+}
+
+// Task number `task` of a source as one batch: read by the reader the engine
+// uses, with the task's row count as the batch size. `columns` names the
+// columns to decode (nullptr = every column). A task that arrives as more
+// than one batch is an error, so a test reads the rows it means to.
+inline Batch read_task(const RecordBatchSource& source, std::size_t task,
+                       const std::vector<std::string>* columns = nullptr) {
+  std::vector<Batch> batches;
+  const int64_t rows = std::max<int64_t>(source.task_rows()[task], 1);
+  const std::vector<std::unique_ptr<TaskReader>> readers = source.readers(1, columns);
+  readers.front()->read_batches(source.plan_tasks()[task], rows,
+                                [&](Batch batch) { batches.push_back(std::move(batch)); });
+  if (batches.size() != 1) {
+    throw Error("task " + std::to_string(task) + " was read as " + std::to_string(batches.size()) + " batches");
+  }
+  return std::move(batches.front());
 }
 
 }  // namespace fastfeaturetransform::testing

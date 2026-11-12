@@ -11,8 +11,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "fastfeaturetransform/kernel.hpp"
 #include "fastfeaturetransform/spill.hpp"
@@ -21,6 +25,7 @@
 namespace fft = fastfeaturetransform;
 using Catch::Approx;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Equals;
 using fft::testing::f64_column;
 using fft::testing::make_batch;
 using fft::testing::numeric_column;
@@ -566,6 +571,54 @@ TEST_CASE("spline_transform buffers for quantile knots and merges to the same ta
   REQUIRE(fitted("spline_transform", params, schema, {right, left})->state() == kernel->state());
 }
 
+TEST_CASE("spline_transform places quantile knots where numpy's percentile puts them") {
+  // The expected bits are np.percentile(values, 100 * np.linspace(0, 1,
+  // n_knots)), knot for knot.
+  const fft::Schema schema{{{"a", "f64"}}};
+  const auto bits = [](const std::vector<double>& values) {
+    std::vector<uint64_t> out;
+    for (double value : values) out.push_back(std::bit_cast<uint64_t>(value));
+    return out;
+  };
+  const auto knots = [&](const fft::Kernel& kernel) {
+    return bits(kernel.state().at("knots").at("a").get<std::vector<double>>());
+  };
+  // The 25th percentile interpolates from the lower value and the 75th from
+  // the upper one, as numpy does; from the other end, each would differ in
+  // its last bit. Each value reaches a worker of its own, so the fit finds
+  // the two values it needs only by adding both workers' counts.
+  auto ends = fitted("spline_transform", {{"columns", {"a"}}, {"n_knots", 5}, {"knots", "quantile"}}, schema,
+                     {make_batch({"a"}, {f64_column({1.2})}), make_batch({"a"}, {f64_column({-0.95})})});
+  REQUIRE(knots(*ends) == bits({-0.95, -0x1.a666666666666p-2, 0x1p-3, 0x1.5333333333333p-1, 1.2}));
+  // Four knots sit at thirds, and 100 * t / 100 is not t for a third: numpy
+  // reads the quantile at the rank the round trip gives.
+  auto thirds = fitted("spline_transform", {{"columns", {"a"}}, {"n_knots", 4}, {"knots", "quantile"}}, schema,
+                       {make_batch({"a"}, {f64_column({-7.39, 1.85})})});
+  REQUIRE(knots(*thirds) == bits({-7.39, -0x1.13d70a3d70a3ep+2, -0x1.3ae147ae147b4p+0, 1.85}));
+  // Halfway between two values numpy interpolates from the upper one: the
+  // middle of three knots over 0.1 and 0.7 is 0x1.9999999999999p-2, where
+  // the lower one gives 0x1.999999999999ap-2.
+  auto middle = fitted("spline_transform", {{"columns", {"a"}}, {"n_knots", 3}, {"knots", "quantile"}}, schema,
+                       {make_batch({"a"}, {f64_column({0.7, 0.1})})});
+  REQUIRE(knots(*middle) == bits({0.1, 0x1.9999999999999p-2, 0.7}));
+}
+
+TEST_CASE("the expanders' boolean parameters take a bool or null and name the step otherwise") {
+  const std::vector<std::pair<std::string, std::string>> flags{{"polynomial_features", "interaction_only"},
+                                                               {"polynomial_features", "include_bias"},
+                                                               {"spline_transform", "include_bias"},
+                                                               {"power_transform", "standardize"}};
+  for (const auto& [id, key] : flags) {
+    CAPTURE(id, key);
+    REQUIRE_THROWS_WITH(fft::make_kernel(id, {{"columns", {"a"}}, {key, 1}}),
+                        Equals(id + ": '" + key + "' must be true or false"));
+    // A null takes the default, which the step reports as its value.
+    const bool fallback = key != "interaction_only";
+    REQUIRE(fft::make_kernel(id, {{"columns", {"a"}}, {key, nullptr}})->params().at(key) == fallback);
+    REQUIRE(fft::make_kernel(id, {{"columns", {"a"}}, {key, !fallback}})->params().at(key) == !fallback);
+  }
+}
+
 TEST_CASE("spline_transform refuses what it cannot fit or extrapolate") {
   const fft::Schema schema{{{"a", "f64"}}};
   REQUIRE_THROWS_WITH(fitted("spline_transform", {{"columns", {"a"}}, {"n_knots", 3}}, schema,
@@ -941,13 +994,67 @@ TEST_CASE("spline_transform's fitted knots do not depend on the row split") {
 
 TEST_CASE("the expanders refuse an integer past 2^53 rather than rounding it") {
   // The scalers round such an integer; the expanders refuse it through
-  // expand.cpp's exact_double, which both transform paths call.
+  // numeric.hpp's exact_double, which both transform paths call.
   constexpr int64_t kBig = (int64_t{1} << 53) + 1;
   auto poly = resolved("polynomial_features", {{"columns", {"a"}}, {"degree", 2}}, fft::Schema{{{"a", "i64"}}});
   REQUIRE_THROWS_WITH(poly->transform(make_batch({"a"}, {numeric_column<arrow::Int64Type>({kBig})})),
                       ContainsSubstring("value 9007199254740993 is beyond 2^53 in magnitude"));
   REQUIRE_THROWS_WITH(poly->transform_row({{"a", kBig}}),
                       ContainsSubstring("value 9007199254740993 is beyond 2^53 in magnitude"));
+}
+
+TEST_CASE("the fits of spline_transform and power_transform read a value under the expanders' rules") {
+  // Both fits keep their values in the numeric family's buffered state, which
+  // robust_scale and quantile_transform fill by rounding an integer past 2^53
+  // and by telling the reader of a NaN to write a null. Neither holds here:
+  // the integer is refused, and the message stops at 'is not finite'.
+  constexpr int64_t kExact = int64_t{1} << 53;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double infinity = std::numeric_limits<double>::infinity();
+  const fft::Schema integers{{{"a", "i64"}}};
+  const fft::Schema floats{{{"a", "f64"}}};
+  const std::vector<nlohmann::json> steps{
+      {{"kernel", "spline_transform"}, {"params", {{"columns", {"a"}}, {"knots", "uniform"}}}},
+      {{"kernel", "spline_transform"}, {"params", {{"columns", {"a"}}, {"knots", "quantile"}}}},
+      {{"kernel", "power_transform"}, {"params", {{"columns", {"a"}}}}},
+  };
+  for (const nlohmann::json& step : steps) {
+    CAPTURE(step.dump());
+    const std::string id = step.at("kernel").get<std::string>();
+    const nlohmann::json& params = step.at("params");
+    const auto fit_integers = [&](std::vector<std::optional<int64_t>> values) {
+      return fitted(id, params, integers, {make_batch({"a"}, {numeric_column<arrow::Int64Type>(values)})});
+    };
+    const auto fit_floats = [&](const std::vector<double>& values) {
+      return fitted(id, params, floats, {make_batch({"a"}, {f64_column(values)})});
+    };
+    REQUIRE_THROWS_WITH(fit_integers({1, 2, kExact + 1}),
+                        Equals("expand: column 'a': value 9007199254740993 is beyond 2^53 in magnitude, where f64 no "
+                               "longer holds every integer exactly"));
+    REQUIRE_THROWS_WITH(fit_integers({1, 2, -kExact - 1}),
+                        Equals("expand: column 'a': value -9007199254740993 is beyond 2^53 in magnitude, where f64 "
+                               "no longer holds every integer exactly"));
+    // 2^53 itself is held exactly, so it fits.
+    REQUIRE_NOTHROW(fit_integers({1, 2, kExact, -kExact}));
+    REQUIRE_THROWS_WITH(fit_floats({1.0, 2.0, nan}), Equals("expand: column 'a': value nan is not finite"));
+    REQUIRE_THROWS_WITH(fit_floats({1.0, -infinity, 2.0}), Equals("expand: column 'a': value -inf is not finite"));
+  }
+}
+
+TEST_CASE("the expanders' transforms refuse a value that is not finite without the hint to write a null") {
+  const double infinity = std::numeric_limits<double>::infinity();
+  const fft::Schema schema{{{"a", "f64"}}};
+  const fft::Batch fit = make_batch({"a"}, {f64_column({1.0, 2.0, 4.0, 8.0})});
+  std::vector<std::unique_ptr<fft::Kernel>> kernels;
+  kernels.push_back(resolved("polynomial_features", {{"columns", {"a"}}}, schema));
+  kernels.push_back(fitted("spline_transform", {{"columns", {"a"}}}, schema, {fit}));
+  kernels.push_back(fitted("power_transform", {{"columns", {"a"}}}, schema, {fit}));
+  for (const auto& kernel : kernels) {
+    CAPTURE(kernel->id());
+    REQUIRE_THROWS_WITH(kernel->transform(make_batch({"a"}, {f64_column({1.0, infinity})})),
+                        Equals("expand: column 'a': value inf is not finite"));
+    REQUIRE_THROWS_WITH(kernel->transform_row({{"a", -infinity}}), Equals("expand: key 'a': value -inf is not finite"));
+  }
 }
 
 TEST_CASE("polynomial suffix reuse distinguishes a source named 1 from the bias") {

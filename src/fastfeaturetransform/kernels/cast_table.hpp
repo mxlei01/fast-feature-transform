@@ -6,7 +6,6 @@
 #pragma once
 
 #include <arrow/array/builder_binary.h>
-#include <arrow/array/builder_primitive.h>
 
 #include <charconv>
 #include <cmath>
@@ -193,49 +192,6 @@ inline double floating_in_width(double value, const CastTarget& target, const st
     throw Error(where + ": value " + std::format("{}", value) + " does not fit in f32");
   }
   return static_cast<double>(static_cast<float>(value));
-}
-
-template <typename ArrowType, typename Value>
-std::shared_ptr<arrow::Array> build_numeric(const std::vector<Value>& values, const std::vector<bool>& nulls,
-                                            const std::string& where) {
-  arrow::NumericBuilder<ArrowType> builder;
-  if (!builder.Reserve(static_cast<int64_t>(values.size())).ok()) throw Error(where + ": allocation failed");
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    if (nulls[i]) {
-      builder.UnsafeAppendNull();
-    } else {
-      builder.UnsafeAppend(static_cast<typename ArrowType::c_type>(values[i]));
-    }
-  }
-  std::shared_ptr<arrow::Array> array;
-  if (!builder.Finish(&array).ok()) throw Error(where + ": failed to build the cast column");
-  return array;
-}
-
-inline std::shared_ptr<arrow::Array> build_integer(const CastTarget& target, const std::vector<int64_t>& values,
-                                                   const std::vector<bool>& nulls, const std::string& where) {
-  if (target.is_unsigned) {
-    switch (target.bits) {
-      case 8:
-        return build_numeric<arrow::UInt8Type>(values, nulls, where);
-      case 16:
-        return build_numeric<arrow::UInt16Type>(values, nulls, where);
-      case 32:
-        return build_numeric<arrow::UInt32Type>(values, nulls, where);
-      default:
-        return build_numeric<arrow::UInt64Type>(values, nulls, where);
-    }
-  }
-  switch (target.bits) {
-    case 8:
-      return build_numeric<arrow::Int8Type>(values, nulls, where);
-    case 16:
-      return build_numeric<arrow::Int16Type>(values, nulls, where);
-    case 32:
-      return build_numeric<arrow::Int32Type>(values, nulls, where);
-    default:
-      return build_numeric<arrow::Int64Type>(values, nulls, where);
-  }
 }
 
 inline Family family_of_array(const arrow::Array& array, const std::string& where) {

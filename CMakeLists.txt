@@ -223,14 +223,10 @@ else()
     target_link_options(_core PRIVATE "LINKER:--exclude-libs,ALL")
   endif()
 
+  # The module's stub and the py.typed marker are tracked files of the Python
+  # package (fast_feature_transform/_core.pyi, py.typed), which
+  # scikit-build-core copies into the wheel with the package's sources, so
+  # nothing here generates or installs them. test/test_invariants.py fails
+  # when the tracked stub differs from the one nanobind generates.
   install(TARGETS _core LIBRARY DESTINATION fast_feature_transform)
-
-  nanobind_add_stub(_core_stub
-    MODULE _core
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/_core.pyi"
-    PYTHON_PATH "$<TARGET_FILE_DIR:_core>"
-    MARKER_FILE "${CMAKE_CURRENT_BINARY_DIR}/py.typed"
-    DEPENDS _core)
-  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/_core.pyi" "${CMAKE_CURRENT_BINARY_DIR}/py.typed"
-          DESTINATION fast_feature_transform)
 endif()

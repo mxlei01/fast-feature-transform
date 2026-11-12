@@ -613,7 +613,22 @@ TEST_CASE("count_encode dictionary fits and transforms preserve counts policies 
   }
 }
 
-TEST_CASE("count_encode dictionary fit offsets survive growth and revisits") {
+TEST_CASE("count_encode counts the null rows of a batch that shares a larger dictionary") {
+  // Ten entries, the first of them null, under five rows: the fit reads such
+  // a batch row by row instead of tallying its dictionary. One row points at
+  // the null entry and one is null itself, its index slot holding 0, the
+  // null entry's index, so the column has two nulls.
+  const auto fixture = fft::testing::dictionary_fixture({std::nullopt, "a", "b", "c", "d", "e", "f", "g", "h", "i"},
+                                                        {1, std::nullopt, 0, 2, 1});
+  const fft::Schema schema{{{"c", "utf8"}}};
+  const auto dictionary = fit_count({{"columns", {"c"}}}, schema, {make_batch({"c"}, {fixture.encoded})});
+  const auto plain = fit_count({{"columns", {"c"}}}, schema, {make_batch({"c"}, {fixture.plain})});
+  REQUIRE(dictionary->state() == plain->state());
+  REQUIRE(dictionary->state().at("counts").at("c") == nlohmann::json({{"a", 2}, {"b", 1}}));
+  REQUIRE(dictionary->state().at("null_counts").at("c") == 2);
+}
+
+TEST_CASE("count_encode dictionary fits keep exact counts through map growth and revisits") {
   constexpr int64_t categories = 1024;
   std::vector<std::optional<std::string>> words;
   for (int64_t i = 0; i < categories; ++i) words.emplace_back("category-" + std::to_string(i));

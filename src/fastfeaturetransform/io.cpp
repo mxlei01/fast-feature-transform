@@ -191,15 +191,14 @@ std::unique_ptr<parquet::arrow::FileReader> make_reader(const std::string& path,
   return std::move(*reader);
 }
 
+// A column chunk is read through a 64 KiB buffer, so a reader holds the pages
+// of the batch it decodes and not the whole chunk.
 std::unique_ptr<parquet::ParquetFileReader> open_raw(const std::string& path,
-                                                     std::shared_ptr<parquet::FileMetaData> metadata,
-                                                     bool bounded = false) {
+                                                     std::shared_ptr<parquet::FileMetaData> metadata) {
   try {
     auto properties = parquet::default_reader_properties();
-    if (bounded) {
-      properties.enable_buffered_stream();
-      properties.set_buffer_size(64 * 1024);
-    }
+    properties.enable_buffered_stream();
+    properties.set_buffer_size(64 * 1024);
     return parquet::ParquetFileReader::Open(open_file(path), properties, std::move(metadata));
   } catch (const parquet::ParquetException& e) {
     throw Error(path + ": " + e.what());
@@ -526,40 +525,6 @@ Batch batch_from_arrow(const arrow::RecordBatch& input) {
   return batch;
 }
 
-void TaskReader::read_batches(const Task& task, int64_t batch_size, const std::function<void(Batch)>& consume) {
-  if (batch_size <= 0) throw Error("batch_size must be a positive integer");
-  Batch input = read(task);
-  if (input.rows == 0) {
-    consume(std::move(input));
-    return;
-  }
-  for (int64_t offset = 0; offset < input.rows; offset += batch_size) {
-    Batch part;
-    part.rows = std::min(batch_size, input.rows - offset);
-    part.names = input.names;
-    for (const auto& column : input.cols) part.cols.push_back(column->Slice(offset, part.rows));
-    consume(std::move(part));
-  }
-}
-
-std::vector<std::unique_ptr<TaskReader>> RecordBatchSource::readers(unsigned workers,
-                                                                    const std::vector<std::string>* columns) const {
-  class Reader final : public TaskReader {
-   public:
-    Reader(const RecordBatchSource& source, const std::vector<std::string>* columns) : source_(source) {
-      if (columns != nullptr) columns_ = *columns;
-    }
-    Batch read(const Task& task) override { return source_.read_task(task, columns_ ? &*columns_ : nullptr); }
-
-   private:
-    const RecordBatchSource& source_;
-    std::optional<std::vector<std::string>> columns_;
-  };
-  std::vector<std::unique_ptr<TaskReader>> out;
-  for (unsigned worker = 0; worker < workers; ++worker) out.push_back(std::make_unique<Reader>(*this, columns));
-  return out;
-}
-
 ParquetSource::ParquetSource(const std::vector<std::string>& files, unsigned workers) {
   if (files.empty()) throw Error("no input files given");
   struct Prepared {
@@ -688,64 +653,18 @@ class ParquetSource::Reader final : public TaskReader {
   Reader(const ParquetSource& source, std::shared_ptr<const Projection> projection)
       : source_(source), projection_(std::move(projection)) {}
 
-  Batch read(const Task& task) override {
-    const File& file = source_.files_[task.file];
-    // One reader/file descriptor per worker, not one per input file. Dynamic
-    // task assignment retains reuse for adjacent groups without unbounded FDs.
-    if (!reader_ || file_ != task.file || bounded_) {
-      reader_ = make_reader(file.path, open_raw(file.path, file.metadata), file.properties);
-      file_ = task.file;
-      bounded_ = false;
-    }
-    auto read = projection_ ? reader_->ReadRowGroup(task.row_group, (*projection_)[task.file])
-                            : reader_->ReadRowGroup(task.row_group);
-    if (!read.ok()) {
-      throw Error(file.path + ": failed to read row group " + std::to_string(task.row_group) + ": " +
-                  read.status().ToString());
-    }
-    std::shared_ptr<arrow::Table> table = *read;
-    if (std::any_of(table->columns().begin(), table->columns().end(),
-                    [](const auto& column) { return column->num_chunks() > 1; })) {
-      auto combined = table->CombineChunks(arrow::default_memory_pool());
-      if (!combined.ok()) throw Error(file.path + ": " + combined.status().ToString());
-      table = *combined;
-    }
-
-    Batch batch;
-    batch.rows = table->num_rows();
-    for (int i = 0; i < table->num_columns(); ++i) {
-      const auto& chunks = table->column(i);
-      std::shared_ptr<arrow::Array> column;
-      if (chunks->num_chunks() == 1) {
-        column = chunks->chunk(0);
-      } else if (chunks->num_chunks() == 0) {
-        // A 0-row row group (empty partition) decodes to no chunks at all.
-        auto empty = arrow::MakeEmptyArray(chunks->type());
-        if (!empty.ok()) throw Error(file.path + ": " + empty.status().ToString());
-        column = *empty;
-      } else {
-        throw Error(file.path + ": column '" + table->field(i)->name() + "' has " +
-                    std::to_string(chunks->num_chunks()) + " chunks after CombineChunks");
-      }
-      check_dictionary_indices(*column, file.path + ": failed to read row group " + std::to_string(task.row_group),
-                               table->field(i)->name());
-      batch.names.push_back(table->field(i)->name());
-      batch.cols.push_back(epoch_microseconds(column, table->field(i)->name()));
-    }
-    return batch;
-  }
-
   void read_batches(const Task& task, int64_t batch_size, const std::function<void(Batch)>& consume) override {
     if (batch_size <= 0) throw Error("batch_size must be a positive integer");
     const File& file = source_.files_[task.file];
-    if (!reader_ || file_ != task.file || !bounded_) {
+    // One reader/file descriptor per worker, not one per input file. Dynamic
+    // task assignment retains reuse for adjacent groups without unbounded FDs.
+    if (!reader_ || file_ != task.file) {
       auto properties = file.properties;
       // Otherwise Arrow may prefetch the entire compressed row group, even
       // though decoded record batches are small.
       properties.set_pre_buffer(false);
-      reader_ = make_reader(file.path, open_raw(file.path, file.metadata, true), properties);
+      reader_ = make_reader(file.path, open_raw(file.path, file.metadata), properties);
       file_ = task.file;
-      bounded_ = true;
     }
     reader_->set_batch_size(batch_size);
     auto stream = projection_ ? reader_->GetRecordBatchReader({task.row_group}, (*projection_)[task.file])
@@ -781,7 +700,6 @@ class ParquetSource::Reader final : public TaskReader {
   std::shared_ptr<const Projection> projection_;
   std::size_t file_ = 0;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
-  bool bounded_ = false;
 };
 
 std::vector<std::unique_ptr<TaskReader>> ParquetSource::readers(unsigned workers,
@@ -808,10 +726,6 @@ std::vector<std::unique_ptr<TaskReader>> ParquetSource::readers(unsigned workers
   std::vector<std::unique_ptr<TaskReader>> out;
   for (unsigned worker = 0; worker < workers; ++worker) out.push_back(std::make_unique<Reader>(*this, projection));
   return out;
-}
-
-Batch ParquetSource::read_task(const Task& task, const std::vector<std::string>* columns) const {
-  return readers(1, columns).front()->read(task);
 }
 
 std::unique_ptr<RecordBatchSource> open_source(const std::vector<std::string>& files, unsigned workers) {
