@@ -1,33 +1,50 @@
 // Explicit C++ tests for Parquet I/O: content sniffing, the write_part ->
 // ParquetSource round trip, projection, empty row groups, list shapes,
-// timestamps, dictionary indices, cross-file schema validation, PartWriter,
-// and MemmapSink.
+// timestamps, dictionary indices, cross-file schema validation, PartWriter
+// (its write buffer and dictionary page limit included), and MemmapSink.
 
 #include "fastfeaturetransform/io.hpp"
 
 #include <arrow/array.h>
+#include <arrow/array/builder_decimal.h>
 #include <arrow/array/builder_nested.h>
+#include <arrow/array/builder_primitive.h>
 #include <arrow/io/file.h>
+#include <arrow/memory_pool.h>
 #include <arrow/table.h>
+#include <arrow/type.h>
+#include <arrow/util/decimal.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_page.h>
+#include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/properties.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 #include "fastfeaturetransform/test_support.hpp"
 
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::StartsWith;
 using fft::testing::bool_column;
 using fft::testing::f64_column;
 using fft::testing::make_batch;
@@ -79,6 +96,96 @@ std::string dictionary_file(const TempDir& dir, const std::string& name, const s
   file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   REQUIRE(file.good());
   return path;
+}
+
+// Runs `action` while this process can grow no file past `bytes`, and
+// returns the message of the fft::Error it throws, or an empty string when it
+// throws none. A write past the limit fails with EFBIG, which stages a disk
+// that refuses the write; the signal sent with it is ignored meanwhile.
+// Nothing is asserted while the limit holds, because it also binds a file
+// that Catch2 reports to.
+std::string error_under_file_size_limit(rlim_t bytes, const std::function<void()>& action) {
+  rlimit original{};
+  REQUIRE(getrlimit(RLIMIT_FSIZE, &original) == 0);
+  struct Restore {
+    rlimit limit;
+    void (*handler)(int);
+    ~Restore() {
+      setrlimit(RLIMIT_FSIZE, &limit);
+      std::signal(SIGXFSZ, handler);
+    }
+  } restore{original, std::signal(SIGXFSZ, SIG_IGN)};
+  rlimit lowered = original;
+  lowered.rlim_cur = bytes;
+  if (setrlimit(RLIMIT_FSIZE, &lowered) != 0) return "the file size limit could not be set";
+  try {
+    action();
+  } catch (const fft::Error& error) {
+    return error.message;
+  }
+  return "";
+}
+
+// `rows` doubles that Snappy cannot shrink, so a page of them takes 8 bytes a
+// value in the file.
+std::vector<double> incompressible_doubles(std::size_t rows, uint64_t seed) {
+  std::vector<double> values(rows);
+  uint64_t state = seed;
+  for (double& value : values) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    value = static_cast<double>(state >> 11) / 9007199254740992.0;  // 53 random bits in [0, 1)
+  }
+  return values;
+}
+
+// An i64 column whose row `r` holds `value(r)`.
+std::shared_ptr<arrow::Array> i64_column(int64_t rows, const std::function<int64_t(int64_t)>& value) {
+  arrow::Int64Builder builder;
+  for (int64_t row = 0; row < rows; ++row) (void)builder.Append(value(row));
+  std::shared_ptr<arrow::Array> array;
+  (void)builder.Finish(&array);
+  return array;
+}
+
+// A column of `rows` values of a numeric Arrow type, cycling through 0 to 6.
+template <typename ArrowType>
+std::shared_ptr<arrow::Array> cycling_column(int64_t rows) {
+  arrow::NumericBuilder<ArrowType> builder;
+  for (int64_t row = 0; row < rows; ++row) (void)builder.Append(static_cast<typename ArrowType::c_type>(row % 7));
+  std::shared_ptr<arrow::Array> array;
+  (void)builder.Finish(&array);
+  return array;
+}
+
+// What the pages of one column chunk hold: the entries of its dictionary
+// page, and how many values its data pages store as dictionary indices and
+// how many plain.
+struct ChunkPages {
+  int64_t dictionary_entries = 0;
+  int64_t index_values = 0;
+  int64_t plain_values = 0;
+};
+
+ChunkPages chunk_pages(const std::string& path, int column) {
+  const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+  REQUIRE(file->metadata()->num_row_groups() == 1);
+  const std::shared_ptr<parquet::RowGroupReader> group = file->RowGroup(0);
+  const std::unique_ptr<parquet::PageReader> pages = group->GetColumnPageReader(column);
+  ChunkPages out;
+  while (const std::shared_ptr<parquet::Page> page = pages->NextPage()) {
+    if (page->type() == parquet::PageType::DICTIONARY_PAGE) {
+      out.dictionary_entries += static_cast<const parquet::DictionaryPage&>(*page).num_values();
+    } else if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
+      const auto& data = static_cast<const parquet::DataPage&>(*page);
+      if (data.encoding() == parquet::Encoding::PLAIN) {
+        out.plain_values += data.num_values();
+      } else if (data.encoding() == parquet::Encoding::RLE_DICTIONARY ||
+                 data.encoding() == parquet::Encoding::PLAIN_DICTIONARY) {
+        out.index_values += data.num_values();
+      }
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -684,6 +791,218 @@ TEST_CASE("PartWriter removes temporary output when publication or initializatio
   fft::PartWriter no_schema(dir.path.string(), 1, 0);
   REQUIRE_THROWS_WITH(no_schema.finish(), ContainsSubstring("no batches supplied"));
   REQUIRE_FALSE(std::filesystem::exists(part(dir, 1) + ".tmp"));
+}
+
+TEST_CASE("PartWriter holds at most 64 KiB of a part back from its file") {
+  TempDir dir;
+  const std::string output = part(dir, 0);
+  // 7,500 doubles are 60,000 bytes of page, which the buffer holds. The
+  // 8,000 bytes of 1,000 more do not fit beside them, so they push the
+  // first batch out. 20,000 doubles are 160,000 bytes.
+  const std::vector<double> first = incompressible_doubles(7500, 1);
+  const std::vector<double> second = incompressible_doubles(1000, 2);
+  const std::vector<double> third = incompressible_doubles(20000, 3);
+  fft::PartWriter writer(dir.path.string(), 0, 28500);
+  writer.append(make_batch({"x"}, {f64_column(first)}));
+  REQUIRE(std::filesystem::file_size(output + ".tmp") == 0u);
+  writer.append(make_batch({"x"}, {f64_column(second)}));
+  const auto after_second = std::filesystem::file_size(output + ".tmp");
+  REQUIRE(after_second >= 60000u);  // the first batch, which the second pushed out
+  REQUIRE(after_second < 68000u);   // the second batch is still held back
+  writer.append(make_batch({"x"}, {f64_column(third)}));
+  REQUIRE(std::filesystem::file_size(output + ".tmp") >= 228000u - 65536u);
+  REQUIRE(writer.finish() == output);
+  REQUIRE(std::filesystem::file_size(output) >= 228000u);
+
+  auto source = fft::open_source({output});
+  REQUIRE(source->task_rows() == std::vector<int64_t>{7500, 1000, 20000});
+  std::vector<double> expected = first;
+  expected.insert(expected.end(), second.begin(), second.end());
+  expected.insert(expected.end(), third.begin(), third.end());
+  std::vector<double> actual;
+  for (const auto& task : source->plan_tasks()) {
+    const fft::Batch batch = source->read_task(task, nullptr);
+    const auto& values = static_cast<const arrow::DoubleArray&>(*batch.cols[0]);
+    actual.insert(actual.end(), values.raw_values(), values.raw_values() + values.length());
+  }
+  REQUIRE(actual == expected);
+}
+
+TEST_CASE("PartWriter fails a part whose write the disk refuses, whichever call meets it, and publishes nothing") {
+  TempDir dir;
+  const std::string previous = fft::write_part(dir.path.string(), 0, make_batch({"x"}, {f64_column({7.0})}));
+  const std::string published = file_contents(previous);
+  const auto small = make_batch({"x"}, {f64_column({1.0, 2.0, 3.0})});
+  const auto large = make_batch({"x"}, {f64_column(incompressible_doubles(20000, 4))});
+  const auto nothing_left = [&] {
+    REQUIRE_FALSE(std::filesystem::exists(previous + ".tmp"));
+    REQUIRE(file_contents(previous) == published);
+  };
+
+  // A batch larger than the buffer reaches the file while it is appended, so
+  // append meets the refusal.
+  std::string immediate;
+  {
+    fft::PartWriter writer(dir.path.string(), 0, 20000);
+    immediate = error_under_file_size_limit(16, [&] { writer.append(large); });
+    nothing_left();
+    REQUIRE_THROWS_WITH(writer.finish(), ContainsSubstring("no longer active"));
+  }
+  REQUIRE_THAT(immediate, StartsWith(previous + ": "));
+  REQUIRE_THAT(immediate, ContainsSubstring("File too large"));
+
+  // A part smaller than the buffer reaches the file only when finish closes
+  // it: append succeeds, and finish reports the same error and publishes
+  // nothing.
+  {
+    fft::PartWriter writer(dir.path.string(), 0, 3);
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.append(small); }).empty());
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.finish(); }) == immediate);
+    nothing_left();
+    REQUIRE_THROWS_WITH(writer.finish(), ContainsSubstring("no longer active"));
+    writer.abandon();
+    nothing_left();
+  }
+
+  // A writer dropped while its buffer holds bytes the file cannot take
+  // removes its temporary file and raises nothing.
+  REQUIRE(error_under_file_size_limit(16, [&] {
+            fft::PartWriter writer(dir.path.string(), 1, 3);
+            writer.append(small);
+          }).empty());
+  REQUIRE_FALSE(std::filesystem::exists(part(dir, 1)));
+  REQUIRE_FALSE(std::filesystem::exists(part(dir, 1) + ".tmp"));
+
+  // With the limit lifted the same part is written and published.
+  auto source = fft::open_source({fft::write_part(dir.path.string(), 0, small)});
+  REQUIRE(source->task_rows() == std::vector<int64_t>{3});
+}
+
+TEST_CASE("a part of numbers ends a dictionary of 8-byte values at 248 KiB and writes the rest plain") {
+  TempDir dir;
+  constexpr int64_t kRows = 65536;
+  const auto distinct = [](int64_t row) { return row * 1'000'003 - 40'000'000'000; };
+
+  // Every value distinct: 248 KiB is 31,744 entries, and the hash table of
+  // Arrow's encoder would grow at the 32,768th.
+  const std::string path = fft::write_part(
+      dir.path.string(), 0,
+      make_batch({"id", "x"}, {i64_column(kRows, distinct),
+                               f64_column(incompressible_doubles(static_cast<std::size_t>(kRows), 5))}));
+  const ChunkPages pages = chunk_pages(path, 0);
+  REQUIRE(pages.dictionary_entries >= 31744);
+  REQUIRE(pages.dictionary_entries < 32768);
+  REQUIRE(pages.index_values == pages.dictionary_entries);  // each row until then added an entry
+  REQUIRE(pages.plain_values == kRows - pages.dictionary_entries);
+  auto source = fft::open_source({path});
+  const fft::Batch batch = source->read_task(source->plan_tasks().front(), nullptr);
+  REQUIRE(batch.rows == kRows);
+  const auto& ids = static_cast<const arrow::Int64Array&>(*batch.cols[0]);
+  for (int64_t row = 0; row < kRows; ++row) {
+    if (ids.Value(row) != distinct(row)) FAIL("row " << row << " holds " << ids.Value(row));
+  }
+
+  // The limit is exact: 31,743 distinct values are 8 bytes short of it and
+  // keep their dictionary for every row, and 31,744 reach it. The distinct
+  // values come first, so rows are left to write once the limit is met.
+  for (const int64_t entries : {31743, 31744}) {
+    CAPTURE(entries);
+    const auto column = i64_column(kRows, [&](int64_t row) { return row < entries ? distinct(row) : distinct(0); });
+    const ChunkPages boundary = chunk_pages(fft::write_part(dir.path.string(), 1, make_batch({"id"}, {column})), 0);
+    REQUIRE(boundary.dictionary_entries == entries);
+    REQUIRE(boundary.index_values + boundary.plain_values == kRows);
+    REQUIRE((boundary.plain_values > 0) == (entries == 31744));
+  }
+}
+
+TEST_CASE("the dictionary limit is lowered only for a part of numbers, bools, times and dictionaries of text") {
+  TempDir dir;
+  // One row group of distinct 8-byte values, enough of them to pass 248 KiB.
+  constexpr int64_t kRows = 34000;
+  const auto id = i64_column(kRows, [](int64_t row) { return row * 1'000'003; });
+  const auto small32 = cycling_column<arrow::Int32Type>(kRows);
+  const auto small64 = cycling_column<arrow::Int64Type>(kRows);
+  // 20,000 strings of 20 bytes: a dictionary of 480,000 bytes, past the limit.
+  std::vector<std::optional<std::string>> words;
+  std::vector<std::optional<int32_t>> word_of_row;
+  for (int32_t word = 0; word < 20000; ++word) words.emplace_back("word-" + std::to_string(100'000'000'000'000 + word));
+  for (int64_t row = 0; row < kRows; ++row) word_of_row.emplace_back(static_cast<int32_t>(row % 20000));
+  const auto text =
+      *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::utf8()),
+                                          numeric_column<arrow::Int32Type>(word_of_row), utf8_column(words));
+
+  std::vector<std::optional<bool>> flags;
+  for (int64_t row = 0; row < kRows; ++row) flags.emplace_back(row % 3 == 0);
+  const std::vector<std::pair<std::string, std::shared_ptr<arrow::Array>>> lowered{
+      {"i8", cycling_column<arrow::Int8Type>(kRows)},
+      {"i16", cycling_column<arrow::Int16Type>(kRows)},
+      {"i32", small32},
+      {"i64", small64},
+      {"u8", cycling_column<arrow::UInt8Type>(kRows)},
+      {"u16", cycling_column<arrow::UInt16Type>(kRows)},
+      {"u32", cycling_column<arrow::UInt32Type>(kRows)},
+      {"u64", cycling_column<arrow::UInt64Type>(kRows)},
+      {"f16", cycling_column<arrow::HalfFloatType>(kRows)},
+      {"f32", cycling_column<arrow::FloatType>(kRows)},
+      {"f64", cycling_column<arrow::DoubleType>(kRows)},
+      {"bool", bool_column(flags)},
+      {"date32", cycling_column<arrow::Date32Type>(kRows)},
+      {"date64", *small64->View(arrow::date64())},
+      {"time32", *small32->View(arrow::time32(arrow::TimeUnit::MILLI))},
+      {"time64", *small64->View(arrow::time64(arrow::TimeUnit::MICRO))},
+      {"timestamp", *small64->View(arrow::timestamp(arrow::TimeUnit::MICRO))},
+      {"duration", *small64->View(arrow::duration(arrow::TimeUnit::MICRO))},
+      {"dictionary of utf8", text},
+  };
+  for (const auto& [name, column] : lowered) {
+    CAPTURE(name);
+    const std::string path = fft::write_part(dir.path.string(), 0, make_batch({"id", "other"}, {id, column}));
+    const ChunkPages pages = chunk_pages(path, 0);
+    REQUIRE(pages.dictionary_entries >= 31744);
+    REQUIRE(pages.dictionary_entries < 32768);
+    REQUIRE(pages.plain_values == kRows - pages.dictionary_entries);
+  }
+  // The dictionary of text is written as the dictionary it is, though it is
+  // larger than the limit that stopped the integers beside it.
+  const ChunkPages text_pages =
+      chunk_pages(fft::write_part(dir.path.string(), 0, make_batch({"id", "other"}, {id, text})), 1);
+  REQUIRE(text_pages.dictionary_entries == 20000);
+  REQUIRE(text_pages.index_values == kRows);
+  REQUIRE(text_pages.plain_values == 0);
+
+  // Any other column keeps Arrow's 1 MiB for the whole part: its own
+  // dictionary can be worth more than 248 KiB. It does so wherever it
+  // stands, after the integers or before them.
+  std::vector<std::optional<std::string>> strings;
+  for (int64_t row = 0; row < kRows; ++row) strings.emplace_back("s" + std::to_string(row % 7));
+  arrow::Decimal128Builder decimals(arrow::decimal128(38, 4));
+  arrow::ListBuilder lists(arrow::default_memory_pool(), std::make_shared<arrow::Int64Builder>());
+  auto& elements = static_cast<arrow::Int64Builder&>(*lists.value_builder());
+  for (int64_t row = 0; row < kRows; ++row) {
+    (void)decimals.Append(arrow::Decimal128(row % 7));
+    (void)lists.Append();
+    (void)elements.Append(row % 7);
+  }
+  const std::vector<std::pair<std::string, std::shared_ptr<arrow::Array>>> kept{
+      {"utf8", utf8_column(strings)},
+      {"decimal", *decimals.Finish()},
+      {"list of i64", *lists.Finish()},
+      {"dictionary of i64",
+       *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::int64()), small32,
+                                           numeric_column<arrow::Int64Type>({10, 11, 12, 13, 14, 15, 16}))},
+  };
+  for (const auto& [name, column] : kept) {
+    CAPTURE(name);
+    for (const bool other_first : {false, true}) {
+      CAPTURE(other_first);
+      const fft::Batch batch =
+          other_first ? make_batch({"other", "id"}, {column, id}) : make_batch({"id", "other"}, {id, column});
+      const ChunkPages pages = chunk_pages(fft::write_part(dir.path.string(), 0, batch), other_first ? 1 : 0);
+      REQUIRE(pages.dictionary_entries == kRows);
+      REQUIRE(pages.index_values == kRows);
+      REQUIRE(pages.plain_values == 0);
+    }
+  }
 }
 
 TEST_CASE("MemmapSink lays out packed records and writes tasks at their offsets in any order") {

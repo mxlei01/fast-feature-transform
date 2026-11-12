@@ -23,7 +23,8 @@ Where each side is favored, stated up front rather than buried:
 - The write-back matches our sink setting for setting. Same Snappy
   compression, same Parquet 2.6 format, no stored Arrow or pandas schema,
   dictionary encoding disabled for floating-point columns and left on for
-  everything else, which is what ``PartWriter`` in
+  everything else, the same dictionary page limit and the same 64 KiB write
+  buffer in front of each file, which is what ``PartWriter`` in
   ``src/fastfeaturetransform/io.cpp`` does, and the same parts and row groups.
   The sink writes a row group per batch and sizes its batches by how wide the
   pipeline's rows are, so that layout is read back from the parts our own

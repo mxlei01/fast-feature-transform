@@ -104,6 +104,8 @@ class ParquetSource final : public RecordBatchSource {
 // one typed empty batch. Nonempty batches become separate output row groups,
 // so the writer never retains all rows of the source row group. Publication
 // occurs only after schema/total-row validation and successful writer close.
+// The file is written through a buffer, so a write the disk refuses fails a
+// later append() or finish(), not always the append() that produced the bytes.
 class PartWriter {
  public:
   PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows);
