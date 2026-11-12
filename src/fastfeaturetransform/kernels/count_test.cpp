@@ -34,6 +34,34 @@ std::unique_ptr<fft::Kernel> fit_count(const nlohmann::json& params, fft::Schema
   return kernel;
 }
 
+// What `kernel` answers for every row of `batch`, whose columns are all
+// utf8, after checking that the record path answers what the batch path does.
+std::vector<fft::Row> both_paths(const fft::Kernel& kernel, const fft::Batch& batch) {
+  const fft::Batch out = kernel.transform(batch);
+  std::vector<fft::Row> rows;
+  for (int64_t row = 0; row < batch.rows; ++row) {
+    fft::Row record;
+    fft::Row answers;
+    for (std::size_t i = 0; i < batch.names.size(); ++i) {
+      const auto& text = static_cast<const arrow::StringArray&>(*batch.cols[i]);
+      record.emplace_back(batch.names[i],
+                          text.IsNull(row) ? fft::RowValue(std::monostate{}) : fft::RowValue(text.GetString(row)));
+      const arrow::Array& column = *out.cols[i];
+      fft::RowValue answer = std::monostate{};
+      if (column.type_id() == arrow::Type::DOUBLE) {
+        if (!column.IsNull(row)) answer = static_cast<const arrow::DoubleArray&>(column).Value(row);
+      } else {
+        REQUIRE(column.type_id() == arrow::Type::INT64);
+        if (!column.IsNull(row)) answer = static_cast<const arrow::Int64Array&>(column).Value(row);
+      }
+      answers.emplace_back(batch.names[i], answer);
+    }
+    REQUIRE(kernel.transform_row(record) == answers);
+    rows.push_back(std::move(answers));
+  }
+  return rows;
+}
+
 }  // namespace
 
 TEST_CASE("count_encode validates its params") {
@@ -128,7 +156,7 @@ TEST_CASE("count_encode folds categories under the threshold into one group") {
   REQUIRE(with_x->state().at("counts").at("c") == nlohmann::json({{"_x", 2}, {"keep", 3}}));
   const fft::Batch empty_null = make_batch({"c"}, {utf8_column({"", std::nullopt, "keep", "keep", "keep"})});
   auto with_null = fit_count({{"columns", {"c"}}, {"min_group_size", 2}}, schema, {empty_null});
-  REQUIRE(with_null->state().at("groups").at("c") == nlohmann::json({{"", "_nan"}}));
+  REQUIRE(with_null->state().at("groups").at("c") == nlohmann::json({{"_nan", nlohmann::json::array({""})}}));
 
   // A threshold that nothing falls under, and one that everything falls
   // under, both leave the tally alone.
@@ -170,7 +198,7 @@ TEST_CASE("count_encode never folds a group over a category of the same name") {
   const fft::Batch lone = make_batch({"c"}, {utf8_column({"a", std::nullopt, "keep", "keep", "keep", "keep"})});
   auto joined =
       fit_count({{"columns", {"c"}}, {"min_group_size", 3}, {"combine_min_nan_groups", "force"}}, schema, {lone});
-  REQUIRE(joined->state().at("groups").at("c").at("a") == "a_nan");
+  REQUIRE(joined->state().at("groups").at("c") == nlohmann::json({{"a_nan", nlohmann::json::array({"a"})}}));
   for (const auto* fitted : {folded.get(), joined.get()}) {
     const nlohmann::json state = fitted->state();
     auto loaded = fft::make_kernel("count_encode", fitted->params());
@@ -313,12 +341,41 @@ TEST_CASE("count_encode load_state rejects a malformed table") {
         state["groups"] = {{"c", {{"x", "g"}}}};
       },
       "folds 'x', which is still a category");
-  // A well-formed groups entry loads: 'a' folds into the fitted 'x'.
-  nlohmann::json grouped = good;
-  grouped["groups"] = {{"c", {{"a", "x"}}}};
-  auto loaded = fresh();
-  REQUIRE_NOTHROW(loaded->load_state(grouped));
-  REQUIRE(std::get<int64_t>(loaded->transform_row({{"c", std::string("a")}})[0].second) == 2);
+  // The groups above are in the layout version 0.0.1 saved, a member and its
+  // group's name. The present layout, a group's name and the list of its
+  // members, is held to the same rules, and a member folds once.
+  auto broken_groups = [&](const char* groups, const std::string& message) {
+    broken(
+        [&](nlohmann::json& state) {
+          state["counts"]["c"]["g"] = 3;
+          state["groups"] = nlohmann::json::parse(groups);
+        },
+        message);
+  };
+  broken_groups(R"({"other":{"x":["a"]}})", "groups names column 'other', which this encoder does not encode");
+  broken_groups(R"({"c":["a"]})", "groups['c'] must be an object");
+  for (const char* members : {"5", "null", "true", R"({"a":"x"})", "[]", R"(["a",7])", R"(["a",null])", R"([["a"]])"}) {
+    CAPTURE(members);
+    broken_groups((std::string(R"({"c":{"x":)") + members + "}}").c_str(),
+                  "groups['c']['x'] must be a non-empty list of member names");
+  }
+  broken_groups(R"({"c":{"gone":["a"]}})", "folds 'a' into 'gone', which is not a category of counts['c']");
+  broken_groups(R"({"c":{"g":["a","x"]}})", "folds 'x', which is still a category of counts['c']");
+  broken_groups(R"({"c":{"x":["a","b","a"]}})", "groups['c'] folds 'a' more than once");
+  broken_groups(R"({"c":{"g":["a","b"],"x":["b"]}})", "groups['c'] folds 'b' more than once");
+  // One entry in each layout names 'a', so it would answer for two groups.
+  broken_groups(R"({"c":{"a":"g","x":["a"]}})", "groups['c'] folds 'a' more than once");
+  // A well-formed groups entry loads in either layout: 'a' folds into the
+  // fitted 'x'.
+  for (const char* groups : {R"({"c":{"a":"x"}})", R"({"c":{"x":["a"]}})"}) {
+    CAPTURE(groups);
+    nlohmann::json grouped = good;
+    grouped["groups"] = nlohmann::json::parse(groups);
+    auto loaded = fresh();
+    REQUIRE_NOTHROW(loaded->load_state(grouped));
+    REQUIRE(std::get<int64_t>(loaded->transform_row({{"c", std::string("a")}})[0].second) == 2);
+    REQUIRE(loaded->state().at("groups") == nlohmann::json::parse(R"({"c":{"x":["a"]}})"));
+  }
 }
 
 TEST_CASE("count_encode round-trips its rare groups, and loads several groups for one column") {
@@ -340,25 +397,182 @@ TEST_CASE("count_encode round-trips its rare groups, and loads several groups fo
     fitted->write_state(streamed);
     REQUIRE(streamed.str() == state.dump());
     REQUIRE(state.at("counts").at("c") == nlohmann::json({{"keep", 5}, {group, 128}}));
-    REQUIRE(state.at("groups").at("c").size() == members.size());
-    for (const auto& member : members) REQUIRE(state.at("groups").at("c").at(member) == group);
+    REQUIRE(state.at("groups") == nlohmann::json({{"c", {{group, members}}}}));
     auto loaded = fft::make_kernel("count_encode", params);
     loaded->load_state(state);
     REQUIRE(loaded->state() == state);
     const auto input = make_batch({"c"}, {utf8_column({members.front(), members.back(), group, "keep", "unseen"})});
-    REQUIRE(loaded->transform(input).cols[0]->Equals(fitted->transform(input).cols[0]));
+    // A member answers its group's count, over the 133 fitted rows under
+    // normalize.
+    std::vector<fft::Row> expected;
+    for (const int64_t count : {128, 128, 128, 5, 0}) {
+      expected.push_back({{"c", normalize ? fft::RowValue(static_cast<double>(count) / 133.0) : fft::RowValue(count)}});
+    }
+    REQUIRE(both_paths(*fitted, input) == expected);
+    REQUIRE(both_paths(*loaded, input) == expected);
   }
 
-  const nlohmann::json saved{{"columns", {"c"}},
-                             {"rows", 15},
-                             {"counts", {{"c", {{"group_a", 3}, {"group_b", 7}, {"keep", 5}}}}},
-                             {"null_counts", {{"c", nullptr}}},
-                             {"groups", {{"c", {{"a", "group_a"}, {"b", "group_a"}, {"c", "group_b"}}}}}};
-  auto loaded = fft::make_kernel("count_encode", {{"columns", {"c"}}});
-  loaded->load_state(saved);
-  REQUIRE(loaded->state() == saved);
-  const auto result = loaded->transform(make_batch({"c"}, {utf8_column({"a", "b", "c", "group_b", "keep"})}));
-  REQUIRE(result.cols[0]->Equals(fft::testing::numeric_column<arrow::Int64Type>({3, 3, 7, 7, 5})));
+  // Several groups for one column load from either layout, the members in any
+  // order, and are saved in the present layout with the members sorted. The
+  // members of the two groups alternate, so in the layout of version 0.0.1
+  // 'c' joins group_a after group_b was made: an entry joins the group its
+  // name finds, which is not always the group made last.
+  const nlohmann::json saved = nlohmann::json::parse(
+      R"({"columns":["c"],"counts":{"c":{"group_a":3,"group_b":7,"keep":5}},)"
+      R"("groups":{"c":{"group_a":["a","c"],"group_b":["b","d"]}},"null_counts":{"c":null},"rows":15})");
+  for (const char* groups :
+       {R"({"c":{"group_a":["a","c"],"group_b":["b","d"]}})", R"({"c":{"group_a":["c","a"],"group_b":["d","b"]}})",
+        R"({"c":{"a":"group_a","b":"group_b","c":"group_a","d":"group_b"}})"}) {
+    CAPTURE(groups);
+    nlohmann::json state = saved;
+    state["groups"] = nlohmann::json::parse(groups);
+    auto loaded = fft::make_kernel("count_encode", {{"columns", {"c"}}});
+    loaded->load_state(state);
+    REQUIRE(loaded->state() == saved);
+    std::ostringstream streamed;
+    loaded->write_state(streamed);
+    REQUIRE(streamed.str() == saved.dump());
+    const auto result = loaded->transform(make_batch({"c"}, {utf8_column({"a", "b", "c", "d", "group_b", "keep"})}));
+    REQUIRE(result.cols[0]->Equals(fft::testing::numeric_column<arrow::Int64Type>({3, 7, 3, 7, 7, 5})));
+  }
+}
+
+// REGRESSION: the state holds a group's name once, with the list of its
+// members, so it grows linearly with them. It used to hold the name once for
+// each member, and the default name joins every member: 2,000 members of 8
+// bytes each made a state of 36 MB.
+TEST_CASE("count_encode saves a group's name once, so its state grows linearly with the members") {
+  const auto state_size = [](int members) {
+    std::vector<std::optional<std::string>> values(3, "keep");
+    for (int i = 0; i < members; ++i) values.emplace_back("cat" + std::to_string(10000 + i));
+    auto fitted = fit_count({{"columns", {"c"}}, {"min_group_size", 2}}, fft::Schema{{{"c", "utf8"}}},
+                            {make_batch({"c"}, {utf8_column(values)})});
+    std::ostringstream streamed;
+    fitted->write_state(streamed);
+    REQUIRE(streamed.str() == fitted->state().dump());
+    return streamed.str().size();
+  };
+  // A member's 8 bytes are saved three times: twice with a '_' in the group's
+  // name, which is a key of the counts and a key of the groups, and once
+  // between quotes and before a comma in the list of members.
+  const std::size_t each = 2 * (8 + 1) + (8 + 3);
+  const std::size_t thousand = state_size(1000);
+  REQUIRE(state_size(2000) == thousand + 1000 * each);
+  REQUIRE(state_size(4000) == thousand + 3000 * each);
+  REQUIRE(state_size(2000) < 60'000);
+}
+
+// A pipeline that version 0.0.1 saved keeps loading. That version saved a
+// member and its group's name where a group's name and its members are saved
+// now; each state below is what it saved for the fit beside it. Loaded, the
+// state is the fitted kernel's: the same state in the present layout, and the
+// same answers on the batch path and the record path.
+TEST_CASE("count_encode loads the groups version 0.0.1 saved, however the fit folded them") {
+  const fft::Schema schema{{{"c", "utf8"}, {"d", "utf8"}}};
+  // With a threshold of 3 the one null of 'c' is below it and the three of
+  // 'd' are not, so combine_min_nan_groups true, false and 'force' fold the
+  // two columns in three different ways.
+  const fft::Batch fit =
+      make_batch({"c", "d"}, {utf8_column({"a", "b", "", "keep", "keep", "keep", "keep", std::nullopt, "keep"}),
+                              utf8_column({"x", "y", std::nullopt, "z", "z", "z", std::nullopt, std::nullopt, "z"})});
+  const fft::Batch probes =
+      make_batch({"c", "d"}, {utf8_column({"a", "b", "", "keep", std::nullopt, "unseen", "_a_b", "rare"}),
+                              utf8_column({"x", "y", "z", std::nullopt, "unseen", "x_y", "a", "rare"})});
+  struct Case {
+    nlohmann::json options;
+    const char* saved;              // the state version 0.0.1 saved
+    const char* groups;             // its groups in the present layout
+    std::vector<int64_t> c_counts;  // the count each probe answers with
+    std::vector<int64_t> d_counts;
+  };
+  const std::vector<Case> cases{
+      {{{"min_group_size", 3}},
+       R"({"columns":["c","d"],"counts":{"c":{"_a_b_nan":4,"keep":5},"d":{"x_y":2,"z":4}},)"
+       R"("groups":{"c":{"":"_a_b_nan","a":"_a_b_nan","b":"_a_b_nan"},"d":{"x":"x_y","y":"x_y"}},)"
+       R"("null_counts":{"c":4,"d":3},"rows":9})",
+       R"({"c":{"_a_b_nan":["","a","b"]},"d":{"x_y":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 0},
+       {2, 2, 4, 3, 0, 2, 0, 0}},
+      {{{"min_group_size", 3}, {"combine_min_nan_groups", false}},
+       R"({"columns":["c","d"],"counts":{"c":{"_a_b":3,"keep":5},"d":{"x_y":2,"z":4}},)"
+       R"("groups":{"c":{"":"_a_b","a":"_a_b","b":"_a_b"},"d":{"x":"x_y","y":"x_y"}},)"
+       R"("null_counts":{"c":1,"d":3},"rows":9})",
+       R"({"c":{"_a_b":["","a","b"]},"d":{"x_y":["x","y"]}})",
+       {3, 3, 3, 5, 1, 0, 3, 0},
+       {2, 2, 4, 3, 0, 2, 0, 0}},
+      {{{"min_group_size", 3}, {"combine_min_nan_groups", "force"}},
+       R"({"columns":["c","d"],"counts":{"c":{"_a_b_nan":4,"keep":5},"d":{"nan_x_y":5,"z":4}},)"
+       R"("groups":{"c":{"":"_a_b_nan","a":"_a_b_nan","b":"_a_b_nan"},"d":{"x":"nan_x_y","y":"nan_x_y"}},)"
+       R"("null_counts":{"c":4,"d":5},"rows":9})",
+       R"({"c":{"_a_b_nan":["","a","b"]},"d":{"nan_x_y":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 0},
+       {5, 5, 4, 5, 0, 0, 0, 0}},
+      {{{"min_group_size", 3}, {"min_group_name", "rare"}},
+       R"({"columns":["c","d"],"counts":{"c":{"keep":5,"rare":4},"d":{"rare":2,"z":4}},)"
+       R"("groups":{"c":{"":"rare","a":"rare","b":"rare"},"d":{"x":"rare","y":"rare"}},)"
+       R"("null_counts":{"c":4,"d":3},"rows":9})",
+       R"({"c":{"rare":["","a","b"]},"d":{"rare":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 4},
+       {2, 2, 4, 3, 0, 0, 0, 2}},
+      {{{"min_group_size", 3}, {"normalize", true}},
+       R"({"columns":["c","d"],"counts":{"c":{"_a_b_nan":4,"keep":5},"d":{"x_y":2,"z":4}},)"
+       R"("groups":{"c":{"":"_a_b_nan","a":"_a_b_nan","b":"_a_b_nan"},"d":{"x":"x_y","y":"x_y"}},)"
+       R"("null_counts":{"c":4,"d":3},"rows":9})",
+       R"({"c":{"_a_b_nan":["","a","b"]},"d":{"x_y":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 0},
+       {2, 2, 4, 3, 0, 2, 0, 0}},
+      // A group named like one of its members: 'a' is a member and the group.
+      {{{"min_group_size", 3}, {"min_group_name", "a"}},
+       R"({"columns":["c","d"],"counts":{"c":{"a":4,"keep":5},"d":{"a":2,"z":4}},)"
+       R"("groups":{"c":{"":"a","a":"a","b":"a"},"d":{"x":"a","y":"a"}},)"
+       R"("null_counts":{"c":4,"d":3},"rows":9})",
+       R"({"c":{"a":["","a","b"]},"d":{"a":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 0},
+       {2, 2, 4, 3, 0, 0, 2, 0}},
+      {{{"min_group_size", 0.3}, {"normalize", true}, {"combine_min_nan_groups", "force"}},
+       R"({"columns":["c","d"],"counts":{"c":{"_a_b_nan":4,"keep":5},"d":{"nan_x_y":5,"z":4}},)"
+       R"("groups":{"c":{"":"_a_b_nan","a":"_a_b_nan","b":"_a_b_nan"},"d":{"x":"nan_x_y","y":"nan_x_y"}},)"
+       R"("null_counts":{"c":4,"d":5},"rows":9})",
+       R"({"c":{"_a_b_nan":["","a","b"]},"d":{"nan_x_y":["x","y"]}})",
+       {4, 4, 4, 5, 4, 0, 0, 0},
+       {5, 5, 4, 5, 0, 0, 0, 0}},
+  };
+  for (const Case& item : cases) {
+    CAPTURE(item.options);
+    nlohmann::json params = item.options;
+    params["columns"] = {"c", "d"};
+    // normalize divides a count by the 9 fitted rows.
+    const bool normalize = params.value("normalize", false);
+    const auto answer = [&](int64_t count) {
+      return normalize ? fft::RowValue(static_cast<double>(count) / 9.0) : fft::RowValue(count);
+    };
+    std::vector<fft::Row> expected;
+    for (std::size_t i = 0; i < item.c_counts.size(); ++i) {
+      expected.push_back({{"c", answer(item.c_counts[i])}, {"d", answer(item.d_counts[i])}});
+    }
+    const nlohmann::json older = nlohmann::json::parse(item.saved);
+    const nlohmann::json present = [&] {
+      nlohmann::json state = older;
+      state["groups"] = nlohmann::json::parse(item.groups);
+      return state;
+    }();
+
+    auto fitted = fit_count(params, schema, {fit});
+    REQUIRE(fitted->state() == present);
+    REQUIRE(both_paths(*fitted, probes) == expected);
+    // The members are saved sorted however the rows were split.
+    const auto slice = [&](int64_t offset, int64_t length) {
+      return make_batch({"c", "d"}, {fit.cols[0]->Slice(offset, length), fit.cols[1]->Slice(offset, length)});
+    };
+    REQUIRE(fit_count(params, schema, {slice(4, 5), slice(0, 4)})->state() == present);
+    for (const nlohmann::json* state : {&older, &present}) {
+      auto loaded = fft::make_kernel("count_encode", params);
+      loaded->stage = "counts";
+      loaded->load_state(*state);
+      REQUIRE(loaded->state() == present);
+      REQUIRE(both_paths(*loaded, probes) == expected);
+    }
+  }
 }
 
 TEST_CASE("count_encode dictionary fits and transforms preserve counts policies and artifacts") {
@@ -460,6 +674,9 @@ TEST_CASE("count_encode streams its exact state with escaped keys, groups and co
   auto loaded = fft::make_kernel("count_encode", {{"columns", {first, second}}});
   loaded->load_state(saved);
   // An explicitly empty groups column is left out of state().
+  REQUIRE(loaded->state().at("groups") == nlohmann::json({{first,
+                                                           {{group_a, nlohmann::json::array({"", member_with_nul})},
+                                                            {group_b, nlohmann::json::array({"quote\"\\雪"})}}}}));
   std::ostringstream stream;
   stream << std::hex << std::showbase;
   loaded->write_state(stream);
