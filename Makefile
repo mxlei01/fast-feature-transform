@@ -22,7 +22,7 @@ else
   VCPKG_TRIPLET := $(if $(filter aarch64 arm64,$(UNAME_M)),arm64-linux,x64-linux)
 endif
 
-.PHONY: dev python-format python-lint python-test audit parity-fixtures sklearn-fixtures release-requirements transformer-benchmark label-encoder-benchmark cpp-format cpp-lint cpp-tidy cpp-test cpp-sanitize cpp-tsan cpp-flags check vcpkg
+.PHONY: dev python-format python-lint python-test audit parity-fixtures sklearn-fixtures release-requirements cpp-format cpp-lint cpp-tidy cpp-test cpp-sanitize cpp-tsan cpp-flags check vcpkg
 
 dev:
 	uv sync
@@ -73,12 +73,6 @@ release-requirements:  ## the hashed lists release.yaml installs from (needs net
 		--custom-compile-command "make release-requirements" build-constraints.in -o build-constraints.txt && \
 	uv pip compile --quiet --universal --python-version 3.12 --generate-hashes \
 		--custom-compile-command "make release-requirements" twine.in -o twine.txt
-
-transformer-benchmark:  ## five transformers vs category_encoders and scikit-learn (needs network access)
-	uv run --with category_encoders==2.10.0 --with pandas python benchmark/transformers.py
-
-label-encoder-benchmark:  ## LabelEncoder vs scikit-learn
-	uv run python benchmark/label_encoder.py
 
 audit:
 	uv run bandit -r -c pyproject.toml fast_feature_transform test

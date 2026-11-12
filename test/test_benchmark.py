@@ -1,20 +1,12 @@
-"""The measurement rules of the two benchmark scripts and the module they share.
+"""The Parquet settings a timing comparison writes another library's output with.
 
-``benchmark/transformers.py`` needs category_encoders and pandas, which are
-deliberately not dependencies of this project, so the module is loaded here
-with those two stubbed out. Nothing tested below touches either of them. The
-tests cover how the scripts measure: the Parquet settings they charge upstream
-for, how a one-column file is read, how repeated runs are summarized, and that
-the case order and the row-group layout are not fixed.
-
-Both scripts measure through ``benchmark/measure.py``, and the
-``test_both_scripts_*`` tests keep them there: the two once reported different
-methodologies.
+``benchmark/measure.py`` writes that output the way this package's sink
+writes its own, and the tests compare the two files: compression, encodings,
+dictionary limit, write buffer, parts and row groups.
 """
 
-import importlib.util
+import importlib
 import sys
-import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -28,44 +20,10 @@ from fast_feature_transform import Select
 
 BENCHMARK_DIR: Path = Path(__file__).resolve().parent.parent / "benchmark"
 
-
-def _load_benchmark(script: str) -> ModuleType:
-    """Import one benchmark script with its two optional dependencies stubbed.
-
-    Args:
-        script: File name of the script inside ``benchmark/``.
-
-    Returns:
-        The loaded module.
-
-    """
-    spec = importlib.util.spec_from_file_location(f"benchmark_{Path(script).stem}", BENCHMARK_DIR / script)
-    assert spec is not None
-    assert spec.loader is not None
-    module: ModuleType = importlib.util.module_from_spec(spec)
-    stubs: dict[str, ModuleType] = {name: ModuleType(name) for name in ("pandas", "category_encoders")}
-    # The scripts import ``measure`` the way they do when run directly, with
-    # their own directory on sys.path.
-    if str(BENCHMARK_DIR) not in sys.path:
-        sys.path.insert(0, str(BENCHMARK_DIR))
-    # Only the two stubbed names are put back afterwards: restoring the whole
-    # of sys.modules would drop everything the import pulled in, and a C
-    # extension cannot be loaded twice in one process.
-    saved: dict[str, ModuleType | None] = {name: sys.modules.get(name) for name in stubs}
-    sys.modules.update(stubs)
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        for name, previous in saved.items():
-            if previous is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous
-    return module
-
-
-BENCH: ModuleType = _load_benchmark("transformers.py")
-LABEL: ModuleType = _load_benchmark("label_encoder.py")
+# The module is imported the way a script beside it imports it, with its
+# directory on sys.path.
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
 MEASURE: ModuleType = importlib.import_module("measure")
 
 
@@ -282,120 +240,7 @@ def test_write_parts_opens_each_part_through_a_buffer_as_large_as_the_sinks(
     assert pa.concat_tables([pq.read_table(tmp_path / name) for name, _ in opened]).equals(table)
 
 
-def test_read_matrix_does_not_copy_a_one_column_file(tmp_path):
-    path: Path = tmp_path / "price.parquet"
-    values: np.ndarray = np.random.default_rng(1).normal(100.0, 25.0, 5_000)
-    pq.write_table(pa.table({"price": values}), path)
-    matrix: np.ndarray = BENCH._read_matrix(path)
-    assert matrix.shape == (5_000, 1)
-    assert not matrix.flags.owndata
-    assert np.array_equal(matrix[:, 0], values)
-
-
-def test_read_matrix_stacks_several_columns(tmp_path):
-    path: Path = tmp_path / "two.parquet"
-    values: np.ndarray = np.random.default_rng(2).normal(0.0, 1.0, (5_000, 2))
-    pq.write_table(pa.table({"a": values[:, 0], "b": values[:, 1]}), path)
-    matrix: np.ndarray = BENCH._read_matrix(path)
-    assert matrix.shape == (5_000, 2)
-    assert np.array_equal(matrix, values)
-
-
-def test_subsampled_quantile_fit_is_timed_with_the_read_inside(tmp_path, monkeypatch):
-    path: Path = tmp_path / "price.parquet"
-    pq.write_table(pa.table({"price": np.random.default_rng(3).normal(100.0, 25.0, 20_000)}), path)
-    read: Any = BENCH._read_matrix
-    calls: list[Path] = []
-
-    def slow_read(target: Path) -> np.ndarray:
-        calls.append(target)
-        time.sleep(0.02)
-        return read(target)
-
-    monkeypatch.setattr(BENCH, "_read_matrix", slow_read)
-    monkeypatch.setattr(MEASURE, "REPEATS", 3)
-    stat = BENCH._measure_subsampled(path)
-    assert calls == [path, path, path]
-    assert stat.median >= 0.02
-
-
-def test_repeats_are_enough_to_take_a_median_of():
-    assert MEASURE.REPEATS >= 5
-
-
-def test_repeat_reports_the_median_not_the_fastest_run(monkeypatch):
-    monkeypatch.setattr(MEASURE, "REPEATS", 5)
-    delays: list[float] = [0.0, 0.02, 0.02, 0.02, 0.02]
-    pending: Any = iter(delays)
-    stat = MEASURE.repeat(lambda: time.sleep(next(pending)))
-    assert len(stat.samples) == len(delays)
-    assert stat.low < 0.01
-    assert stat.median >= 0.015
-    assert stat.high >= stat.median
-
-
-def test_summarise_reports_the_middle_and_the_spread():
-    stat = MEASURE.summarise([3.0, 1.0, 100.0, 2.0, 4.0])
-    assert stat.median == 3.0
-    assert stat.q1 == 2.0
-    assert stat.q3 == 4.0
-    assert stat.iqr == 2.0
-    assert stat.low == 1.0
-    assert stat.high == 100.0
-
-
-def test_run_order_is_a_shuffle_of_every_case():
-    declared: list[str] = [case.name for case in BENCH.CASES]
-    orders: set[tuple[str, ...]] = {
-        tuple(case.name for case in BENCH._run_order(np.random.default_rng(seed))) for seed in range(20)
-    }
-    assert all(sorted(order) == sorted(declared) for order in orders)
-    assert len(orders) > 1
-    assert any(list(order) != declared for order in orders)
-
-
-def test_generate_honours_the_row_group_layout(tmp_path):
-    dataset = BENCH.generate(tmp_path, 1_000, 250)
-    assert dataset.row_groups == 4
-    for path in dataset.paths.values():
-        assert pq.ParquetFile(path).num_row_groups == 4
-
-
-def test_the_sweep_measures_more_than_one_layout():
-    assert len(set(BENCH.SWEEP_ROW_GROUPS)) > 1
-    assert min(BENCH.SWEEP_ROW_GROUPS) == 1
-
-
-def test_both_scripts_summarise_their_runs_the_same_way():
-    # The two once reported the best of three and the median of seven; sharing
-    # the functions is what stops that from coming back.
-    assert BENCH.repeat is MEASURE.repeat
-    assert LABEL.repeat is MEASURE.repeat
-    assert BENCH.REPEATS == MEASURE.REPEATS
-    assert LABEL.REPEATS == MEASURE.REPEATS
-    assert not hasattr(LABEL, "_best_of")
-
-
-def test_both_scripts_write_upstream_output_through_the_same_sink_settings():
-    assert BENCH.write_back is MEASURE.write_back
-    assert LABEL.write_parts is MEASURE.write_parts
-    assert BENCH.sink_layout is MEASURE.sink_layout
-    assert LABEL.sink_layout is MEASURE.sink_layout
-    assert LABEL.ROW_GROUP_SIZE == MEASURE.ROW_GROUP_SIZE
-
-
 def test_as_table_takes_a_single_column_result():
     table = MEASURE.as_table(np.arange(6, dtype=np.int64))
     assert table.num_columns == 1
     assert table.num_rows == 6
-
-
-def test_label_encoder_measures_in_a_shuffled_order():
-    order: dict[str, Any] = {name: (lambda: None) for name in ("a", "b", "c", "d", "e")}
-    orders: set[tuple[str, ...]] = set()
-    for _ in range(20):
-        stats, drawn = LABEL._measure(order, np.random.default_rng())
-        assert sorted(stats) == sorted(order)
-        assert sorted(drawn) == sorted(order)
-        orders.add(tuple(drawn))
-    assert len(orders) > 1
