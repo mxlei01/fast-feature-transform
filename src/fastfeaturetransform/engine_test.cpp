@@ -437,6 +437,33 @@ TEST_CASE("a fit whose second encoder depends on the first runs in two passes") 
   }
 }
 
+// REGRESSION: a step given no columns takes the columns known when the fit
+// starts, whichever pass it fits in. The scaler used to take the one-hot
+// columns too when a step in front made it fit a pass after the encoder.
+TEST_CASE("a step given no columns takes the same columns whichever pass it fits in") {
+  TempDir dir;
+  fft::write_part(dir.path.string(), 0,
+                  make_batch({"c", "x"}, {utf8_column({"a", "b", "a", "c"}), f64_column({1.0, 2.0, 3.0, 6.0})}));
+  const std::vector<std::string> sources{(dir.path / "part-00000.parquet").string()};
+  const std::string alone_plan = R"({"type": "pipeline", "steps": [
+    ["hot", {"kernel": "one_hot_encode", "params": {"columns": ["c"]}}],
+    ["scale", {"kernel": "standard_scale", "params": {"columns": null}}]]})";
+  // The scaler in front writes x as it is. The last step reads x, so it fits
+  // one pass later, after the encoder is fitted.
+  const std::string waiting_plan = R"({"type": "pipeline", "steps": [
+    ["wait", {"kernel": "standard_scale", "params": {"columns": ["x"], "with_mean": false, "with_std": false}}],
+    ["hot", {"kernel": "one_hot_encode", "params": {"columns": ["c"]}}],
+    ["scale", {"kernel": "standard_scale", "params": {"columns": null}}]]})";
+  fft::FittedPipeline alone = fft::Engine(2).fit(alone_plan, sources);
+  fft::FittedPipeline waiting = fft::Engine(2).fit(waiting_plan, sources);
+
+  const nlohmann::json state = nlohmann::json::parse(alone.stage_state("scale"));
+  REQUIRE(state.at("columns") == nlohmann::json::array({"x"}));
+  REQUIRE(nlohmann::json::parse(waiting.stage_state("scale")) == state);
+  const fft::Row record{{"c", std::string("b")}, {"x", 2.0}};
+  REQUIRE(waiting.transform_row(record) == alone.transform_row(record));
+}
+
 TEST_CASE("write_memmap turns transform_batch's parts into one memmap and refuses strings") {
   TempDir dir;
   fft::write_part(dir.path.string(), 0,

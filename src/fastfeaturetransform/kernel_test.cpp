@@ -244,6 +244,60 @@ TEST_CASE("every kernel refuses a parameter name it does not report and lists th
   }
 }
 
+TEST_CASE("a kernel given no columns takes them at its first resolve and keeps them") {
+  // The engine resolves every op again after each fit pass, and by then the
+  // schema holds what the ops fitted so far generate. The second schema has
+  // one more column of each family: an expanding encoder leaves only numbers
+  // behind, and the utf8 one holds the encoders to the same rule.
+  // REGRESSION: the list of the first resolve stays. Every later resolve used
+  // to derive it again, so a numeric step that fitted a pass later took the
+  // generated columns too.
+  const fft::Schema first{{{"a", "utf8"}, {"x", "f64"}, {"y", "i64"}}};
+  const fft::Schema later{{{"a", "utf8"}, {"x", "f64"}, {"y", "i64"}, {"made", "utf8"}, {"made_1", "f64"}}};
+  const nlohmann::json none = nlohmann::json::object();
+  const nlohmann::json target{{"target", "y"}};
+  const std::vector<std::pair<std::string, nlohmann::json>> kernels{
+      {"standard_scale", none},
+      {"min_max_scale", none},
+      {"max_abs_scale", none},
+      {"robust_scale", none},
+      {"quantile_transform", none},
+      {"k_bins_discretize", none},
+      {"label_encode", none},
+      {"count_encode", none},
+      {"ordinal_encode", none},
+      {"one_hot_encode", none},
+      {"rank_hot_encode", none},
+      {"basen_encode", none},
+      {"binary_encode", none},
+      {"gray_encode", none},
+      {"backward_difference_encode", none},
+      {"helmert_encode", none},
+      {"sum_encode", none},
+      {"polynomial_encode", none},
+      {"target_encode", target},
+      {"m_estimate_encode", target},
+      {"woe_encode", target},
+      {"james_stein_encode", target},
+      {"leave_one_out_encode", target},
+      {"cat_boost_encode", target},
+      {"quantile_encode", target},
+      {"summary_encode", target},
+  };
+  for (const auto& [id, params] : kernels) {
+    CAPTURE(id);
+    auto kernel = fft::make_kernel(id, params);
+    kernel->stage = "step";
+    fft::Schema schema = first;
+    kernel->resolve(schema);
+    const std::vector<std::string> taken = kernel->inputs;
+    REQUIRE_FALSE(taken.empty());
+    schema = later;
+    kernel->resolve(schema);
+    REQUIRE(kernel->inputs == taken);
+  }
+}
+
 TEST_CASE("select projects and reorders columns; row and batch agree") {
   auto kernel = fft::make_kernel("select", {{"columns", {"b", "a"}}});
   kernel->stage = "sel";

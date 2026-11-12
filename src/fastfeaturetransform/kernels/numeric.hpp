@@ -122,18 +122,18 @@ void for_each_numeric(const arrow::Array& array, const std::string& stage, const
 
 // The numeric columns a `columns: null` step takes, or the listed ones,
 // checked against the incoming schema: categories.hpp's bind_columns for
-// numbers. A fitted step's columns come from its state and are never
-// re-derived, which is also what keeps resolve() from writing a member the
-// record path reads. A step whose `columns` is required passes
-// explicit_columns true and never reaches the derivation.
+// numbers, with the same rule for when the list is derived. A fitted step's
+// columns come from its state and are never re-derived, which is also what
+// keeps resolve() from writing a member the record path reads. A step whose
+// `columns` is required passes explicit_columns true and never reaches the
+// derivation.
 inline void bind_numeric(const Schema& schema, const std::string& stage, std::vector<std::string>& columns,
                          bool explicit_columns, bool fitted, const std::string& what) {
   const auto numeric = [](const std::string& tag) {
     const std::optional<Family> family = family_of_tag(tag);
     return family == Family::Integer || family == Family::Floating;
   };
-  if (!fitted && !explicit_columns) {
-    columns.clear();
+  if (!fitted && !explicit_columns && columns.empty()) {
     for (const auto& [name, type] : schema.cols) {
       if (numeric(type)) columns.push_back(name);
     }

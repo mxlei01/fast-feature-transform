@@ -1041,8 +1041,9 @@ class OneHotEncoder(_Expanding):
     ``handle_missing="value"``, a null that was never a fitted category is
     all zeros whatever ``handle_unknown`` says. How many columns there are is
     known only after the fit, so a later step in the same pipeline cannot
-    name them, and the generated block is appended after the columns that
-    stay rather than substituted in the encoded column's place.
+    name them, and one given no columns does not take them. The generated
+    block is appended after the columns that stay rather than substituted in
+    the encoded column's place.
     """
 
     kernel_id: ClassVar[str] = "one_hot_encode"
@@ -1139,7 +1140,8 @@ class BaseNEncoder(_Positional):
     column, which is ordinal encoding.
 
     How many columns the encoder produces is known only after the fit, so a
-    later step in the same pipeline cannot name them.
+    later step in the same pipeline cannot name them, and one given no columns
+    does not take them.
     """
 
     kernel_id: ClassVar[str] = "basen_encode"
@@ -1278,9 +1280,9 @@ class BackwardDifferenceEncoder(_Contrast):
     level emits nothing at all — unless ``handle_missing`` is ``"return_nan"``
     or ``"error"``, whose placeholder level gives it a second one to contrast
     against. How many columns there are is known only after the fit, so a
-    later step in the same pipeline cannot name them, and the generated block
-    is appended after the columns that stay rather than substituted in the
-    encoded column's place.
+    later step in the same pipeline cannot name them, and one given no columns
+    does not take them. The generated block is appended after the columns that
+    stay rather than substituted in the encoded column's place.
     """
 
     kernel_id: ClassVar[str] = "backward_difference_encode"
@@ -2285,11 +2287,11 @@ class _Scaler(Transformer):
     """Shared base for the three fitted scalers: a numeric column list and its row count.
 
     ``columns=None`` scales every integer or float column that reaches the
-    step, chosen once at fit and saved with the pipeline. A null teaches
-    nothing and comes out a null, which is what scikit-learn's NaN does; a
-    NaN or infinity in the data itself is an error, because a missing number
-    has one spelling here. Every scaled column becomes f64 whatever width it
-    arrived as.
+    step and is known when the fit starts, chosen once at fit and saved with
+    the pipeline. A null teaches nothing and comes out a null, which is what
+    scikit-learn's NaN does; a NaN or infinity in the data itself is an
+    error, because a missing number has one spelling here. Every scaled
+    column becomes f64 whatever width it arrived as.
     """
 
     def __init__(self, columns: list[str] | None = None) -> None:
@@ -2930,14 +2932,15 @@ class KBinsDiscretizer(Transformer):
     thing here, because the output is always dense columns: both drop the
     column and append one i64 column per bin, named ``<column>_<bin>``, after
     the columns that stay, so how many columns there are is known only after
-    the fit and a later step in the same pipeline cannot name them. A null is
-    an error, at fit and at transform, because scikit-learn refuses one
-    outright; so is a value that is NaN or infinity. An integer column is
-    widened to f64, so a magnitude past 2^53 rounds. ``"quantile"`` and
-    ``"kmeans"`` keep every value and move them to temporary files when they
-    outgrow the fit's memory budget, while ``"uniform"`` needs only the
-    extremes and keeps nothing. Spilled k-means makes sequential passes and
-    gives the same edges, bit for bit, as a fit held in memory.
+    the fit and a later step in the same pipeline cannot name them, and one
+    given no columns does not take them. A null is an error, at fit and at
+    transform, because scikit-learn refuses one outright; so is a value that is
+    NaN or infinity. An integer column is widened to f64, so a magnitude past
+    2^53 rounds. ``"quantile"`` and ``"kmeans"`` keep every value and move them
+    to temporary files when they outgrow the fit's memory budget, while
+    ``"uniform"`` needs only the extremes and keeps nothing. Spilled k-means
+    makes sequential passes and gives the same edges, bit for bit, as a fit
+    held in memory.
 
     ``"kmeans"`` follows scikit-learn's Lloyd iteration down to its
     empty-cluster rules, which decide whole bin layouts on a column with few
