@@ -280,18 +280,14 @@ class CountEncode final : public Kernel {
       for (const auto& [key, count] : table.counts) entries[key] = count;
       counts[name] = std::move(entries);
       null_counts[name] = table.has_null_category ? nlohmann::json(table.null_count) : nlohmann::json();
-      if (!table.members.empty()) {
-        nlohmann::json members = nlohmann::json::object();
-        for (const auto& [member, group] : table.members) members[member] = table.groups[group].name;
-        groups[name] = std::move(members);
-      }
+      if (!table.members.empty()) groups[name] = groups_of(table);
     }
     return {
         {"columns", columns_}, {"counts", counts}, {"null_counts", null_counts}, {"groups", groups}, {"rows", rows_}};
   }
 
-  // Write exactly what state() builds, but without materializing every copy
-  // of a potentially enormous joined group name.
+  // Write exactly what state() builds, one table at a time, without building
+  // the whole state first.
   // nlohmann objects sort keys; matching that order and using its string
   // escaping makes this byte-for-byte identical to state().dump().
   void write_state(std::ostream& stream) const override {
@@ -318,17 +314,7 @@ class CountEncode final : public Kernel {
       if (table.members.empty()) continue;
       if (!first_column) stream << ',';
       first_column = false;
-      stream << nlohmann::json(name).dump() << ":{";
-      std::vector<std::string> names;
-      names.reserve(table.groups.size());
-      for (const auto& group : table.groups) names.push_back(nlohmann::json(group.name).dump());
-      bool first = true;
-      for (const auto* entry : sorted_entries(table.members)) {
-        if (!first) stream << ',';
-        first = false;
-        stream << nlohmann::json(entry->first).dump() << ':' << names[entry->second];
-      }
-      stream << '}';
+      stream << nlohmann::json(name).dump() << ':' << groups_of(table).dump();
     }
     stream << "},\"null_counts\":{";
     first_column = true;
@@ -386,29 +372,52 @@ class CountEncode final : public Kernel {
       }
       if (groups == nullptr || !groups->contains(name)) continue;
       StringIndex group_ids;
-      for (const auto& [member, group] : groups->at(name).items()) {
-        if (!group.is_string()) throw Error(stage + ": groups['" + name + "'] must map to group names");
-        // A member is folded away and a group is what it folds into, so the
-        // one must be absent from the counts and the other present. Either
-        // way round, a wrong entry would answer a fitted category as unseen.
-        // A member may share its key with its own group, as a min_group_name
-        // naming a folded category gives it: that key answers the group's
-        // count either way.
-        const std::string& into = group.get_ref<const std::string&>();
-        if (member != into && table.counts.contains(member)) {
-          throw Error(stage + ": groups['" + name + "'] folds '" + member + "', which is still a category of counts['" +
-                      name + "']");
+      for (const auto& [key, value] : groups->at(name).items()) {
+        // An entry is a group's name and the list of its members. Version
+        // 0.0.1 saved a member and its group's name instead, and a string in
+        // the list's place tells that layout apart.
+        const bool listed =
+            value.is_array() && !value.empty() &&
+            std::all_of(value.begin(), value.end(), [](const nlohmann::json& member) { return member.is_string(); });
+        if (!listed && !value.is_string()) {
+          throw Error(stage + ": groups['" + name + "']['" + key + "'] must be a non-empty list of member names");
         }
-        auto [id, inserted] = group_ids.try_emplace(into, table.groups.size());
-        if (inserted) {
-          const auto count = table.counts.find(into);
-          if (count == table.counts.end()) {
-            throw Error(stage + ": groups['" + name + "'] folds '" + member + "' into '" + into +
-                        "', which is not a category of counts['" + name + "']");
+        const std::string& into = listed ? key : value.get_ref<const std::string&>();
+        const std::size_t size = listed ? value.size() : 1;
+        // The group's name is looked up with the entry's first member and not
+        // with each of them: the default name is as long as its members
+        // together, and a lookup for each of 64,000 members of 8 bytes made a
+        // load of 9 ms take 1.7 s.
+        std::size_t group = 0;
+        for (std::size_t i = 0; i < size; ++i) {
+          const std::string& member = listed ? value[i].get_ref<const std::string&>() : key;
+          // A member is folded away and a group is what it folds into, so the
+          // one must be absent from the counts and the other present. Either
+          // way round, a wrong entry would answer a fitted category as unseen.
+          // A member may share its key with its own group, as a min_group_name
+          // naming a folded category gives it: that key answers the group's
+          // count either way.
+          if (member != into && table.counts.contains(member)) {
+            throw Error(stage + ": groups['" + name + "'] folds '" + member +
+                        "', which is still a category of counts['" + name + "']");
           }
-          table.groups.push_back({into, count->second});
+          if (i == 0) {
+            auto [id, inserted] = group_ids.try_emplace(into, table.groups.size());
+            if (inserted) {
+              const auto count = table.counts.find(into);
+              if (count == table.counts.end()) {
+                throw Error(stage + ": groups['" + name + "'] folds '" + member + "' into '" + into +
+                            "', which is not a category of counts['" + name + "']");
+              }
+              table.groups.push_back({into, count->second});
+            }
+            group = id->second;
+          }
+          // A member answers with one group's count, so it folds once.
+          if (!table.members.emplace(member, group).second) {
+            throw Error(stage + ": groups['" + name + "'] folds '" + member + "' more than once");
+          }
         }
-        table.members.emplace(member, id->second);
       }
     }
     index_tables();
@@ -504,6 +513,24 @@ class CountEncode final : public Kernel {
     int64_t null_count = 0;
     bool has_null_category = false;
   };
+
+  // One column's groups as the state holds them: each group's name with the
+  // list of its members, sorted, so that the state is the same however the
+  // rows were split and whichever layout the table was loaded from.
+  // REGRESSION: the state holds a group's name once. It used to hold the name
+  // once for each member, and the default name joins every member, so the
+  // state grew with the square of the folded categories: a pipeline folding
+  // 2,000 categories of 8 bytes each saved 36 MB, and now saves 58 KB.
+  static nlohmann::json groups_of(const Table& table) {
+    std::vector<std::vector<std::string>> members(table.groups.size());
+    for (const auto& [member, group] : table.members) members[group].push_back(member);
+    nlohmann::json groups = nlohmann::json::object();
+    for (std::size_t group = 0; group < members.size(); ++group) {
+      std::sort(members[group].begin(), members[group].end());
+      groups[table.groups[group].name] = std::move(members[group]);
+    }
+    return groups;
+  }
 
   void index_tables() {
     for (auto& [name, table] : tables_) {
