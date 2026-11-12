@@ -9,10 +9,10 @@
 #include "fastfeaturetransform/kernels/kernels.hpp"
 
 namespace fastfeaturetransform {
+namespace {
 
-void Kernel::write_state(std::ostream& output) const { output << state().dump(); }
-
-std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json& params) {
+// The table itself: the kernel `id` names, built from `params`.
+std::unique_ptr<Kernel> construct(const std::string& id, const nlohmann::json& params) {
   try {
     if (id == "select") return make_select(params);
     if (id == "cast") return make_cast(params);
@@ -60,6 +60,32 @@ std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json&
               "sum_encode, polynomial_encode, standard_scale, min_max_scale, max_abs_scale, binarize, "
               "normalize, robust_scale, quantile_transform, k_bins_discretize, polynomial_features, "
               "spline_transform, power_transform)");
+}
+
+}  // namespace
+
+void Kernel::write_state(std::ostream& output) const { output << state().dump(); }
+
+std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json& params) {
+  std::unique_ptr<Kernel> kernel = construct(id, params);
+  // A name the kernel does not report in its own params() is an error. A
+  // constructor reads the names it knows and never looks at another one, so
+  // a misspelled name would otherwise leave its parameter at the default. A
+  // manifest's params were written by params(), so a saved pipeline passes.
+  if (params.is_object()) {
+    const nlohmann::json accepted = kernel->params();
+    for (const auto& [name, value] : params.items()) {
+      if (accepted.contains(name)) continue;
+      std::string names;
+      for (const auto& [known, reported] : accepted.items()) names += (names.empty() ? "" : ", ") + known;
+      throw Error(id + ": unknown parameter '" + name + "' (accepted: " + names + ")");
+    }
+  } else if (!params.is_null()) {
+    // Null stands for no parameters. Any other value holds no names, and a
+    // kernel would read it as no parameters too.
+    throw Error(id + ": params must be an object of parameter names and values (got " + params.type_name() + ")");
+  }
+  return kernel;
 }
 
 std::vector<std::string> list_kernels() {

@@ -32,8 +32,15 @@ namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
 
 namespace {
+// label_encode takes neither option: it encodes a null and an unknown category
+// as 0 under every policy.
 std::unique_ptr<fft::Kernel> fitted_encoder(const std::string& id, const std::string& policy) {
-  auto kernel = fft::make_kernel(id, {{"columns", {"c"}}, {"handle_missing", policy}, {"handle_unknown", policy}});
+  nlohmann::json params = {{"columns", {"c"}}};
+  if (id != "label_encode") {
+    params["handle_missing"] = policy;
+    params["handle_unknown"] = policy;
+  }
+  auto kernel = fft::make_kernel(id, params);
   kernel->stage = "enc";
   fft::Schema schema{{{"c", "utf8"}}};
   kernel->resolve(schema);

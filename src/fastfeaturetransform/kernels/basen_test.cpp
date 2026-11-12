@@ -12,6 +12,7 @@
 
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Equals;
 using fft::testing::make_batch;
 using fft::testing::utf8_column;
 
@@ -55,10 +56,14 @@ TEST_CASE("the positional encoders validate their params") {
   for (const char* id : {"basen_encode", "binary_encode", "gray_encode"}) {
     REQUIRE_NOTHROW((fft::make_kernel(id, {{"handle_unknown", "indicator"}})));
   }
-  // Only base-N has a base: upstream fixes it at 2 for the other two.
+  // Only base-N has a base: category_encoders fixes it at 2 for the other
+  // two, which report none and refuse one.
   REQUIRE(fft::make_kernel("basen_encode", {{"base", 3}})->params().at("base") == 3);
-  REQUIRE_FALSE(fft::make_kernel("binary_encode", nlohmann::json::object())->params().contains("base"));
-  REQUIRE_FALSE(fft::make_kernel("gray_encode", {{"base", 3}})->params().contains("base"));
+  for (const std::string id : {"binary_encode", "gray_encode"}) {
+    REQUIRE_FALSE(fft::make_kernel(id, nlohmann::json::object())->params().contains("base"));
+    REQUIRE_THROWS_WITH((fft::make_kernel(id, {{"base", 3}})),
+                        Equals(id + ": unknown parameter 'base' (accepted: columns, handle_missing, handle_unknown)"));
+  }
 }
 
 TEST_CASE("binary_encode declares one column per digit only once it has fitted") {
