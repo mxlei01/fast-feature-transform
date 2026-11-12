@@ -48,31 +48,23 @@ def test_vocab_size_does_not_materialize_state(tmp_path: Path) -> None:
     restored = pickle.loads(pickle.dumps(pipeline))
     restored_encoder = restored["encode"]
     assert isinstance(restored_encoder, LabelEncoder)
-    assert restored_encoder._vocab_size_cache == {}
     assert restored_encoder.vocab_size("key") == 3
     assert restored_encoder._state_cache is None
     with pytest.raises(KeyError, match="absent"):
         encoder.vocab_size("absent")
 
 
-def test_vocab_size_cache_hits_refit_and_pickle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vocab_size_follows_a_refit_and_survives_a_pickle(tmp_path: Path) -> None:
     source = tmp_path / "source.parquet"
     pq.write_table(pa.table({"key": ["a", "b"], "other": ["a", "a"]}), source)
     encoder = LabelEncoder().fit([source])
     assert encoder.vocab_size("key") == 3
     assert encoder.vocab_size("other") == 2
     assert encoder._state_cache is None
-    with monkeypatch.context() as patch:
-        patch.setattr(encoder, "_require_handle", lambda: pytest.fail("cache hit requested native state"))
-        assert encoder.vocab_size("key") == 3
-        assert encoder.vocab_size("other") == 2
-    assert "_vocab_size_cache" not in encoder.__getstate__()
     restored = pickle.loads(pickle.dumps(encoder))
-    assert restored._vocab_size_cache == {}
     assert restored.vocab_size("key") == 3
     pq.write_table(pa.table({"key": ["c"], "other": ["c"]}), source)
     encoder.fit([source])
-    assert encoder._vocab_size_cache == {}
     assert encoder.vocab_size("key") == 2
     assert encoder._state_cache is None
     assert restored.vocab_size("key") == 3

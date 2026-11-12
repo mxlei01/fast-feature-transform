@@ -1,6 +1,7 @@
 """Tests for the Python API surface: validation, nesting rules, pickling, and ergonomics."""
 
 import copy
+import enum
 import importlib.metadata
 import json
 import pickle
@@ -18,10 +19,24 @@ import pytest
 
 import fast_feature_transform
 from fast_feature_transform import (
+    BinaryEncoder,
+    CountEncoder,
     EngineError,
+    HelmertEncoder,
+    JamesSteinEncoder,
+    KBinsDiscretizer,
     LabelEncoder,
+    Normalizer,
+    OneHotEncoder,
+    OrdinalEncoder,
     Pipeline,
+    PowerTransformer,
+    QuantileEncoder,
+    QuantileTransformer,
     Select,
+    SplineTransformer,
+    SummaryEncoder,
+    TargetEncoder,
     Transformer,
     _core,
     parquet_to_memmap,
@@ -256,6 +271,71 @@ def test_constructor_arguments_are_validated() -> None:
         Pipeline([("s", a_class)])
     with pytest.raises(TypeError, match="pair"):
         Pipeline(not_a_pair)
+
+
+# One option of each transformer that takes a string from a fixed set.
+_STRING_OPTIONS: list[tuple[type[Transformer], dict[str, Any], str]] = [
+    (OrdinalEncoder, {"handle_unknown": "return_nan"}, "handle_unknown"),
+    (OrdinalEncoder, {"handle_missing": "error"}, "handle_missing"),
+    (OneHotEncoder, {"handle_unknown": "indicator"}, "handle_unknown"),
+    (BinaryEncoder, {"handle_missing": "return_nan"}, "handle_missing"),
+    (HelmertEncoder, {"handle_unknown": "error"}, "handle_unknown"),
+    (CountEncoder, {"handle_unknown": "return_nan"}, "handle_unknown"),
+    (CountEncoder, {"handle_missing": "error"}, "handle_missing"),
+    (TargetEncoder, {"target": "y", "handle_unknown": "error"}, "handle_unknown"),
+    (JamesSteinEncoder, {"target": "y", "handle_missing": "return_nan"}, "handle_missing"),
+    (JamesSteinEncoder, {"target": "y", "model": "pooled"}, "model"),
+    (QuantileEncoder, {"target": "y", "handle_unknown": "return_nan"}, "handle_unknown"),
+    (SummaryEncoder, {"target": "y", "handle_missing": "error"}, "handle_missing"),
+    (Normalizer, {"columns": ["x"], "norm": "l1"}, "norm"),
+    (QuantileTransformer, {"output_distribution": "normal"}, "output_distribution"),
+    (KBinsDiscretizer, {"encode": "ordinal"}, "encode"),
+    (KBinsDiscretizer, {"strategy": "uniform"}, "strategy"),
+    (SplineTransformer, {"columns": ["x"], "extrapolation": "linear"}, "extrapolation"),
+    (PowerTransformer, {"columns": ["x"], "method": "box-cox"}, "method"),
+]
+
+
+@pytest.mark.parametrize(
+    ("transformer", "arguments", "option"),
+    _STRING_OPTIONS,
+    ids=[f"{transformer.__name__}-{option}" for transformer, _, option in _STRING_OPTIONS],
+)
+def test_an_option_given_as_an_enum_of_strings_is_taken_as_its_value(
+    transformer: type[Transformer], arguments: dict[str, Any], option: str
+) -> None:
+    # REGRESSION: an option given as a str subclass is stored as the plain
+    # string it equals. An Enum with a str mixin equals its value and prints
+    # as "Member.NAME": the encoders that printed it were refused at fit, and
+    # those that kept the member itself were not.
+    member: Any = enum.Enum("Member", {"NAME": arguments[option]}, type=str).NAME
+    plain: Transformer = transformer(**arguments)
+    given: Transformer = transformer(**{**arguments, option: member})
+    assert type(getattr(given, option)) is str
+    assert getattr(given, option) == arguments[option]
+    assert given.params() == plain.params()
+    assert json.dumps(given.params()) == json.dumps(plain.params())
+
+
+def test_an_encoder_whose_option_is_an_enum_fits_like_one_given_the_string(tmp_path: Path) -> None:
+    source: Path = tmp_path / "train.parquet"
+    pq.write_table(pa.table({"c": ["a", "b", "a", "b"], "y": [0.0, 1.0, 1.0, 0.0]}), source)
+    member: Any = enum.Enum("Member", {"NAME": "return_nan"}, type=str).NAME
+    pairs: list[tuple[Transformer, Transformer]] = [
+        (
+            OrdinalEncoder(columns=["c"], handle_unknown=member),
+            OrdinalEncoder(columns=["c"], handle_unknown="return_nan"),
+        ),
+        (
+            QuantileEncoder(target="y", columns=["c"], handle_unknown=member),
+            QuantileEncoder(target="y", columns=["c"], handle_unknown="return_nan"),
+        ),
+    ]
+    for given, plain in pairs:
+        given.fit([source])
+        plain.fit([source])
+        for record in ({"c": "a", "y": 0.0}, {"c": "never seen", "y": 0.0}):
+            assert repr(given.transform_dict(dict(record))) == repr(plain.transform_dict(dict(record)))
 
 
 def test_threads_are_validated_and_accepted_everywhere(train_files: list[str], tmp_path: Path) -> None:
