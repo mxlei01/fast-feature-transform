@@ -1,6 +1,7 @@
 """Tests for the Parquet source and sink: empty row groups, page encodings, projection, output contract."""
 
 import base64
+import json
 import os
 import resource
 from pathlib import Path
@@ -14,7 +15,15 @@ from pyarrow.parquet import encryption
 
 from fast_feature_transform import EngineError
 from fast_feature_transform.pipeline import Pipeline
-from fast_feature_transform.transformers import GroupAgg, HashingEncoder, LabelEncoder, Select, StandardScaler
+from fast_feature_transform.transformers import (
+    GroupAgg,
+    HashingEncoder,
+    LabelEncoder,
+    OneHotEncoder,
+    OrdinalEncoder,
+    Select,
+    StandardScaler,
+)
 
 
 def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
@@ -51,6 +60,60 @@ def _distinct_integers(count: int, seed: int) -> np.ndarray:
     values: np.ndarray = np.random.default_rng(seed).integers(-(2**62), 2**62, count, dtype=np.int64)
     assert len(np.unique(values)) == count
     return values
+
+
+# The characters of _distinct_words: with 64 of them, words drawn at random repeat too little for Snappy to shorten.
+_ALPHABET: np.ndarray = np.frombuffer(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", dtype="S1")
+
+
+def _distinct_words(count: int, seed: int) -> np.ndarray:
+    """Draw distinct strings of 16 random characters, in which Snappy finds nothing to shorten.
+
+    Args:
+        count: How many strings to draw.
+        seed: Seed of the generator.
+
+    Returns:
+        The strings. A Parquet page stores each as a 4-byte length and its 16 characters.
+
+    """
+    letters: np.ndarray = np.random.default_rng(seed).choice(_ALPHABET, size=(count, 16))
+    words: np.ndarray = letters.view("S16").ravel().astype(str)
+    assert len(np.unique(words)) == count
+    return words
+
+
+def _write_strings(path: Path, table: pa.Table, column: str, storage: str) -> str:
+    """Write one row group whose string column is stored in a given way, and check that it is.
+
+    Args:
+        path: Destination file.
+        table: Table to write.
+        column: The string column the storage applies to.
+        storage: "no dictionary" stores every value in plain pages. "dictionary given up" makes the writer check its
+            dictionary page after every 64 values and drop the dictionary once the page holds 4 KiB, so the values
+            after that are in plain pages. "dictionary" keeps every value in the dictionary page.
+
+    Returns:
+        The file path.
+
+    """
+    options: dict[str, Any] = {
+        "no dictionary": {"use_dictionary": False},
+        "dictionary given up": {"dictionary_pagesize_limit": 4 * 1024, "write_batch_size": 64},
+        "dictionary": {"dictionary_pagesize_limit": 64 * 1024 * 1024},
+    }[storage]
+    source: str = _write(path, table, row_group_size=table.num_rows, **options)
+    assert pq.ParquetFile(source).metadata.num_row_groups == 1
+    chunk = _first_chunk(Path(source), column)
+    dictionary, data = _stored_bytes(chunk)
+    if storage == "no dictionary":
+        assert not chunk.has_dictionary_page
+    elif storage == "dictionary given up":
+        assert 0 < dictionary < data
+    else:
+        assert dictionary > data
+    return source
 
 
 def _first_chunk(part: Path, column: str) -> Any:
@@ -383,6 +446,101 @@ def test_strings_read_as_a_dictionary_keep_it_past_the_lowered_limit(tmp_path: P
     word = _first_chunk(parts[0], "word")
     assert word.total_uncompressed_size > 20_000 * (4 + 24) > 248 * 1024
     assert _stored_bytes(word)[1] < 2 * _BATCH_ROWS + 1024
+
+
+@pytest.mark.parametrize("storage", ["no dictionary", "dictionary given up"])
+def test_strings_stored_in_plain_pages_pass_through_at_about_the_inputs_size(tmp_path: Path, storage: str) -> None:
+    # REGRESSION: a batch keeps only the dictionary entries its rows use. A string column is read as a dictionary,
+    # and when its pages are plain the reader builds one dictionary for the row group as it reads, so each batch
+    # arrives with every entry of the batches before it. The three batches of this row group (65,536 distinct
+    # values, 65,536 nulls, 3,928 more distinct values) are written with 65,536, 0 and 3,928 entries; they used to
+    # be written with 65,536, 65,536 and 69,464.
+    words: np.ndarray = _distinct_words(_BATCH_ROWS + 3_928, 6)
+    column: pa.Array = pa.concat_arrays(
+        [pa.array(words[:_BATCH_ROWS]), pa.nulls(_BATCH_ROWS, pa.string()), pa.array(words[_BATCH_ROWS:])]
+    )
+    table: pa.Table = pa.table({"id": column})
+    source: str = _write_strings(tmp_path / "ids.parquet", table, "id", storage)
+    parts: list[Path] = Select(columns=["id"]).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    assert _row_group_rows(parts[0]) == [_BATCH_ROWS, _BATCH_ROWS, 3_928]
+    assert pq.read_table(parts[0]).equals(table)
+    # The output holds each value once, as the input does, and adds an index of 2 bytes for each of the 69,464 rows
+    # that hold one: 1.11 times the input. It used to hold 200,536 values, 3.0 times the input.
+    assert parts[0].stat().st_size <= 1.2 * Path(source).stat().st_size
+
+
+def test_ordinal_and_label_codes_do_not_depend_on_how_a_row_group_stores_its_strings(tmp_path: Path) -> None:
+    # 70,000 rows draw from 60,000 words, and one row in fifty is null. In one row group the second batch holds 4,464
+    # rows and arrives with the dictionary of the whole row group, about 41,000 entries, whether the reader built it
+    # from plain pages or the file stores it: the batch keeps the entries its rows use, and the encoders must code
+    # them as they code a batch that arrives with exactly its own dictionary. The last file is that reference: its
+    # row groups of 20,000 rows are one batch each. Both columns hold the same strings.
+    rows: int = _BATCH_ROWS + 4_464
+    rng = np.random.default_rng(8)
+    words: np.ndarray = np.sort(_distinct_words(60_000, 7))
+    drawn: np.ndarray = rng.integers(0, 60_000, rows)
+    nulls: np.ndarray = rng.random(rows) < 0.02
+    column: pa.Array = pa.array(words[drawn], mask=nulls)
+    table: pa.Table = pa.table({"ordinal": column, "label": column})
+    sources: dict[str, str] = {
+        storage: _write_strings(tmp_path / f"{index}.parquet", table, "label", storage)
+        for index, storage in enumerate(("no dictionary", "dictionary given up", "dictionary"))
+    }
+    sources["a dictionary per batch"] = _write(tmp_path / "small.parquet", table, row_group_size=20_000)
+
+    # The categories are the words some row holds, in byte order, which is the order of `words`. OrdinalEncoder
+    # counts them from 1 and gives a null seen at fit the code after the last; LabelEncoder counts them from 1 and
+    # gives a null 0.
+    categories: np.ndarray = np.unique(drawn[~nulls])
+    rank: np.ndarray = np.searchsorted(categories, drawn) + 1
+    expected: dict[str, np.ndarray] = {
+        "ordinal": np.where(nulls, len(categories) + 1, rank),
+        "label": np.where(nulls, 0, rank),
+    }
+    for storage, source in sources.items():
+        pipeline: Pipeline = Pipeline(
+            [("ordinal", OrdinalEncoder(columns=["ordinal"])), ("label", LabelEncoder(columns=["label"]))]
+        ).fit([source])
+        coded: pa.Table = pq.read_table(pipeline.transform_parquet([source], output_dir=tmp_path / f"out-{storage}"))
+        for name, codes in expected.items():
+            np.testing.assert_array_equal(coded.column(name).to_numpy(), codes, err_msg=f"{storage}: {name}")
+        if storage != "no dictionary":
+            continue
+        # The memmap sink receives the same batches.
+        index_path: Path = pipeline.transform_memmap([source], output_dir=tmp_path / "memmap")
+        index: dict[str, Any] = json.loads(index_path.read_text())
+        assert [(field["name"], field["dtype"]) for field in index["columns"]] == [
+            ("ordinal", "int64"),
+            ("label", "int64"),
+        ]
+        records: np.ndarray = np.memmap(
+            index_path.parent / index["file"], dtype=[("ordinal", "int64"), ("label", "int64")], mode="r"
+        )
+        for name, codes in expected.items():
+            np.testing.assert_array_equal(records[name], codes, err_msg=f"memmap: {name}")
+
+
+def test_one_hot_columns_do_not_depend_on_how_a_row_group_stores_its_strings(tmp_path: Path) -> None:
+    # A one-hot of 900 categories makes a row 900 columns wide, so a batch holds 776 rows, fewer than the 900
+    # entries of the row group's dictionary: every batch but the first of a row group of 1,000 rows keeps only the
+    # entries its rows use, and so does the first when the file stores the dictionary. Each of the 900 words is in
+    # the first 900 rows, in a shuffled order. The two batches, of 776 and 224 rows, share one row group of the
+    # output.
+    words: np.ndarray = np.sort(_distinct_words(900, 9))
+    rng = np.random.default_rng(10)
+    choice: np.ndarray = np.concatenate([rng.permutation(900), rng.integers(0, 900, 100)])
+    table: pa.Table = pa.table({"c": words[choice]})
+    # Column c_k is 1 in the rows that hold the k-th category in byte order.
+    expected: np.ndarray = np.zeros((1_000, 900), dtype=np.int64)
+    expected[np.arange(1_000), choice] = 1
+    for storage in ("no dictionary", "dictionary given up", "dictionary"):
+        source: str = _write_strings(tmp_path / f"{storage}.parquet", table, "c", storage)
+        encoder: OneHotEncoder = OneHotEncoder(columns=["c"]).fit([source])
+        parts: list[Path] = encoder.transform_parquet([source], output_dir=tmp_path / f"out-{storage}")
+        assert _row_group_rows(parts[0]) == [1_000]
+        hot: pa.Table = pq.read_table(parts[0])
+        assert hot.column_names == [f"c_{k}" for k in range(1, 901)]
+        np.testing.assert_array_equal(np.column_stack([column.to_numpy() for column in hot.columns]), expected, storage)
 
 
 def test_a_write_the_disk_refuses_fails_the_transform_and_leaves_no_part(tmp_path: Path) -> None:
