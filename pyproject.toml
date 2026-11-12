@@ -146,9 +146,6 @@ testpaths = ["test"]
 # pyarrow, numpy or scikit-learn appears when the lock is upgraded, which is
 # when to act on it.
 filterwarnings = ["error"]
-markers = [
-    "scale: large out-of-core test; skipped unless --run-scale is passed",
-]
 
 [tool.ruff]
 line-length = 120

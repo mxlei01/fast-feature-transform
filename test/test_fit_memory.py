@@ -133,7 +133,6 @@ def test_fit_transform_with_temp_directory_round_trips(tmp_path: Path) -> None:
     assert restored.transform_dict({"x": 3.0}) == pipeline.transform_dict({"x": 3.0})
 
 
-@pytest.mark.scale
 def test_automatic_spill_and_failure_cleanup_preserve_fitted_state(tmp_path: Path) -> None:
     path = tmp_path / "large.parquet"
     chunk = pa.table({"x": np.tile([1.0, 3.0], 32768)})
