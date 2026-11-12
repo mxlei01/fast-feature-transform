@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
@@ -29,37 +28,9 @@ from fast_feature_transform import (
     WOEEncoder,
     _core,
 )
+from helpers import read_rows, write_parquet
 
 PRIOR: float = 0.625
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
 
 
 @pytest.fixture
@@ -79,7 +50,7 @@ def clicks(tmp_path: Path) -> list[str]:
             "clicked": [1, 0, 1, 1, 0, 0, 1, 1],
         }
     )
-    return [_write(tmp_path / "clicks.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "clicks.parquet", table, row_group_size=2)]
 
 
 def test_target_encode_blends_the_category_mean_with_the_prior(clicks: list[str], tmp_path: Path) -> None:
@@ -97,7 +68,7 @@ def test_target_encode_blends_the_category_mean_with_the_prior(clicks: list[str]
     )
     assert encoder.null_values_ == {"city": None}
 
-    rows: list[dict[str, Any]] = _rows(encoder.transform_parquet(clicks, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(encoder.transform_parquet(clicks, output_dir=tmp_path / "out"))
     assert rows[0]["city"] == pytest.approx(blend(3, 2))
     assert rows[0]["clicked"] == 1  # the target passes through
     assert encoder.transform_dict({"city": "cph", "clicked": 0}) == {
@@ -125,7 +96,7 @@ def test_m_estimate_shrinks_toward_the_prior_and_gives_up_on_an_id_like_column(
     plain: MEstimateEncoder = MEstimateEncoder(target="clicked", columns=["city"], m=0.0).fit(clicks)
     assert plain.values_["city"]["ams"] == pytest.approx(2 / 3)
 
-    ids: str = _write(
+    ids: str = write_parquet(
         tmp_path / "ids.parquet",
         pa.table({"city": ["ams", "ber", "cph", "dub"], "clicked": [1, 0, 1, 1]}),
     )
@@ -154,7 +125,7 @@ def test_woe_encode_needs_a_binary_target_and_centres_on_zero(clicks: list[str],
         ([1, 2, 1, 2, 1, 2, 1, 2], "no value 0 was found"),
         ([0, -1, 0, -1, 0, -1, 0, -1], "no value 1 was found"),
     ):
-        path: str = _write(
+        path: str = write_parquet(
             tmp_path / "woe.parquet",
             pa.table({"city": ["ams", "ber", "cph", "dub"] * 2, "clicked": target}),
         )
@@ -163,7 +134,7 @@ def test_woe_encode_needs_a_binary_target_and_centres_on_zero(clicks: list[str],
 
 
 def test_a_null_category_is_learned_and_a_null_target_teaches_nothing(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "gaps.parquet",
         pa.table({"city": ["ams", "ams", None, None, "ber"], "clicked": [1.0, 0.0, 1.0, 1.0, None]}),
     )
@@ -191,20 +162,20 @@ def test_a_null_category_is_learned_and_a_null_target_teaches_nothing(tmp_path: 
 
     with pytest.raises(EngineError, match="has nulls and handle_missing is 'error'"):
         MEstimateEncoder(target="clicked", columns=["city"], handle_missing="error").fit([path])
-    clean: str = _write(tmp_path / "clean.parquet", pa.table({"city": ["ams", "ber"], "clicked": [1.0, 0.0]}))
+    clean: str = write_parquet(tmp_path / "clean.parquet", pa.table({"city": ["ams", "ber"], "clicked": [1.0, 0.0]}))
     picky: MEstimateEncoder = MEstimateEncoder(target="clicked", columns=["city"], handle_missing="error").fit([clean])
     with pytest.raises(EngineError, match="has a null and handle_missing is 'error'"):
         picky.transform_dict({"city": None})
 
 
 def test_unfitted_columns_default_to_every_utf8_column_but_never_the_target(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "wide.parquet",
         pa.table({"city": ["ams", "ber"], "device": ["ios", "web"], "clicked": [1, 0]}),
     )
     encoder: TargetEncoder = TargetEncoder(target="clicked").fit([path])
     assert sorted(encoder.values_) == ["city", "device"]
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"n": [1, 2], "clicked": [1, 0]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"n": [1, 2], "clicked": [1, 0]}))
     with pytest.raises(EngineError, match="no utf8 columns to encode"):
         TargetEncoder(target="clicked").fit([numbers])
 
@@ -215,26 +186,26 @@ def test_the_target_is_read_at_fit_only_and_can_be_dropped(clicks: list[str], tm
     ).fit(clicks)
     assert pipeline.transform_dict({"city": "ams", "clicked": 1}) == {"city": pytest.approx(0.6314360527118139)}
     # A serving file without the label still transforms.
-    serving: str = _write(tmp_path / "serving.parquet", pa.table({"city": ["ams", "ber"]}))
-    rows: list[dict[str, Any]] = _rows(pipeline.transform_parquet([serving], output_dir=tmp_path / "out"))
+    serving: str = write_parquet(tmp_path / "serving.parquet", pa.table({"city": ["ams", "ber"]}))
+    rows: list[dict[str, Any]] = read_rows(pipeline.transform_parquet([serving], output_dir=tmp_path / "out"))
     assert sorted(rows[0]) == ["city"]
 
 
 def test_target_errors_name_the_target_column(clicks: list[str], tmp_path: Path) -> None:
     with pytest.raises(EngineError, match="target column 'missing' not found in input"):
         TargetEncoder(target="missing", columns=["city"]).fit(clicks)
-    strings: str = _write(tmp_path / "strings.parquet", pa.table({"city": ["ams"], "clicked": ["yes"]}))
+    strings: str = write_parquet(tmp_path / "strings.parquet", pa.table({"city": ["ams"], "clicked": ["yes"]}))
     with pytest.raises(EngineError, match="is utf8, expected an integer or float column"):
         TargetEncoder(target="clicked", columns=["city"]).fit([strings])
-    numeric: str = _write(tmp_path / "numeric.parquet", pa.table({"seats": [4], "clicked": [1]}))
+    numeric: str = write_parquet(tmp_path / "numeric.parquet", pa.table({"seats": [4], "clicked": [1]}))
     with pytest.raises(EngineError, match="is i64, expected utf8"):
         TargetEncoder(target="clicked", columns=["seats"]).fit([numeric])
-    empty: str = _write(
+    empty: str = write_parquet(
         tmp_path / "empty.parquet", pa.table({"city": ["ams"], "clicked": pa.array([None], pa.int64())})
     )
     with pytest.raises(EngineError, match="has no non-null values to learn from"):
         TargetEncoder(target="clicked", columns=["city"]).fit([empty])
-    nan: str = _write(tmp_path / "nan.parquet", pa.table({"city": ["ams"], "clicked": [float("nan")]}))
+    nan: str = write_parquet(tmp_path / "nan.parquet", pa.table({"city": ["ams"], "clicked": [float("nan")]}))
     with pytest.raises(EngineError, match="is not finite"):
         TargetEncoder(target="clicked", columns=["city"]).fit([nan])
 
@@ -242,7 +213,7 @@ def test_target_errors_name_the_target_column(clicks: list[str], tmp_path: Path)
 def test_the_fitted_table_is_independent_of_the_split_and_survives_the_artifact(
     clicks: list[str], tmp_path: Path
 ) -> None:
-    floats: str = _write(
+    floats: str = write_parquet(
         tmp_path / "floats.parquet",
         pa.table({"city": ["ams", "ams", "ber", "ber"], "clicked": [1e100, 1.0, -1e100, 2.0]}),
         row_group_size=1,
@@ -517,7 +488,7 @@ def test_an_integer_target_above_2_to_the_53_fits_by_the_formula(
         targets: Each category's integer targets.
 
     """
-    path: str = _write(tmp_path / "integers.parquet", _target_table(targets, pa.int64()), row_group_size=4)
+    path: str = write_parquet(tmp_path / "integers.parquet", _target_table(targets, pa.int64()), row_group_size=4)
     for threads in (1, 4):
         encoder: Any = shell(**ENCODED, **options).fit([path], threads=threads)
         prior, values = _fitted_by_formula(encoder, targets)
@@ -559,7 +530,7 @@ def test_a_float_target_fits_below_its_magnitude_bound_and_is_refused_from_it(
     inside: float = math.nextafter(bound, 0.0)
 
     def fit(targets: Mapping[str | None, Sequence[float]]) -> Any:
-        path: str = _write(tmp_path / "floats.parquet", _target_table(targets, pa.float64()), row_group_size=2)
+        path: str = write_parquet(tmp_path / "floats.parquet", _target_table(targets, pa.float64()), row_group_size=2)
         return shell(**ENCODED).fit([path], threads=1)
 
     # WOEEncoder needs a target of two values, one at most 0 and one at least 1.

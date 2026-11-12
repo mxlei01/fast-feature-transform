@@ -800,16 +800,7 @@ const nlohmann::json kEveryAgg = nlohmann::json::array({"count", "sum", "mean", 
 // Fit a group_agg kernel with one worker state per batch.
 std::unique_ptr<fft::Kernel> fit_group_agg(const nlohmann::json& params, fft::Schema schema,
                                            const std::vector<fft::Batch>& batches) {
-  auto kernel = fft::make_kernel("group_agg", params);
-  kernel->stage = "agg";
-  kernel->resolve(schema);
-  std::vector<std::unique_ptr<fft::AccState>> states;
-  for (const fft::Batch& batch : batches) {
-    states.push_back(kernel->make_state());
-    kernel->consume(*states.back(), batch);
-  }
-  kernel->finalize(std::move(states));
-  return kernel;
+  return fft::testing::fit_kernel_per_batch("group_agg", params, std::move(schema), batches, "agg");
 }
 
 }  // namespace

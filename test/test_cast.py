@@ -12,40 +12,13 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from fast_feature_transform import Cast, EngineError, LabelEncoder, Pipeline
+from helpers import read_rows, write_parquet
 
 TWO_POW_53: int = 2**53
 
 
-def _write(path: Path, table: pa.Table) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
-
-
 def test_a_numeric_id_must_be_cast_before_it_can_be_encoded(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "ids.parquet", pa.table({"user_id": pa.array([7, 12, 7], pa.int32())}))
+    path: str = write_parquet(tmp_path / "ids.parquet", pa.table({"user_id": pa.array([7, 12, 7], pa.int32())}))
     with pytest.raises(EngineError, match="is i32, expected utf8"):
         LabelEncoder(columns=["user_id"]).fit([path])
     pipeline: Pipeline = Pipeline(
@@ -55,7 +28,7 @@ def test_a_numeric_id_must_be_cast_before_it_can_be_encoded(tmp_path: Path) -> N
     assert isinstance(encoder, LabelEncoder)
     assert encoder.label_maps_["user_id"] == {"12": 1, "7": 2}  # digits, sorted as strings
     assert pipeline.transform_dict({"user_id": 12}) == {"user_id": 1}
-    assert _rows(pipeline.transform_parquet([path], output_dir=tmp_path / "out")) == [
+    assert read_rows(pipeline.transform_parquet([path], output_dir=tmp_path / "out")) == [
         {"user_id": 2},
         {"user_id": 1},
         {"user_id": 2},
@@ -75,7 +48,7 @@ def test_cast_output_types_are_exact_and_agree_with_the_record_path(tmp_path: Pa
             "text_price": pa.array(["1.5", "-2e3", None], pa.string()),
         }
     )
-    path: str = _write(tmp_path / "mixed.parquet", table)
+    path: str = write_parquet(tmp_path / "mixed.parquet", table)
     cast: Cast = Cast({"price": "f32", "count": "i16", "flag": "i64", "text_id": "i64", "text_price": "f64"}).fit(
         [path]
     )
@@ -91,7 +64,7 @@ def test_cast_output_types_are_exact_and_agree_with_the_record_path(tmp_path: Pa
 
 
 def test_cast_parses_strings_strictly(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "text.parquet", pa.table({"n": ["12"]}))
+    path: str = write_parquet(tmp_path / "text.parquet", pa.table({"n": ["12"]}))
     cast: Cast = Cast({"n": "i64"}).fit([path])
     assert cast.transform_dict({"n": "+7"}) == {"n": 7}
     assert cast.transform_dict({"n": "-0"}) == {"n": 0}
@@ -112,7 +85,7 @@ def test_cast_parses_strings_strictly(tmp_path: Path) -> None:
 
 def test_unsigned_64_bit_values_keep_their_type_or_become_digits(tmp_path: Path) -> None:
     big: int = 2**63 + 5
-    path: str = _write(tmp_path / "u64.parquet", pa.table({"n": pa.array([big, 7], pa.uint64())}))
+    path: str = write_parquet(tmp_path / "u64.parquet", pa.table({"n": pa.array([big, 7], pa.uint64())}))
     kept: list[Path] = Cast({"n": "u64"}).fit([path]).transform_parquet([path], output_dir=tmp_path / "kept")
     assert pq.read_table(kept[0]).column("n").to_pylist() == [big, 7]
     assert pq.read_table(kept[0]).schema.types == [pa.uint64()]
@@ -123,7 +96,7 @@ def test_unsigned_64_bit_values_keep_their_type_or_become_digits(tmp_path: Path)
 
 
 def test_cast_refuses_lossy_or_unlisted_conversions(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "t.parquet", pa.table({"n": pa.array([1], pa.int64()), "x": [0.5], "f": [True], "s": ["a"]})
     )
     for tag, value, message in (
@@ -196,10 +169,10 @@ _REFUSALS: list[tuple[str, pa.DataType, Any, str]] = [
 def test_a_refused_record_value_names_its_stage_and_key_and_reads_as_the_batch_path_does(
     target: str, source: pa.DataType, value: Any, text: str, tmp_path: Path
 ) -> None:
-    accepted: str = _write(
+    accepted: str = write_parquet(
         tmp_path / "accepted.parquet", pa.table({"kept": pa.array([1], pa.int64()), "n": pa.array([1], pa.int64())})
     )
-    refused: str = _write(
+    refused: str = write_parquet(
         tmp_path / "refused.parquet", pa.table({"kept": pa.array([1], pa.int64()), "n": pa.array([value], source)})
     )
     # Cast walks its columns in sorted order, so the refused one is its second:
@@ -215,7 +188,7 @@ def test_a_refused_record_value_names_its_stage_and_key_and_reads_as_the_batch_p
 
 def test_a_refused_record_value_spells_its_stage_and_key_in_full(tmp_path: Path) -> None:
     key: str = "prix d'été"
-    path: str = _write(tmp_path / "t.parquet", pa.table({key: pa.array([1], pa.int64())}))
+    path: str = write_parquet(tmp_path / "t.parquet", pa.table({key: pa.array([1], pa.int64())}))
     nested: Pipeline = Pipeline([("outer", Pipeline([("it's", Cast({key: "i8"}))]))]).fit([path])
     with pytest.raises(EngineError) as nested_error:
         nested.transform_dict({key: 300})
@@ -228,7 +201,9 @@ def test_a_refused_record_value_spells_its_stage_and_key_in_full(tmp_path: Path)
 
 def test_cast_names_the_refused_key_among_several_and_refuses_no_null(tmp_path: Path) -> None:
     columns: list[str] = ["a", "b", "c"]
-    path: str = _write(tmp_path / "t.parquet", pa.table({column: pa.array([1], pa.int64()) for column in columns}))
+    path: str = write_parquet(
+        tmp_path / "t.parquet", pa.table({column: pa.array([1], pa.int64()) for column in columns})
+    )
     pipeline: Pipeline = Pipeline([("types", Cast(dict.fromkeys(columns, "i8")))]).fit([path])
     for refused in columns:
         # The record's keys are not in the order Cast walks its columns in.
@@ -244,7 +219,9 @@ def test_cast_names_the_refused_key_among_several_and_refuses_no_null(tmp_path: 
 
 
 def test_cast_survives_artifacts_and_pickle(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "t.parquet", pa.table({"user_id": pa.array([3, 4], pa.int32()), "p": [1.0, 2.0]}))
+    path: str = write_parquet(
+        tmp_path / "t.parquet", pa.table({"user_id": pa.array([3, 4], pa.int32()), "p": [1.0, 2.0]})
+    )
     pipeline: Pipeline = Pipeline(
         [("types", Cast({"user_id": "utf8", "p": "f32"})), ("encode", LabelEncoder(columns=["user_id"]))]
     ).fit([path])
@@ -271,9 +248,9 @@ def test_cast_properties(
     ints: list[int | None] = values[:length]
     floats: list[float | None] = reals[:length]
     table: pa.Table = pa.table({"n": pa.array(ints, pa.int32()), "x": pa.array(floats, pa.float64())})
-    path: str = _write(tmp_path / "p.parquet", table)
+    path: str = write_parquet(tmp_path / "p.parquet", table)
     cast: Cast = Cast({"n": "utf8", "x": "f32"}).fit([path])
-    rows: list[dict[str, Any]] = _rows(cast.transform_parquet([path], output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(cast.transform_parquet([path], output_dir=tmp_path / "out"))
     for n, x, row in zip(ints, floats, rows, strict=True):
         assert row == cast.transform_dict({"n": n, "x": x})
         assert row["n"] == (None if n is None else str(n))

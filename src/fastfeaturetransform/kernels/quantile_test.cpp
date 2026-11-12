@@ -27,16 +27,7 @@ namespace {
 // Fit a kernel with one worker state per batch.
 std::unique_ptr<fft::Kernel> fit_quantile(const std::string& id, const nlohmann::json& params, fft::Schema schema,
                                           const std::vector<fft::Batch>& batches) {
-  auto kernel = fft::make_kernel(id, params);
-  kernel->stage = "encode";
-  kernel->resolve(schema);
-  std::vector<std::unique_ptr<fft::AccState>> states;
-  for (const fft::Batch& batch : batches) {
-    states.push_back(kernel->make_state());
-    kernel->consume(*states.back(), batch);
-  }
-  kernel->finalize(std::move(states));
-  return kernel;
+  return fft::testing::fit_kernel_per_batch(id, params, std::move(schema), batches, "encode");
 }
 
 const fft::Schema kSchema{{{"color", "utf8"}, {"y", "f64"}}};

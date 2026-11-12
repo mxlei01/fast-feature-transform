@@ -20,35 +20,7 @@ from fast_feature_transform import (
     Select,
     _core,
 )
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
+from helpers import read_rows, write_parquet
 
 
 @pytest.fixture
@@ -65,7 +37,7 @@ def prices(tmp_path: Path) -> list[str]:
     table: pa.Table = pa.table(
         {"price": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], "tag": ["a", "b", "c", "d", "e", "f", "g", "h"]}
     )
-    return [_write(tmp_path / "prices.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "prices.parquet", table, row_group_size=2)]
 
 
 def test_robust_scaler_centres_on_the_median_and_scales_by_the_quantile_range(
@@ -103,25 +75,27 @@ def test_robust_scaler_unit_variance_reads_a_tiny_q_min_as_scikit_learn_does(tmp
     REGRESSION: the inverse normal CDF used to answer NaN below about 6e-311,
     so q_min = 1e-318 failed the fit with "its values are too large".
     """
-    powers: str = _write(tmp_path / "powers.parquet", pa.table({"price": [1.0, 2.0, 4.0, 8.0, 16.0]}))
+    powers: str = write_parquet(tmp_path / "powers.parquet", pa.table({"price": [1.0, 2.0, 4.0, 8.0, 16.0]}))
     scaler: RobustScaler = RobustScaler(columns=["price"], quantile_range=(1e-318, 75.0), unit_variance=True)
     assert scaler.fit([powers]).scale_["price"] == pytest.approx(0.17974705181433237, rel=1e-12)
 
 
 def test_robust_scaler_ignores_nulls_and_maps_a_zero_scale_to_one(tmp_path: Path) -> None:
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 3.0, None, 5.0, 9.0]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 3.0, None, 5.0, 9.0]}))
     scaler: RobustScaler = RobustScaler(columns=["price"]).fit([holes])
     assert scaler.center_["price"] == pytest.approx(4.0)  # the median of 1, 3, 5, 9
     assert scaler.transform_dict({"price": None}) == {"price": None}
-    assert [row["price"] for row in _rows(scaler.transform_parquet([holes], output_dir=tmp_path / "out"))][1] is None
+    assert [row["price"] for row in read_rows(scaler.transform_parquet([holes], output_dir=tmp_path / "out"))][
+        1
+    ] is None
 
-    flat: str = _write(tmp_path / "flat.parquet", pa.table({"price": [3.0, 3.0, 3.0]}))
+    flat: str = write_parquet(tmp_path / "flat.parquet", pa.table({"price": [3.0, 3.0, 3.0]}))
     constant: RobustScaler = RobustScaler(columns=["price"]).fit([flat])
     assert constant.scale_ == {"price": pytest.approx(1.0)}  # the near-zero rule, not a division by zero
     assert constant.transform_dict({"price": 5.0}) == {"price": pytest.approx(2.0)}
 
     # Every numeric column, integers included: they widen to f64.
-    integers: str = _write(tmp_path / "ints.parquet", pa.table({"n": [1, 2, 3, 4], "tag": ["a", "b", "c", "d"]}))
+    integers: str = write_parquet(tmp_path / "ints.parquet", pa.table({"n": [1, 2, 3, 4], "tag": ["a", "b", "c", "d"]}))
     every: RobustScaler = RobustScaler().fit([integers])
     assert set(every.center_) == {"n"}
     assert every.transform_dict({"n": 1, "tag": "a"}) == {"n": pytest.approx(-1.0), "tag": "a"}
@@ -164,7 +138,7 @@ def test_quantile_transformer_averages_the_two_interpolations_over_ties(tmp_path
     # a 1, forward interpolation alone gives 0.75, the last tie's reference,
     # and backward alone 0.25, the first's; averaged, 0.5. The expected values
     # are scikit-learn 1.9.0's.
-    ties: str = _write(tmp_path / "ties.parquet", pa.table({"price": [0.0, 1.0, 1.0, 1.0, 2.0]}))
+    ties: str = write_parquet(tmp_path / "ties.parquet", pa.table({"price": [0.0, 1.0, 1.0, 1.0, 2.0]}))
     transformer: QuantileTransformer = QuantileTransformer(columns=["price"], n_quantiles=5).fit([ties])
     assert transformer.quantiles_ == {"price": [0.0, 1.0, 1.0, 1.0, 2.0]}
     expected: dict[float, float] = {1.0: 0.5, 0.5: 0.125, 1.5: 0.875, 0.0: 0.0, 2.0: 1.0}
@@ -177,7 +151,7 @@ def test_quantile_transformer_clips_a_rank_below_the_smallest_normal_double(tmp_
     REGRESSION: over 0 and 2**1023, the value 2**-20 ranks at 2**-1044, where
     the inverse normal CDF used to answer NaN, which the clip let through.
     """
-    wide: str = _write(tmp_path / "wide.parquet", pa.table({"price": [0.0, 2.0**1023]}))
+    wide: str = write_parquet(tmp_path / "wide.parquet", pa.table({"price": [0.0, 2.0**1023]}))
     normal: QuantileTransformer = QuantileTransformer(
         columns=["price"], n_quantiles=2, output_distribution="normal"
     ).fit([wide])
@@ -214,7 +188,7 @@ def test_k_bins_discretizer_expands_to_one_column_per_bin(prices: list[str], tmp
         binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=2, encode=encode, strategy="uniform").fit(
             prices
         )
-        rows: list[dict[str, Any]] = _rows(binner.transform_parquet(prices, output_dir=tmp_path / f"out-{encode}"))
+        rows: list[dict[str, Any]] = read_rows(binner.transform_parquet(prices, output_dir=tmp_path / f"out-{encode}"))
         assert set(rows[0]) == {"tag", "price_0", "price_1"}
         assert [row["price_0"] for row in rows] == [1, 1, 1, 1, 0, 0, 0, 0]
         assert binner.transform_dict({"price": 8.0, "tag": "h"}) == {"tag": "h", "price_0": 0, "price_1": 1}
@@ -225,11 +199,13 @@ def test_k_bins_discretizer_expands_to_one_column_per_bin(prices: list[str], tmp
 
 def test_k_bins_discretizer_drops_collapsed_bins_and_bins_a_constant_column(tmp_path: Path) -> None:
     # The low percentiles all land on 1, so upstream drops those edges.
-    ties: str = _write(tmp_path / "ties.parquet", pa.table({"price": [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 5.0, 9.0]}))
+    ties: str = write_parquet(
+        tmp_path / "ties.parquet", pa.table({"price": [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 5.0, 9.0]})
+    )
     binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=5, encode="ordinal").fit([ties])
     assert binner.n_bins_["price"] < 5
 
-    flat: str = _write(tmp_path / "flat.parquet", pa.table({"price": [3.0, 3.0, 3.0]}))
+    flat: str = write_parquet(tmp_path / "flat.parquet", pa.table({"price": [3.0, 3.0, 3.0]}))
     constant: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=4, encode="onehot").fit([flat])
     assert constant.n_bins_ == {"price": 1}
     assert constant.transform_dict({"price": 99.0}) == {"price_0": 1}
@@ -243,10 +219,10 @@ def test_k_bins_discretizer_drops_collapsed_bins_and_bins_a_constant_column(tmp_
 
 
 def test_k_bins_discretizer_refuses_a_null(tmp_path: Path) -> None:
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 3.0]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 3.0]}))
     with pytest.raises(EngineError, match="column 'price' has nulls, which k_bins_discretize refuses"):
         KBinsDiscretizer(columns=["price"], strategy="uniform").fit([holes])
-    whole: str = _write(tmp_path / "whole.parquet", pa.table({"price": [1.0, 2.0, 3.0, 4.0]}))
+    whole: str = write_parquet(tmp_path / "whole.parquet", pa.table({"price": [1.0, 2.0, 3.0, 4.0]}))
     binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=2, encode="ordinal").fit([whole])
     with pytest.raises(EngineError, match="is null, which k_bins_discretize refuses"):
         binner.transform_dict({"price": None})
@@ -257,8 +233,8 @@ def test_k_bins_discretizer_refuses_a_null(tmp_path: Path) -> None:
 def test_binning_refuses_a_value_that_is_not_finite(tmp_path: Path) -> None:
     # A null is how a missing value is spelled here (it is what scikit-learn's
     # NaN maps onto), so a float NaN or infinity is an error everywhere.
-    broken: str = _write(tmp_path / "broken.parquet", pa.table({"price": [1.0, float("nan"), 3.0]}))
-    whole: str = _write(tmp_path / "whole.parquet", pa.table({"price": [1.0, 2.0, 3.0, 4.0]}))
+    broken: str = write_parquet(tmp_path / "broken.parquet", pa.table({"price": [1.0, float("nan"), 3.0]}))
+    whole: str = write_parquet(tmp_path / "whole.parquet", pa.table({"price": [1.0, 2.0, 3.0, 4.0]}))
     # KBinsDiscretizer refuses a null too, so only the other two suggest one.
     for shell, message in (
         (RobustScaler(columns=["price"]), "is not finite; write a missing value as a null"),
@@ -273,7 +249,7 @@ def test_binning_refuses_a_value_that_is_not_finite(tmp_path: Path) -> None:
         with pytest.raises(EngineError, match=message):
             fitted.transform_dict({"price": float("inf")})
 
-    holes: str = _write(
+    holes: str = write_parquet(
         tmp_path / "holes.parquet", pa.table({"price": [None, None]}, schema=pa.schema([("price", pa.float64())]))
     )
     for scaler in (RobustScaler(columns=["price"]), QuantileTransformer(columns=["price"])):
@@ -362,18 +338,18 @@ def test_binning_validates_its_arguments(prices: list[str], tmp_path: Path) -> N
     with pytest.raises(ValueError, match="quantile_method must be one of"):
         KBinsDiscretizer(quantile_method="nearest")
 
-    strings: str = _write(tmp_path / "strings.parquet", pa.table({"tag": ["a", "b"]}))
+    strings: str = write_parquet(tmp_path / "strings.parquet", pa.table({"tag": ["a", "b"]}))
     with pytest.raises(EngineError, match="no integer or float columns to scale"):
         RobustScaler().fit([strings])
     with pytest.raises(EngineError, match="is utf8, expected an integer or float column"):
         RobustScaler(columns=["tag"]).fit([strings])
-    clash: str = _write(tmp_path / "clash.parquet", pa.table({"price": [1.0, 2.0], "price_0": [1.0, 2.0]}))
+    clash: str = write_parquet(tmp_path / "clash.parquet", pa.table({"price": [1.0, 2.0], "price_0": [1.0, 2.0]}))
     with pytest.raises(EngineError, match="output column 'price_0' already exists in input"):
         KBinsDiscretizer(columns=["price"], n_bins=2, strategy="uniform").fit([clash])
 
     # A string column is an error, not a parse: Cast is the one step that
     # changes a type.
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"price": ["1.0", "2.0", "3.0", "4.0"]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"price": ["1.0", "2.0", "3.0", "4.0"]}))
     cast: Pipeline = Pipeline([("cast", Cast(types={"price": "f64"})), ("scale", RobustScaler(columns=["price"]))]).fit(
         [numbers]
     )
@@ -397,12 +373,12 @@ def test_kmeans_reproduces_upstream_empty_cluster_relocation(tmp_path: Path) -> 
 
     """
     values: list[float] = [0.0, 0.0, 0.0, 0.0, 1.0, 5.0, 0.0, 0.0]
-    source: str = _write(tmp_path / "empty.parquet", pa.table({"price": values}))
+    source: str = write_parquet(tmp_path / "empty.parquet", pa.table({"price": values}))
     binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=5, encode="ordinal", strategy="kmeans").fit(
         [source]
     )
     assert binner.bin_edges_ == {"price": [0.0, 0.0, 0.5, 3.0, 5.0]}
-    rows: list[dict[str, Any]] = _rows(binner.transform_parquet([source], output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(binner.transform_parquet([source], output_dir=tmp_path / "out"))
     assert [row["price"] for row in rows] == [1, 1, 1, 1, 2, 3, 1, 1]
     for value, row in zip(values, rows, strict=True):
         assert binner.transform_dict({"price": value}) == row
@@ -421,7 +397,7 @@ def test_kmeans_stops_at_the_first_pass_whose_centers_barely_move(tmp_path: Path
         tmp_path: pytest temporary directory.
 
     """
-    source: str = _write(tmp_path / "cubes.parquet", pa.table({"price": [float(i**3) for i in range(300)]}))
+    source: str = write_parquet(tmp_path / "cubes.parquet", pa.table({"price": [float(i**3) for i in range(300)]}))
     binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=3, encode="ordinal", strategy="kmeans").fit(
         [source]
     )
@@ -449,7 +425,7 @@ def test_every_fitted_bin_table_loads_back(tmp_path: Path) -> None:
         "constant": [3.0, 3.0, 3.0, 3.0],
     }
     for what, values in columns.items():
-        source: str = _write(tmp_path / f"{what}.parquet", pa.table({"price": values}))
+        source: str = write_parquet(tmp_path / f"{what}.parquet", pa.table({"price": values}))
         for strategy in ("uniform", "quantile", "kmeans"):
             pipeline: Pipeline = Pipeline(
                 [("bin", KBinsDiscretizer(columns=["price"], n_bins=3, encode="ordinal", strategy=strategy))]

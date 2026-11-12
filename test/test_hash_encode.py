@@ -11,37 +11,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import Cast, EngineError, HashingEncoder, Pipeline, _core
+from helpers import read_rows, write_parquet
 
 COMPONENTS: int = 4
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
 
 
 def _bucket(value: str, components: int = COMPONENTS) -> int:
@@ -77,7 +49,7 @@ def events(tmp_path: Path) -> list[str]:
             "price": [1.0] * 6,
         }
     )
-    return [_write(tmp_path / "events.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "events.parquet", table, row_group_size=2)]
 
 
 def test_hash_encode_replaces_the_column_with_a_block_of_md5_counters(events: list[str], tmp_path: Path) -> None:
@@ -104,7 +76,7 @@ def test_hash_encode_replaces_the_column_with_a_block_of_md5_counters(events: li
 
 def test_hash_encode_feeds_every_column_into_the_one_block(events: list[str], tmp_path: Path) -> None:
     encoder: HashingEncoder = HashingEncoder(columns=["device", "source"], n_components=COMPONENTS).fit(events)
-    rows: list[dict[str, Any]] = _rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
     assert set(rows[0]) == {"price", "col_0", "col_1", "col_2", "col_3"}
     # Row 0 is ("ios", "ads"): two values, so two increments in one block.
     assert sum(rows[0][name] for name in encoder.output_columns) == 2
@@ -122,11 +94,11 @@ def test_hash_encode_feeds_every_column_into_the_one_block(events: list[str], tm
 
 
 def test_hash_encode_hashes_a_cast_integer_as_its_digits(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "ids.parquet", pa.table({"user_id": [7, 42, 7]}))
+    path: str = write_parquet(tmp_path / "ids.parquet", pa.table({"user_id": [7, 42, 7]}))
     pipeline: Pipeline = Pipeline(
         [("cast", Cast({"user_id": "utf8"})), ("hash", HashingEncoder(columns=["user_id"], n_components=COMPONENTS))]
     ).fit([path])
-    rows: list[dict[str, Any]] = _rows(pipeline.transform_parquet([path], output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(pipeline.transform_parquet([path], output_dir=tmp_path / "out"))
     assert rows[0][f"col_{_bucket('7')}"] == 1  # str(7), which is what category_encoders hashes
     assert rows[1][f"col_{_bucket('42')}"] == 1
 
@@ -139,7 +111,7 @@ def test_hash_encode_is_independent_of_the_split_and_survives_the_artifact(event
             events, threads=threads
         )
         states.add(encoder._require_handle().stage_state("hashingencoder"))
-        outputs.add(json.dumps(_rows(encoder.transform_parquet(events, output_dir=tmp_path / f"out{threads}"))))
+        outputs.add(json.dumps(read_rows(encoder.transform_parquet(events, output_dir=tmp_path / f"out{threads}"))))
     assert states == {"{}"}  # nothing is learned, so there is nothing a split could change
     assert len(outputs) == 1
 
@@ -166,7 +138,7 @@ def test_hash_encode_refuses_columns_it_cannot_hash_and_a_second_block(events: l
     with pytest.raises(EngineError, match="two hash encoders cannot share one pipeline"):
         two.fit(events)
     # A column named like a bucket is fine as long as it is the hashed one.
-    path: str = _write(tmp_path / "named.parquet", pa.table({"col_0": ["ios", "web"]}))
+    path: str = write_parquet(tmp_path / "named.parquet", pa.table({"col_0": ["ios", "web"]}))
     assert HashingEncoder(columns=["col_0"], n_components=1).fit([path]).transform_dict({"col_0": "ios"}) == {
         "col_0": 1
     }

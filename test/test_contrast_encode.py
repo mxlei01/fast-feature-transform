@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
@@ -22,6 +21,7 @@ from fast_feature_transform import (
     SumEncoder,
     _core,
 )
+from helpers import read_table, write_parquet
 
 CODERS = (BackwardDifferenceEncoder, HelmertEncoder, SumEncoder, PolynomialEncoder)
 
@@ -32,35 +32,6 @@ POLY_4: list[list[float]] = [
     [0.22360679774997902, -0.5, -0.6708203932499369],
     [0.670820393249937, 0.5, 0.2236067977499791],
 ]
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _table(parts: list[Path]) -> pa.Table:
-    """Read output parts back as one table.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The concatenated table.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts])
 
 
 @pytest.fixture
@@ -77,7 +48,7 @@ def colors(tmp_path: Path) -> list[str]:
     table: pa.Table = pa.table(
         {"color": ["delta", "amber", "blue", "cyan", "amber", "delta"], "size": ["l"] * 6},
     )
-    return [_write(tmp_path / "colors.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "colors.parquet", table, row_group_size=2)]
 
 
 @pytest.fixture
@@ -92,13 +63,13 @@ def with_null(tmp_path: Path) -> list[str]:
 
     """
     table: pa.Table = pa.table({"color": ["cyan", "amber", None, "blue", "amber", "cyan"], "size": ["l"] * 6})
-    return [_write(tmp_path / "nulls.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "nulls.parquet", table, row_group_size=2)]
 
 
 def test_each_coder_replaces_the_column_with_its_own_matrix(colors: list[str], tmp_path: Path) -> None:
     difference: BackwardDifferenceEncoder = BackwardDifferenceEncoder(columns=["color"]).fit(colors)
     assert difference.categories_ == {"color": ["amber", "blue", "cyan", "delta"]}
-    table: pa.Table = _table(difference.transform_parquet(colors, output_dir=tmp_path / "diff"))
+    table: pa.Table = read_table(difference.transform_parquet(colors, output_dir=tmp_path / "diff"))
     # Four levels, so three f64 columns named after their position, and the
     # source column is gone.
     assert table.column_names == ["size", "color_0", "color_1", "color_2"]
@@ -132,7 +103,7 @@ def test_a_fitted_null_is_a_level_of_its_own_and_sorts_last(with_null: list[str]
     assert total.categories_ == {"color": ["amber", "blue", "cyan"]}
     # Three categories plus the null level: four levels, so three columns, and
     # the null is the reference level sum coding leaves out.
-    rows: list[dict[str, Any]] = _table(total.transform_parquet(with_null, output_dir=tmp_path / "out")).to_pylist()
+    rows: list[dict[str, Any]] = read_table(total.transform_parquet(with_null, output_dir=tmp_path / "out")).to_pylist()
     assert rows[1] == {"size": "l", "color_0": 1.0, "color_1": 0.0, "color_2": 0.0}  # amber
     assert rows[2] == {"size": "l", "color_0": -1.0, "color_1": -1.0, "color_2": -1.0}  # the fitted null
     assert total.transform_dict({"color": None, "size": "l"}) == rows[2]
@@ -161,7 +132,7 @@ def test_unknown_categories_follow_handle_unknown(colors: list[str], tmp_path: P
 
     # 'indicator' makes the unknown a real fifth level, so a fourth column appears.
     flagged: HelmertEncoder = HelmertEncoder(columns=["color"], handle_unknown="indicator").fit(colors)
-    table: pa.Table = _table(flagged.transform_parquet(colors, output_dir=tmp_path / "flag"))
+    table: pa.Table = read_table(flagged.transform_parquet(colors, output_dir=tmp_path / "flag"))
     assert table.column_names == ["size", "color_0", "color_1", "color_2", "color_3"]
     assert flagged.transform_dict({"color": "zulu"}) == {
         "color_0": 0.0,
@@ -182,13 +153,15 @@ def test_unknown_categories_follow_handle_unknown(colors: list[str], tmp_path: P
 
 
 def test_a_single_level_emits_no_columns_at_all(tmp_path: Path) -> None:
-    only_one: str = _write(tmp_path / "one.parquet", pa.table({"color": ["amber"] * 4, "size": ["l", "m", "s", "l"]}))
+    only_one: str = write_parquet(
+        tmp_path / "one.parquet", pa.table({"color": ["amber"] * 4, "size": ["l", "m", "s", "l"]})
+    )
     for cls in CODERS:
         # Even with the indicator level asked for: upstream drops the column
         # before it ever appends one.
         encoder = cls(columns=["color"], handle_unknown="indicator").fit([only_one])
         parts: list[Path] = encoder.transform_parquet([only_one], output_dir=tmp_path / cls.__name__)
-        assert _table(parts).column_names == ["size"]
+        assert read_table(parts).column_names == ["size"]
         assert encoder.transform_dict({"color": "amber", "size": "l"}) == {"size": "l"}
 
     # The column is still read, so 'error' still refuses an unseen category.
@@ -206,7 +179,7 @@ def test_a_later_step_sees_the_schema_the_expansion_produced(colors: list[str], 
     assert counts.counts_ == {"size": {"l": 6}}
     row: dict[str, Any] = pipeline.transform_dict({"color": "amber", "size": "l"})
     assert row == {"size": 6, "color_0": 1.0, "color_1": 0.0, "color_2": 0.0}
-    assert _table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
+    assert read_table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
 
 
 def test_the_fitted_state_survives_threads_the_artifact_and_a_pickle(with_null: list[str], tmp_path: Path) -> None:
@@ -257,7 +230,7 @@ def test_polynomial_basis_is_stable_for_32_effective_levels(
     values: list[str | None] = [f"c{index:03}" for index in range(categories)]
     if fitted_null:
         values.append(None)
-    source: str = _write(tmp_path / "levels.parquet", pa.table({"color": values}), row_group_size=7)
+    source: str = write_parquet(tmp_path / "levels.parquet", pa.table({"color": values}), row_group_size=7)
     encoder: PolynomialEncoder = PolynomialEncoder(
         columns=["color"], handle_missing=missing, handle_unknown=unknown
     ).fit([source])
@@ -277,8 +250,8 @@ def test_polynomial_basis_is_stable_for_32_effective_levels(
     # Strings reach the kernels as Parquet's dictionaries, or as plain strings when the pages are delta-encoded.
     plain: dict[str, Any] = {"use_dictionary": False, "column_encoding": {"color": "DELTA_BYTE_ARRAY"}}
     for encoding, options in (("dictionary", {}), ("delta", plain)):
-        probe: str = _write(tmp_path / f"inferred-{encoding}.parquet", table, row_group_size=7, **options)
-        output: pa.Table = _table(encoder.transform_parquet([probe], output_dir=tmp_path / f"out-{encoding}"))
+        probe: str = write_parquet(tmp_path / f"inferred-{encoding}.parquet", table, row_group_size=7, **options)
+        output: pa.Table = read_table(encoder.transform_parquet([probe], output_dir=tmp_path / f"out-{encoding}"))
         assert output.to_pylist() == expected, encoding
     names: list[str] = [f"color_{index}" for index in range(31)]
     assert output.column_names == names
@@ -304,11 +277,11 @@ def test_polynomial_artifacts_preserve_stored_values_and_column_order(tmp_path: 
             "z": [f"z{31 - index:02}" for index in range(32)],
         }
     )
-    source: str = _write(tmp_path / "two.parquet", table, row_group_size=5)
+    source: str = write_parquet(tmp_path / "two.parquet", table, row_group_size=5)
     runs: Iterator[int] = itertools.count()
 
     def batch(model: Pipeline) -> list[dict[str, Any]]:
-        return _table(model.transform_parquet([source], output_dir=tmp_path / f"out-{next(runs)}")).to_pylist()
+        return read_table(model.transform_parquet([source], output_dir=tmp_path / f"out-{next(runs)}")).to_pylist()
 
     fitted: Pipeline = Pipeline([("poly", PolynomialEncoder(columns=["z", "a"]))]).fit([source])
     original: list[dict[str, Any]] = batch(fitted)
@@ -403,7 +376,7 @@ def test_a_polynomial_artifact_needs_its_stored_basis(colors: list[str], tmp_pat
 
 def test_polynomial_artifact_preserves_an_empty_single_level_matrix(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"color": ["only"] * 3, "size": [1, 2, 3]})
-    source: str = _write(tmp_path / "single.parquet", table)
+    source: str = write_parquet(tmp_path / "single.parquet", table)
     fitted: Pipeline = Pipeline([("poly", PolynomialEncoder(columns=["color"], handle_unknown="indicator"))]).fit(
         [source]
     )
@@ -412,7 +385,7 @@ def test_polynomial_artifact_preserves_an_empty_single_level_matrix(tmp_path: Pa
     artifact: Path = tmp_path / "single-artifact"
     fitted.save(artifact)
     parts: list[Path] = Pipeline.load(artifact).transform_parquet([source], output_dir=tmp_path / "out")
-    assert _table(parts).equals(table.select(["size"]))
+    assert read_table(parts).equals(table.select(["size"]))
 
 
 def test_the_shells_validate_their_arguments() -> None:
@@ -444,14 +417,14 @@ def test_the_engine_names_what_it_refuses(colors: list[str], with_null: list[str
         SumEncoder(columns=["color"], handle_missing="error").fit(with_null)
 
     # No coercion: a non-utf8 column has to be cast first.
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"color": [1, 2, 3], "size": ["l", "m", "s"]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"color": [1, 2, 3], "size": ["l", "m", "s"]}))
     with pytest.raises(EngineError, match="column 'color' is i64, expected utf8"):
         HelmertEncoder(columns=["color"]).fit([numbers])
-    only_numbers: str = _write(tmp_path / "only.parquet", pa.table({"n": [1, 2, 3]}))
+    only_numbers: str = write_parquet(tmp_path / "only.parquet", pa.table({"n": [1, 2, 3]}))
     with pytest.raises(EngineError, match="no utf8 columns to helmert-encode"):
         HelmertEncoder().fit([only_numbers])
 
-    clash: str = _write(
+    clash: str = write_parquet(
         tmp_path / "clash.parquet",
         pa.table({"color": ["amber", "blue", "cyan"], "color_0": ["x", "y", "z"]}),
     )

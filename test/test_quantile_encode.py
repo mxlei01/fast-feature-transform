@@ -10,37 +10,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import EngineError, Pipeline, QuantileEncoder, Select, SummaryEncoder, _core
+from helpers import read_rows, write_parquet
 
 PRIOR: float = 3.5  # the median of prices 1..6
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
 
 
 @pytest.fixture
@@ -57,7 +29,7 @@ def events(tmp_path: Path) -> list[str]:
     table: pa.Table = pa.table(
         {"device": ["ios", "web", "ios", None, "tv", "ios"], "price": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
     )
-    return [_write(tmp_path / "events.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "events.parquet", table, row_group_size=2)]
 
 
 def test_quantile_encode_smooths_each_category_toward_the_prior(events: list[str], tmp_path: Path) -> None:
@@ -85,7 +57,7 @@ def test_quantile_encode_smooths_each_category_toward_the_prior(events: list[str
 
 def test_quantile_encode_interpolates_like_numpy(tmp_path: Path) -> None:
     # Four values, so the quartiles fall between two of them: h = q*(n-1).
-    path: str = _write(tmp_path / "even.parquet", pa.table({"c": ["a"] * 4, "y": [1.0, 2.0, 3.0, 4.0]}))
+    path: str = write_parquet(tmp_path / "even.parquet", pa.table({"c": ["a"] * 4, "y": [1.0, 2.0, 3.0, 4.0]}))
     for quantile, expected in ((0.0, 1.0), (0.25, 1.75), (0.5, 2.5), (0.9, 3.7), (1.0, 4.0)):
         encoder: QuantileEncoder = QuantileEncoder(target="y", columns=["c"], quantile=quantile, m=0).fit([path])
         assert encoder.encodings_["c"] == pytest.approx([expected])
@@ -99,7 +71,7 @@ def test_summary_encode_replaces_each_column_with_one_per_quantile(events: list[
     # ios holds 1, 3, 6, whose 25% is 2; tv and web hold one value each.
     assert encoder.encodings_["device_25"] == pytest.approx([2.0625, 3.625, 2.125])
 
-    rows: list[dict[str, Any]] = _rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
     assert list(rows[0]) == ["device_25", "device_75", "price"]  # the generated columns take device's place
     assert encoder.transform_dict({"device": "ios", "price": 1.0}) == rows[0]
     assert encoder.transform_dict({"device": "nobody"}) == {"device_25": 2.25, "device_75": 4.75}
@@ -123,13 +95,15 @@ def test_quantile_encode_null_and_unknown_options(events: list[str], tmp_path: P
     )
     assert as_null.transform_dict({"device": "nobody"}) == {"device": None}
     assert as_null.transform_dict({"device": None}) == {"device": 3.75}  # nulls answer to handle_missing alone
-    assert _rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == pytest.approx(3.125)
+    assert read_rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == pytest.approx(
+        3.125
+    )
 
     strict: QuantileEncoder = QuantileEncoder(target="price", columns=["device"], handle_unknown="error").fit(events)
     with pytest.raises(EngineError, match="category that was not seen at fit"):
         strict.transform_dict({"device": "nobody"})
 
-    plain: str = _write(tmp_path / "plain.parquet", pa.table({"device": ["ios", "web"], "price": [1.0, 2.0]}))
+    plain: str = write_parquet(tmp_path / "plain.parquet", pa.table({"device": ["ios", "web"], "price": [1.0, 2.0]}))
     fussy: QuantileEncoder = QuantileEncoder(target="price", columns=["device"], handle_missing="error").fit([plain])
     with pytest.raises(EngineError, match="has a null and handle_missing is 'error'"):
         fussy.transform_dict({"device": None})
@@ -142,7 +116,7 @@ def test_quantile_encode_null_and_unknown_options(events: list[str], tmp_path: P
 # category, with nothing anywhere saying so. target_encode always had this
 # guard; the quantile and shrinkage families did not.
 def test_quantile_encode_refuses_a_target_with_no_non_null_values(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "unlabelled.parquet",
         pa.table({"device": ["ios", "web"], "price": pa.array([None, None], pa.float64())}),
     )
@@ -154,22 +128,22 @@ def test_quantile_encode_refuses_a_target_with_no_non_null_values(tmp_path: Path
 def test_quantile_encode_target_rules(events: list[str], tmp_path: Path) -> None:
     with pytest.raises(EngineError, match="target column 'nope' not found in input"):
         QuantileEncoder(target="nope", columns=["device"]).fit(events)
-    text: str = _write(tmp_path / "text.parquet", pa.table({"device": ["ios"], "other": ["a"], "price": [1.0]}))
+    text: str = write_parquet(tmp_path / "text.parquet", pa.table({"device": ["ios"], "other": ["a"], "price": [1.0]}))
     with pytest.raises(EngineError, match="target column 'other' is utf8, expected an integer or float column"):
         QuantileEncoder(target="other", columns=["device"]).fit([text])
     with pytest.raises(ValueError, match="cannot encode its target"):
         QuantileEncoder(target="price", columns=["price"])
 
     # A row whose target is null contributes to nothing, so its category is unseen.
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"device": ["ios", "web"], "price": [2.0, None]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"device": ["ios", "web"], "price": [2.0, None]}))
     sparse: QuantileEncoder = QuantileEncoder(target="price", columns=["device"]).fit([holes])
     assert sparse.categories_ == {"device": ["ios"]}
     assert sparse.transform_dict({"device": "web"}) == {"device": 2.0}
 
     # Once fitted the target is no longer read, so a serving file without it transforms.
     encoder: QuantileEncoder = QuantileEncoder(target="price", columns=["device"]).fit(events)
-    serving: str = _write(tmp_path / "serving.parquet", pa.table({"device": ["ios", "tv"]}))
-    assert [row["device"] for row in _rows(encoder.transform_parquet([serving], output_dir=tmp_path / "out"))] == (
+    serving: str = write_parquet(tmp_path / "serving.parquet", pa.table({"device": ["ios", "tv"]}))
+    assert [row["device"] for row in read_rows(encoder.transform_parquet([serving], output_dir=tmp_path / "out"))] == (
         pytest.approx([3.125, 4.25])
     )
     assert encoder.transform_dict({"device": "ios"}) == {"device": 3.125}
@@ -227,18 +201,20 @@ def test_quantile_encode_validates_its_arguments(events: list[str], tmp_path: Pa
         SummaryEncoder(target="price", quantiles=[])
     with pytest.raises(ValueError, match="round to the same percentile"):
         SummaryEncoder(target="price", quantiles=[0.12, 0.125])
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"price": [1.0, 2.0]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"price": [1.0, 2.0]}))
     with pytest.raises(EngineError, match="no utf8 columns to encode"):
         QuantileEncoder(target="price").fit([numbers])
     # REGRESSION: a target spanning past f64 is refused at fit. Its median used
     # to overflow into a prior that saved as null, so the pipeline would not
     # load.
-    wide: str = _write(
+    wide: str = write_parquet(
         tmp_path / "wide.parquet",
         pa.table({"device": pa.array([None, None], pa.string()), "price": [-1.7e308, 1.7e308]}),
     )
     with pytest.raises(EngineError, match="target column 'price' spans past the range of f64"):
         QuantileEncoder(target="price", columns=["device"], handle_missing="return_nan").fit([wide])
-    clash: str = _write(tmp_path / "clash.parquet", pa.table({"device": ["ios"], "device_25": [1.0], "price": [1.0]}))
+    clash: str = write_parquet(
+        tmp_path / "clash.parquet", pa.table({"device": ["ios"], "device_25": [1.0], "price": [1.0]})
+    )
     with pytest.raises(EngineError, match="output column 'device_25' already exists in input"):
         SummaryEncoder(target="price", columns=["device"]).fit([clash])

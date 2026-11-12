@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
@@ -19,35 +18,7 @@ from fast_feature_transform import (
     Pipeline,
     _core,
 )
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _table(parts: list[Path]) -> pa.Table:
-    """Read output parts back as one table.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The concatenated table.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts])
+from helpers import read_table, write_parquet
 
 
 @pytest.fixture
@@ -62,13 +33,13 @@ def colors(tmp_path: Path) -> list[str]:
 
     """
     table: pa.Table = pa.table({"color": ["cyan", "amber", None, "blue", "amber", "cyan"], "size": ["l"] * 6})
-    return [_write(tmp_path / "colors.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "colors.parquet", table, row_group_size=2)]
 
 
 def test_binary_encode_spells_the_rank_of_every_level(colors: list[str], tmp_path: Path) -> None:
     encoder: BinaryEncoder = BinaryEncoder(columns=["color"]).fit(colors)
     assert encoder.categories_ == {"color": ["amber", "blue", "cyan"]}
-    table: pa.Table = _table(encoder.transform_parquet(colors, output_dir=tmp_path / "out"))
+    table: pa.Table = read_table(encoder.transform_parquet(colors, output_dir=tmp_path / "out"))
     # Three categories plus the fitted null make four levels, and the word 0
     # is reserved for an unknown, so the rank needs three binary digits.
     assert table.column_names == ["size", "color_0", "color_1", "color_2"]
@@ -81,14 +52,14 @@ def test_binary_encode_spells_the_rank_of_every_level(colors: list[str], tmp_pat
     # An unknown takes the code word the ranks left free.
     assert encoder.transform_dict({"color": "zulu"}) == {"color_0": 0, "color_1": 0, "color_2": 0}
 
-    plain: str = _write(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))
+    plain: str = write_parquet(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))
     unseen_null: BinaryEncoder = BinaryEncoder(columns=["color"]).fit([plain])
     assert unseen_null.transform_dict({"color": None}) == {"color_0": 0, "color_1": 0}  # never a fitted level
 
 
 def test_basen_encode_writes_the_rank_in_its_base(colors: list[str], tmp_path: Path) -> None:
     base3: BaseNEncoder = BaseNEncoder(columns=["color"], base=3).fit(colors)
-    rows: list[dict[str, Any]] = _table(base3.transform_parquet(colors, output_dir=tmp_path / "three")).to_pylist()
+    rows: list[dict[str, Any]] = read_table(base3.transform_parquet(colors, output_dir=tmp_path / "three")).to_pylist()
     assert list(rows[0]) == ["size", "color_0", "color_1"]  # four levels need two base-3 digits
     assert [rows[1]["color_0"], rows[1]["color_1"]] == [0, 1]  # amber, rank 1
     assert [rows[0]["color_0"], rows[0]["color_1"]] == [1, 0]  # cyan, rank 3
@@ -110,7 +81,7 @@ def test_basen_encode_writes_the_rank_in_its_base(colors: list[str], tmp_path: P
 def test_gray_encode_changes_one_digit_between_neighbouring_ranks(tmp_path: Path) -> None:
     # Deliberately unsorted: category_encoders sorts the categories for Gray,
     # so this encoder agrees with it on any fit data.
-    source: str = _write(tmp_path / "gray.parquet", pa.table({"c": ["e", "c", "a", "d", "b"]}))
+    source: str = write_parquet(tmp_path / "gray.parquet", pa.table({"c": ["e", "c", "a", "d", "b"]}))
     encoder: GrayEncoder = GrayEncoder(columns=["c"]).fit([source])
     assert encoder.categories_ == {"c": ["a", "b", "c", "d", "e"]}
     words: list[list[int]] = [
@@ -159,7 +130,7 @@ def test_a_later_step_sees_the_schema_the_expansion_produced(colors: list[str], 
     assert counts.counts_ == {"size": {"l": 6}}
     row: dict[str, Any] = pipeline.transform_dict({"color": "amber", "size": "l"})
     assert row == {"size": 6, "color_0": 0, "color_1": 0, "color_2": 1}
-    assert _table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
+    assert read_table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
 
 
 def test_the_encoders_survive_the_split_and_the_artifact(colors: list[str], tmp_path: Path) -> None:
@@ -201,7 +172,7 @@ def test_the_encoders_survive_the_split_and_the_artifact(colors: list[str], tmp_
 
 
 def test_the_encoders_refuse_columns_they_cannot_encode(colors: list[str], tmp_path: Path) -> None:
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"price": [1.0, 2.0]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"price": [1.0, 2.0]}))
     with pytest.raises(EngineError, match="is f64, expected utf8"):
         BinaryEncoder(columns=["price"]).fit([numbers])
     with pytest.raises(EngineError, match="not found in input"):
@@ -209,7 +180,9 @@ def test_the_encoders_refuse_columns_they_cannot_encode(colors: list[str], tmp_p
     with pytest.raises(EngineError, match="no utf8 columns to binary-encode"):
         BinaryEncoder().fit([numbers])
     # The digits would land on a column that is already there.
-    clash: str = _write(tmp_path / "clash.parquet", pa.table({"color": ["amber", "blue"], "color_0": ["x", "y"]}))
+    clash: str = write_parquet(
+        tmp_path / "clash.parquet", pa.table({"color": ["amber", "blue"], "color_0": ["x", "y"]})
+    )
     with pytest.raises(EngineError, match="output column 'color_0' already exists in input"):
         BinaryEncoder(columns=["color"]).fit([clash])
 

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
@@ -18,35 +17,7 @@ from fast_feature_transform import (
     RankHotEncoder,
     _core,
 )
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _table(parts: list[Path]) -> pa.Table:
-    """Read output parts back as one table.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The concatenated table.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts])
+from helpers import read_table, write_parquet
 
 
 @pytest.fixture
@@ -61,13 +32,13 @@ def colors(tmp_path: Path) -> list[str]:
 
     """
     table: pa.Table = pa.table({"color": ["cyan", "amber", None, "blue", "amber", "cyan"], "size": ["l"] * 6})
-    return [_write(tmp_path / "colors.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "colors.parquet", table, row_group_size=2)]
 
 
 def test_ordinal_encode_numbers_sorted_categories_with_the_null_last(colors: list[str], tmp_path: Path) -> None:
     encoder: OrdinalEncoder = OrdinalEncoder(columns=["color"]).fit(colors)
     assert encoder.categories_ == {"color": ["amber", "blue", "cyan"]}
-    rows: list[dict[str, Any]] = _table(encoder.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()
+    rows: list[dict[str, Any]] = read_table(encoder.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()
     assert [row["color"] for row in rows] == [3, 1, 4, 2, 1, 3]  # the null was seen at fit, so it takes the last code
     assert encoder.transform_dict({"color": "amber", "size": "l"}) == {"color": 1, "size": "l"}
     assert encoder.transform_dict({"color": "zulu"}) == {"color": -1}
@@ -79,7 +50,7 @@ def test_ordinal_encode_numbers_sorted_categories_with_the_null_last(colors: lis
     with pytest.raises(ValueError, match=r"index_start must be an integer from -2\*\*63 to 2\*\*63 - 1"):
         OrdinalEncoder(columns=["color"], index_start=2**63)
 
-    plain: str = _write(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))
+    plain: str = write_parquet(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))
     unseen_null: OrdinalEncoder = OrdinalEncoder(columns=["color"]).fit([plain])
     assert unseen_null.transform_dict({"color": None}) == {"color": -2}  # never a fitted category
 
@@ -101,7 +72,7 @@ def test_ordinal_encode_null_and_unknown_options(colors: list[str], tmp_path: Pa
 
 def test_one_hot_and_rank_hot_expand_the_column(colors: list[str], tmp_path: Path) -> None:
     hot: OneHotEncoder = OneHotEncoder(columns=["color"]).fit(colors)
-    table: pa.Table = _table(hot.transform_parquet(colors, output_dir=tmp_path / "hot"))
+    table: pa.Table = read_table(hot.transform_parquet(colors, output_dir=tmp_path / "hot"))
     # The source column is replaced; the null category is sorted last and gets its own column.
     assert table.column_names == ["size", "color_1", "color_2", "color_3", "color_4"]
     assert table.to_pylist()[0] == {"size": "l", "color_1": 0, "color_2": 0, "color_3": 1, "color_4": 0}
@@ -110,7 +81,7 @@ def test_one_hot_and_rank_hot_expand_the_column(colors: list[str], tmp_path: Pat
     assert hot.transform_dict({"color": "zulu"}) == {"color_1": 0, "color_2": 0, "color_3": 0, "color_4": 0}
 
     named: OneHotEncoder = OneHotEncoder(columns=["color"], use_cat_names=True).fit(colors)
-    assert _table(named.transform_parquet(colors, output_dir=tmp_path / "named")).column_names == [
+    assert read_table(named.transform_parquet(colors, output_dir=tmp_path / "named")).column_names == [
         "size",
         "color_amber",
         "color_blue",
@@ -119,7 +90,7 @@ def test_one_hot_and_rank_hot_expand_the_column(colors: list[str], tmp_path: Pat
     ]
 
     ranked: RankHotEncoder = RankHotEncoder(columns=["color"]).fit(colors)
-    ranks: list[dict[str, Any]] = _table(ranked.transform_parquet(colors, output_dir=tmp_path / "rank")).to_pylist()
+    ranks: list[dict[str, Any]] = read_table(ranked.transform_parquet(colors, output_dir=tmp_path / "rank")).to_pylist()
     assert ranks[1] == {"size": "l", "color_1": 1, "color_2": 0, "color_3": 0, "color_4": 0}  # amber, rank 1
     assert ranks[0] == {"size": "l", "color_1": 1, "color_2": 1, "color_3": 1, "color_4": 0}  # cyan, rank 3
     assert ranked.transform_dict({"color": "cyan", "size": "l"}) == ranks[0]
@@ -138,11 +109,11 @@ def test_one_hot_and_rank_hot_expand_the_column(colors: list[str], tmp_path: Pat
 # as zeros instead of nulls. OneHotEncoder does have that row, and is right to
 # keep giving zeros.
 def test_rank_hot_hands_a_null_it_never_fitted_to_handle_unknown(tmp_path: Path) -> None:
-    plain: list[str] = [_write(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))]
-    late: list[str] = [_write(tmp_path / "late.parquet", pa.table({"color": ["amber", None]}))]
+    plain: list[str] = [write_parquet(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))]
+    late: list[str] = [write_parquet(tmp_path / "late.parquet", pa.table({"color": ["amber", None]}))]
 
     ranked: RankHotEncoder = RankHotEncoder(columns=["color"], handle_unknown="return_nan").fit(plain)
-    rows: list[dict[str, Any]] = _table(ranked.transform_parquet(late, output_dir=tmp_path / "rank")).to_pylist()
+    rows: list[dict[str, Any]] = read_table(ranked.transform_parquet(late, output_dir=tmp_path / "rank")).to_pylist()
     assert rows == [{"color_1": 1, "color_2": 0}, {"color_1": None, "color_2": None}]
     assert ranked.transform_dict({"color": None}) == rows[1]
 
@@ -164,7 +135,7 @@ def test_rank_hot_hands_a_null_it_never_fitted_to_handle_unknown(tmp_path: Path)
 # column narrower than the library's. OneHotEncoder drops it upstream too.
 def test_rank_hot_keeps_the_placeholder_column_under_return_nan(colors: list[str], tmp_path: Path) -> None:
     ranked: RankHotEncoder = RankHotEncoder(columns=["color"], handle_missing="return_nan").fit(colors)
-    table: pa.Table = _table(ranked.transform_parquet(colors, output_dir=tmp_path / "rank"))
+    table: pa.Table = read_table(ranked.transform_parquet(colors, output_dir=tmp_path / "rank"))
     assert table.column_names == ["size", "color_1", "color_2", "color_3", "color_-2"]
     rows: list[dict[str, Any]] = table.to_pylist()
     assert rows[1] == {"size": "l", "color_1": 1, "color_2": 0, "color_3": 0, "color_-2": 0}  # amber
@@ -174,7 +145,7 @@ def test_rank_hot_keeps_the_placeholder_column_under_return_nan(colors: list[str
     assert ranked.transform_dict({"color": None, "size": "l"}) == rows[2]
 
     named: RankHotEncoder = RankHotEncoder(columns=["color"], handle_missing="return_nan", use_cat_names=True)
-    assert _table(named.fit(colors).transform_parquet(colors, output_dir=tmp_path / "named")).column_names == [
+    assert read_table(named.fit(colors).transform_parquet(colors, output_dir=tmp_path / "named")).column_names == [
         "size",
         "color_amber",
         "color_blue",
@@ -192,7 +163,7 @@ def test_rank_hot_keeps_the_placeholder_column_under_return_nan(colors: list[str
     assert pickle.loads(pickle.dumps(pipeline)).transform_dict(record) == rows[1]
 
     # handle_missing='error' refits the pre-encoder strictly: no slot, no column.
-    plain: list[str] = [_write(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))]
+    plain: list[str] = [write_parquet(tmp_path / "plain.parquet", pa.table({"color": ["amber", "blue"]}))]
     assert RankHotEncoder(columns=["color"], handle_missing="error").fit(plain).transform_dict({"color": "amber"}) == {
         "color_1": 1,
         "color_2": 0,
@@ -214,9 +185,9 @@ def test_rank_hot_keeps_the_placeholder_column_under_return_nan(colors: list[str
 # the parts and a model served from records had different feature counts.
 # category_encoders' counter spans every encoded column; ours does now too.
 def test_one_hot_disambiguates_a_name_that_repeats_across_columns(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "collide.parquet", pa.table({"a": ["b_c", "d"], "a_b": ["c", "e"]}))
+    path: str = write_parquet(tmp_path / "collide.parquet", pa.table({"a": ["b_c", "d"], "a_b": ["c", "e"]}))
     hot: OneHotEncoder = OneHotEncoder(columns=["a", "a_b"], use_cat_names=True).fit([path])
-    table: pa.Table = _table(hot.transform_parquet([path], output_dir=tmp_path / "out"))
+    table: pa.Table = read_table(hot.transform_parquet([path], output_dir=tmp_path / "out"))
     assert table.column_names == ["a_b_c", "a_d", "a_b_c#", "a_b_e"]
     rows: list[dict[str, Any]] = table.to_pylist()
     assert rows[0] == {"a_b_c": 1, "a_d": 0, "a_b_c#": 1, "a_b_e": 0}
@@ -243,7 +214,7 @@ def test_a_later_step_sees_the_schema_the_expansion_produced(colors: list[str], 
     assert counts.counts_ == {"size": {"l": 6}}
     row: dict[str, Any] = pipeline.transform_dict({"color": "amber", "size": "l"})
     assert row == {"size": 6, "color_1": 1, "color_2": 0, "color_3": 0, "color_4": 0}
-    assert _table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
+    assert read_table(pipeline.transform_parquet(colors, output_dir=tmp_path / "out")).to_pylist()[1] == row
 
 
 def test_the_substrate_is_independent_of_the_split_and_survives_the_artifact(colors: list[str], tmp_path: Path) -> None:

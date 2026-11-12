@@ -22,16 +22,7 @@ namespace {
 // Fit a count_encode kernel with one worker state per batch.
 std::unique_ptr<fft::Kernel> fit_count(const nlohmann::json& params, fft::Schema schema,
                                        const std::vector<fft::Batch>& batches) {
-  auto kernel = fft::make_kernel("count_encode", params);
-  kernel->stage = "counts";
-  kernel->resolve(schema);
-  std::vector<std::unique_ptr<fft::AccState>> states;
-  for (const fft::Batch& batch : batches) {
-    states.push_back(kernel->make_state());
-    kernel->consume(*states.back(), batch);
-  }
-  kernel->finalize(std::move(states));
-  return kernel;
+  return fft::testing::fit_kernel_per_batch("count_encode", params, std::move(schema), batches, "counts");
 }
 
 // What `kernel` answers for every row of `batch`, whose columns are all
