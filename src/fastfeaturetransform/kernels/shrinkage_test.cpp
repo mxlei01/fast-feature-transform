@@ -72,6 +72,14 @@ TEST_CASE("the shrinkage encoders validate their params") {
   // binary is refused on purpose: it is not reproducible from the formula.
   REQUIRE_THROWS_WITH(fft::make_kernel("james_stein_encode", {{"target", "y"}, {"model", "binary"}}),
                       ContainsSubstring("not portable"));
+  // A kernel reads its own param before handle_unknown and handle_missing, as
+  // every target encoder does, so with both wrong the message names its own.
+  REQUIRE_THROWS_WITH(
+      fft::make_kernel("cat_boost_encode", {{"target", "y"}, {"a", -1}, {"handle_unknown", "sometimes"}}),
+      ContainsSubstring("'a' must be a finite number >= 0"));
+  REQUIRE_THROWS_WITH(
+      fft::make_kernel("james_stein_encode", {{"target", "y"}, {"model", "shrunk"}, {"handle_missing", "sometimes"}}),
+      ContainsSubstring("'model' must be 'independent', 'pooled' or 'beta'"));
   REQUIRE(fft::make_kernel("james_stein_encode", target)->needs_fit());
   REQUIRE(fft::make_kernel("cat_boost_encode", target)->params().at("a") == 1.0);
   REQUIRE(fft::make_kernel("james_stein_encode", target)->params().at("model") == "independent");

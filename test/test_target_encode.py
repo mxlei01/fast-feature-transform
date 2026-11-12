@@ -1,8 +1,14 @@
-"""Tests for the target-mean kernels: the three formulas, the target column, and the artifact."""
+"""Tests for the target-mean kernels: the three formulas, the target column, and the artifact.
+
+The last two tests cover all six target encoders: an integer target above 2^53, and a float target at the magnitude
+bound.
+"""
 
 import json
 import math
 import pickle
+from collections.abc import Mapping, Sequence
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +17,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
+    CatBoostEncoder,
     EngineError,
+    JamesSteinEncoder,
+    LeaveOneOutEncoder,
     MEstimateEncoder,
     Pipeline,
     Select,
@@ -324,3 +333,255 @@ def test_the_shells_validate_their_arguments() -> None:
         WOEEncoder(target="clicked", regularization=text)
     with pytest.raises(ValueError, match="regularization must be a finite number > 0"):
         WOEEncoder(target="clicked", regularization=0.0)
+
+
+BIG: int = 2**62
+
+# Each category's integer targets. An f64 holds every second integer above 2^53 and every 1,024th above 2^62, so a
+# sum of these values as floats loses what an exact integer sum keeps. The large values cancel across the column, so
+# the prior is small and every category's own sum shows in its value.
+INTEGER_TARGETS: dict[str | None, list[int]] = {
+    "cancel": [BIG + 1, -BIG, BIG + 1, -BIG, 3],  # sums to 5; to 3 once each value is rounded to an f64
+    "round": [BIG + 511] * 9,  # each value rounds down by 511, and their exact sum rounds up by 3,593
+    "top": [2**63 - 1, 2**63 - 1, BIG + 3],  # sums past 2^64
+    "bottom": [-(2**63)] * 7 + [5],  # sums below -2^65, cancelling the large sums above
+    "single": [7],
+    None: [2**53 + 1, -(2**53), 2**53 + 1, -(2**53)],  # sums to 2; to 0 as floats
+}
+
+# Categories whose values are all one integer that no f64 holds: each value rounds up to an f64 and each category's
+# sum rounds down. Each category's variance is 0, which JamesSteinEncoder finds only when it sums the values and their
+# squares exactly.
+CONSTANT_TARGETS: dict[str | None, list[int]] = {f"level{step}": [BIG + step * 2**20 + 700] * 3 for step in range(4)}
+
+# Categories near 2^53. 2^53 + 1 is the one integer above 2^53 whose f64 is 2^53, and squared as that f64 it loses
+# 2^54 + 1: the edge category's value under JamesSteinEncoder's independent model then moves by 4,953,902.
+EDGE_TARGETS: dict[str | None, list[int]] = {
+    "edge": [2**53 + 1, 2**53 + 1, 2**53 + 2**28],
+    "up": [2**53 + 2**28] * 3,
+    "down": [2**53 - 2**28] * 3,
+    "mid": [2**53 + 2] * 3,
+}
+
+# Categories near -(2^62 + 2^11), whose square is 2^124 + 2^74 + 2^22. The kernel cuts an integer sum or square at bits
+# 22 and 75 into pieces that an f64 holds, every sum here is negative, and 5 of the 12 squares have bit 74 set. The
+# category means lie 2^40 to 2^43 apart and each category spans 2^40 to 2^42, so dropping bit 74 from each square
+# moves every value of JamesSteinEncoder's independent and pooled models.
+CUT = -(BIG + 2**11)
+CUT_TARGETS: dict[str | None, list[int]] = {
+    "a": [CUT, CUT - 3 * 2**39, CUT + 5 * 2**39 + 1],
+    "b": [CUT - 2**42, CUT - 2**42 + 2**40 + 11, CUT - 2**42 - 3 * 2**38],
+    "c": [CUT + 2**41 + 7, CUT + 2**41 - 2**40, CUT + 2**41 + 2**39 + 3],
+    "d": [CUT - 3 * 2**41 + 5, CUT - 3 * 2**41 - 2**40, CUT - 3 * 2**41 + 2**39 + 9],
+}
+
+# WOEEncoder needs a target of two values, one at most 0 and one at least 1. With these two a category of as many
+# rows of each sums to its count of the larger one, and to 0 once each value is rounded to an f64.
+WOE_TARGETS: dict[str | None, list[int]] = {
+    "two": [BIG + 1, -BIG] * 2,
+    "one": [BIG + 1, -BIG],
+    "three": [BIG + 1, -BIG] * 3,
+    "high": [BIG + 1],
+    "low": [-BIG],
+    None: [BIG + 1, -BIG],
+}
+
+# The column and the target of every fixture below, as an encoder's arguments.
+ENCODED: dict[str, Any] = {"columns": ["c"], "target": "y"}
+
+
+def _target_table(targets: Mapping[str | None, Sequence[float]], kind: pa.DataType) -> pa.Table:
+    """Build the (category, target) rows of a fixture, with the categories interleaved.
+
+    Args:
+        targets: Each category's target values; the key None is the null category.
+        kind: The Arrow type of the target column.
+
+    Returns:
+        A table of the string column ``c`` and the target column ``y``.
+
+    """
+    rows: list[tuple[str | None, float]] = [(key, value) for key, values in targets.items() for value in values]
+    rows = rows[::3] + rows[1::3] + rows[2::3]
+    return pa.table(
+        {"c": pa.array([key for key, _ in rows], pa.string()), "y": pa.array([value for _, value in rows], kind)}
+    )
+
+
+def _fitted_by_formula(  # noqa: C901
+    encoder: Transformer, targets: Mapping[str | None, Sequence[float]]
+) -> tuple[float, dict[str | None, float]]:
+    """Compute what an encoder fits, from exact sums and the formula its docstring gives.
+
+    Every sum is an exact fraction, rounded to a float once, where the kernel rounds it. The arithmetic on the
+    rounded sums is the kernel's, in the kernel's order.
+
+    Args:
+        encoder: The encoder, which is read for its class and its parameters only.
+        targets: Each category's target values; the key None is the null category.
+
+    Returns:
+        The prior, and each category's value.
+
+    """
+    counts: dict[str | None, int] = {key: len(values) for key, values in targets.items()}
+    exact: dict[str | None, Fraction] = {
+        key: sum((Fraction(v) for v in values), Fraction(0)) for key, values in targets.items()
+    }
+    squares: dict[str | None, Fraction] = {
+        key: sum((Fraction(v) * Fraction(v) for v in values), Fraction(0)) for key, values in targets.items()
+    }
+    sums: dict[str | None, float] = {key: float(value) for key, value in exact.items()}
+    rows: int = sum(counts.values())
+    total: float = float(sum(exact.values(), Fraction(0)))
+    prior: float = total / rows
+    id_like: bool = len(targets) == rows
+
+    def variance(n: int, s: Fraction, q: Fraction) -> float:
+        return 0.0 if n < 2 else max(0.0, float(n * q - s * s) / (float(n) * (n - 1)))
+
+    def value(key: str | None) -> float:  # noqa: C901
+        n: float = float(counts[key])
+        s: float = sums[key]
+        if isinstance(encoder, TargetEncoder):
+            weight: float = 1.0 / (1.0 + math.exp(-((n - float(encoder.min_samples_leaf)) / encoder.smoothing)))
+            return prior * (1 - weight) + (s / n) * weight
+        if isinstance(encoder, MEstimateEncoder):
+            return prior if id_like else (s + prior * encoder.m) / (n + encoder.m)
+        if isinstance(encoder, WOEEncoder):
+            r: float = encoder.regularization
+            return 0.0 if n == 1 else math.log(((s + r) / (total + 2 * r)) / (((n - s) + r) / ((rows - total) + 2 * r)))
+        if isinstance(encoder, LeaveOneOutEncoder):
+            return s / n if n > 1 else prior
+        if isinstance(encoder, CatBoostEncoder):
+            return (s + prior * encoder.a) / (n + encoder.a) if n > 1 else prior
+        assert isinstance(encoder, JamesSteinEncoder)
+        if id_like:
+            return prior
+        mean: float = s / n
+        categories: float = float(len(targets))
+        target_variance: float = variance(rows, sum(exact.values(), Fraction(0)), sum(squares.values(), Fraction(0)))
+        if encoder.model == "independent":
+            weight = 1.0
+            if categories >= 2:
+                own: float = variance(counts[key], exact[key], squares[key])
+                both: float = target_variance + own
+                shrinkage: float = (0.0 if both == 0.0 else own / both) * (categories - 3) / (categories - 1)
+                weight = min(max(1.0 - shrinkage, 0.0), 1.0)
+            return weight * mean + (1 - weight) * prior
+        if encoder.model == "pooled":
+            errors: list[float] = [sums[other] / counts[other] - prior for other in targets]
+            sse: float = math.fsum(error * error for error in errors)
+            pooled: float = 0.0
+            if sse > 0:
+                pooled = min(max((categories - 3) * (target_variance / (rows / categories)) / sse, 0.0), 1.0)
+            return prior + (1 - pooled) * (mean - prior)
+        weight = n / (n + float(rows))
+        return weight * mean + (1 - weight) * prior
+
+    return prior, {key: value(key) for key in targets}
+
+
+@pytest.mark.parametrize(
+    ("shell", "options", "targets"),
+    [
+        pytest.param(TargetEncoder, {}, INTEGER_TARGETS, id="target"),
+        pytest.param(TargetEncoder, {"min_samples_leaf": 3, "smoothing": 0.5}, INTEGER_TARGETS, id="target-leaf-3"),
+        pytest.param(MEstimateEncoder, {}, INTEGER_TARGETS, id="m-estimate"),
+        pytest.param(MEstimateEncoder, {"m": 0.0}, INTEGER_TARGETS, id="m-estimate-m-0"),
+        pytest.param(WOEEncoder, {}, WOE_TARGETS, id="woe"),
+        pytest.param(WOEEncoder, {"regularization": 0.25}, WOE_TARGETS, id="woe-regularization-0.25"),
+        pytest.param(JamesSteinEncoder, {}, INTEGER_TARGETS, id="james-stein-independent"),
+        pytest.param(JamesSteinEncoder, {"model": "pooled"}, INTEGER_TARGETS, id="james-stein-pooled"),
+        pytest.param(JamesSteinEncoder, {"model": "beta"}, INTEGER_TARGETS, id="james-stein-beta"),
+        pytest.param(JamesSteinEncoder, {}, CONSTANT_TARGETS, id="james-stein-independent-constant"),
+        pytest.param(JamesSteinEncoder, {}, EDGE_TARGETS, id="james-stein-independent-edge"),
+        pytest.param(JamesSteinEncoder, {"model": "pooled"}, CONSTANT_TARGETS, id="james-stein-pooled-constant"),
+        pytest.param(JamesSteinEncoder, {"model": "pooled"}, EDGE_TARGETS, id="james-stein-pooled-edge"),
+        pytest.param(JamesSteinEncoder, {}, CUT_TARGETS, id="james-stein-independent-cut"),
+        pytest.param(JamesSteinEncoder, {"model": "pooled"}, CUT_TARGETS, id="james-stein-pooled-cut"),
+        pytest.param(LeaveOneOutEncoder, {}, INTEGER_TARGETS, id="leave-one-out"),
+        pytest.param(CatBoostEncoder, {}, INTEGER_TARGETS, id="cat-boost"),
+        pytest.param(CatBoostEncoder, {"a": 0.0}, INTEGER_TARGETS, id="cat-boost-a-0"),
+    ],
+)
+def test_an_integer_target_above_2_to_the_53_fits_by_the_formula(
+    tmp_path: Path, shell: type[Transformer], options: dict[str, Any], targets: dict[str | None, list[int]]
+) -> None:
+    """Every encoder sums an integer target whole, so its prior and values are the formula's on the exact sums.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        shell: The encoder class.
+        options: The encoder's own parameters.
+        targets: Each category's integer targets.
+
+    """
+    path: str = _write(tmp_path / "integers.parquet", _target_table(targets, pa.int64()), row_group_size=4)
+    for threads in (1, 4):
+        encoder: Any = shell(**ENCODED, **options).fit([path], threads=threads)
+        prior, values = _fitted_by_formula(encoder, targets)
+        state: dict[str, Any] = encoder._state()
+        assert state["prior"] == prior
+        fitted: dict[str | None, float] = dict(state["values"]["c"]) | {None: state["null_values"]["c"]}
+        if None not in targets:
+            assert fitted.pop(None) is None
+        assert fitted == values
+
+
+@pytest.mark.parametrize(
+    ("shell", "power", "holder"),
+    [
+        (TargetEncoder, 900, "a sum"),
+        (MEstimateEncoder, 900, "a sum"),
+        (WOEEncoder, 900, "a sum"),
+        (JamesSteinEncoder, 450, "the squared sums"),
+        (LeaveOneOutEncoder, 900, "a sum"),
+        (CatBoostEncoder, 900, "a sum"),
+    ],
+)
+def test_a_float_target_fits_below_its_magnitude_bound_and_is_refused_from_it(
+    tmp_path: Path, shell: type[Transformer], power: int, holder: str
+) -> None:
+    """A float target fits up to the largest f64 below the encoder's bound, and the bound itself is refused.
+
+    Every encoder takes a target below 2^900 in magnitude, except JamesSteinEncoder, which sums the target's squares
+    and takes one below 2^450.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        shell: The encoder class.
+        power: The bound is 2 to this power.
+        holder: What the message says a value from the bound on is more than.
+
+    """
+    bound: float = 2.0**power
+    inside: float = math.nextafter(bound, 0.0)
+
+    def fit(targets: Mapping[str | None, Sequence[float]]) -> Any:
+        path: str = _write(tmp_path / "floats.parquet", _target_table(targets, pa.float64()), row_group_size=2)
+        return shell(**ENCODED).fit([path], threads=1)
+
+    # WOEEncoder needs a target of two values, one at most 0 and one at least 1.
+    fitting: list[dict[str | None, list[float]]] = [{"a": [inside, 0.0], "b": [inside, 0.0]}]
+    if shell is not WOEEncoder:
+        # The exact sum of every target is 1.5, though two of them are as large as the encoder takes.
+        fitting = [{"a": [value, 1.0], "b": [-value, 0.5]} for value in (inside, -inside)]
+    for targets in fitting:
+        encoder: Any = fit(targets)
+        prior, values = _fitted_by_formula(encoder, targets)
+        state: dict[str, Any] = encoder._state()
+        assert state["prior"] == prior
+        assert state["values"]["c"] == values
+
+    for value in (bound, -bound, math.inf if power == 900 else 1e200):
+        with pytest.raises(EngineError) as refused:
+            fit({"a": [value, 0.0], "b": [1.0, 0.0]})
+        problem: str = f"is 2^{power} or more in magnitude, more than {holder} can hold (scale the target first)"
+        if math.isinf(value):
+            problem = "is not finite; a target cannot be NaN or infinity"
+        assert str(refused.value) == f"{shell.__name__.lower()}: target column 'y': value {value!r} {problem}"
+    if power == 900:
+        # Nothing is refused between 2^450, where JamesSteinEncoder stops, and 2^900.
+        for value in (2.0**450, 1e200):
+            assert fit({"a": [value, 0.0], "b": [value, 0.0]})._state()["prior"] == value / 2

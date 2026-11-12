@@ -43,8 +43,6 @@ std::unique_ptr<Kernel> make_polynomial_encode(const nlohmann::json& params);
 std::unique_ptr<Kernel> make_target_encode(const nlohmann::json& params);
 std::unique_ptr<Kernel> make_m_estimate_encode(const nlohmann::json& params);
 std::unique_ptr<Kernel> make_woe_encode(const nlohmann::json& params);
-
-// kernels/shrinkage.cpp
 std::unique_ptr<Kernel> make_james_stein_encode(const nlohmann::json& params);
 std::unique_ptr<Kernel> make_leave_one_out_encode(const nlohmann::json& params);
 std::unique_ptr<Kernel> make_cat_boost_encode(const nlohmann::json& params);
