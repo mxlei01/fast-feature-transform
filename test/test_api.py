@@ -20,8 +20,12 @@ import pytest
 import fast_feature_transform
 from fast_feature_transform import (
     BinaryEncoder,
+    Cast,
+    CatBoostEncoder,
     CountEncoder,
     EngineError,
+    GroupAgg,
+    HashingEncoder,
     HelmertEncoder,
     JamesSteinEncoder,
     KBinsDiscretizer,
@@ -38,9 +42,11 @@ from fast_feature_transform import (
     SummaryEncoder,
     TargetEncoder,
     Transformer,
+    WOEEncoder,
     _core,
     parquet_to_memmap,
 )
+from fast_feature_transform.transformers import _output_directory
 
 # LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
 MOB_INDEX: int = 2
@@ -128,8 +134,9 @@ def test_the_version_is_the_installed_one_and_comes_from_the_extension(tmp_path:
     assert fast_feature_transform.__version__ == importlib.metadata.version("fast-feature-transform")
     # REGRESSION: importing the package does not import importlib.metadata. It
     # used to ask the installed metadata for the version, and that import and
-    # its search of the installed distributions took a third of this one. A
-    # child process shows it, because this process has imported the metadata.
+    # its search of the installed distributions took about a third of this one
+    # with no cached bytecode and about half with the bytecode cached. A child
+    # process shows it, because this process has imported the metadata.
     # Where the interpreter's own start imports it, there is nothing to show.
     script: str = (
         "import sys\n"
@@ -170,6 +177,30 @@ def test_a_failed_batch_call_removes_the_temporary_directory_it_made(
     (made,) = temporary.iterdir()
     assert made.name.startswith("fast_feature_transform_")
     assert {path.parent for path in ([written] if call == "memmap" else written)} == {made}
+
+
+def _interrupted_call(made: list[Path], *, wrote: bool) -> None:
+    with _output_directory(None) as directory:
+        made.append(Path(directory))
+        if wrote:
+            (made[-1] / "part-00000.parquet").write_bytes(b"rows")
+        raise KeyboardInterrupt
+
+
+def test_an_interrupt_removes_the_temporary_directory_only_while_it_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An interrupt, which is not an Exception, removes the directory too. One
+    # that lands while the engine runs is raised when the engine returns, after
+    # it has written its output, and rmdir leaves that output where it is.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    made: list[Path] = []
+    with pytest.raises(KeyboardInterrupt):
+        _interrupted_call(made, wrote=False)
+    assert not made[0].exists()
+    with pytest.raises(KeyboardInterrupt):
+        _interrupted_call(made, wrote=True)
+    assert [path.name for path in made[1].iterdir()] == ["part-00000.parquet"]
 
 
 def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str]) -> None:
@@ -273,7 +304,9 @@ def test_constructor_arguments_are_validated() -> None:
         Pipeline(not_a_pair)
 
 
-# One option of each transformer that takes a string from a fixed set.
+# Options that take a string from a fixed set: at least one of every
+# constructor that checks one with _one_of, both of the target encoders', and
+# the two checked with messages of their own.
 _STRING_OPTIONS: list[tuple[type[Transformer], dict[str, Any], str]] = [
     (OrdinalEncoder, {"handle_unknown": "return_nan"}, "handle_unknown"),
     (OrdinalEncoder, {"handle_missing": "error"}, "handle_missing"),
@@ -283,6 +316,8 @@ _STRING_OPTIONS: list[tuple[type[Transformer], dict[str, Any], str]] = [
     (CountEncoder, {"handle_unknown": "return_nan"}, "handle_unknown"),
     (CountEncoder, {"handle_missing": "error"}, "handle_missing"),
     (TargetEncoder, {"target": "y", "handle_unknown": "error"}, "handle_unknown"),
+    (WOEEncoder, {"target": "y", "handle_missing": "return_nan"}, "handle_missing"),
+    (CatBoostEncoder, {"target": "y", "handle_unknown": "error"}, "handle_unknown"),
     (JamesSteinEncoder, {"target": "y", "handle_missing": "return_nan"}, "handle_missing"),
     (JamesSteinEncoder, {"target": "y", "model": "pooled"}, "model"),
     (QuantileEncoder, {"target": "y", "handle_unknown": "return_nan"}, "handle_unknown"),
@@ -293,6 +328,8 @@ _STRING_OPTIONS: list[tuple[type[Transformer], dict[str, Any], str]] = [
     (KBinsDiscretizer, {"strategy": "uniform"}, "strategy"),
     (SplineTransformer, {"columns": ["x"], "extrapolation": "linear"}, "extrapolation"),
     (PowerTransformer, {"columns": ["x"], "method": "box-cox"}, "method"),
+    (HashingEncoder, {"columns": ["c"], "hash_method": "md5"}, "hash_method"),
+    (CountEncoder, {"combine_min_nan_groups": "force"}, "combine_min_nan_groups"),
 ]
 
 
@@ -315,6 +352,17 @@ def test_an_option_given_as_an_enum_of_strings_is_taken_as_its_value(
     assert getattr(given, option) == arguments[option]
     assert given.params() == plain.params()
     assert json.dumps(given.params()) == json.dumps(plain.params())
+
+
+def test_type_tags_and_aggregates_given_as_an_enum_of_strings_are_taken_as_their_values() -> None:
+    tag: Any = enum.Enum("Tag", {"NAME": "f64"}, type=str).NAME
+    aggregate: Any = enum.Enum("Aggregate", {"NAME": "mean"}, type=str).NAME
+    cast: Cast = Cast({"x": tag})
+    assert [type(value) for value in cast.types.values()] == [str]
+    assert cast.params() == Cast({"x": "f64"}).params()
+    group: GroupAgg = GroupAgg(key="k", aggs={"x": [aggregate]})
+    assert [type(value) for value in group.aggs["x"]] == [str]
+    assert group.params() == GroupAgg(key="k", aggs={"x": ["mean"]}).params()
 
 
 def test_an_encoder_whose_option_is_an_enum_fits_like_one_given_the_string(tmp_path: Path) -> None:

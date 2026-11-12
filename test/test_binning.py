@@ -323,6 +323,7 @@ def test_binning_is_independent_of_the_split_and_survives_the_artifact(prices: l
 
 def test_binning_validates_its_arguments(prices: list[str], tmp_path: Path) -> None:
     text: Any = "nope"
+    one: Any = 1
     bare: Any = "price"
     short: Any = (25.0,)
     with pytest.raises(TypeError, match="columns must be a list of column names"):
@@ -331,6 +332,9 @@ def test_binning_validates_its_arguments(prices: list[str], tmp_path: Path) -> N
         RobustScaler(columns=[])
     with pytest.raises(TypeError, match="with_centering must be True or False"):
         RobustScaler(with_centering=text)
+    # A flag takes a bool only: 1 is refused rather than read as True.
+    with pytest.raises(TypeError, match="RobustScaler: unit_variance must be True or False, got 1"):
+        RobustScaler(unit_variance=one)
     with pytest.raises(TypeError, match="quantile_range must be two percentiles"):
         RobustScaler(quantile_range=short)
     with pytest.raises(ValueError, match="quantile_range must satisfy"):
