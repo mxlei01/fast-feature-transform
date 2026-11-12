@@ -10,15 +10,19 @@
 #include <arrow/util/bit_util.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "fastfeaturetransform/core.hpp"
@@ -315,57 +319,325 @@ inline const arrow::Array& column_array(const Batch& batch, const std::string& s
   return *batch.cols[static_cast<std::size_t>(idx)];
 }
 
-// Exact float summation: Shewchuk's non-overlapping partials, the algorithm
-// behind Python's math.fsum. The running sum is held exactly, so partials
-// merged in any order give the same correctly rounded result. add() and
-// merge() answer false when the sum leaves f64's range.
-struct ExactSum {
-  std::vector<double> partials;  // non-overlapping, by increasing magnitude
+// An exact sum of doubles. add() and merge() lose no bit, so the same values
+// give the same sum in any order and however they are split across sums that
+// are merged later, and value() rounds that sum once, correctly. add() and
+// merge() answer false when a value is not finite or the sum leaves f64's
+// range; the sum then holds nothing a caller can use until clear().
+//
+// The sum is the exact total of two parts.
+//
+// The three terms head_, carry_ and spare_. A value is added to head_, what
+// that addition rounds away is added to carry_, and what that one rounds
+// away is added to spare_. Each addition is a TwoSum, which gives the rounded
+// sum and, as a second double, exactly what the rounding dropped. So the
+// three terms together grow by exactly the value whenever the third addition
+// drops nothing, which is almost always: between them they hold 159 bits,
+// and the values of one column seldom span more.
+//
+// The partials, Shewchuk's non-overlapping doubles by increasing magnitude
+// (the algorithm of Python's math.fsum). They take what the third addition
+// drops, in a walk over every partial.
+//
+// One test after the three additions finds every value they cannot finish:
+//   * e3 != 0: the third addition dropped e3, which joins the partials. A
+//     NaN compares unequal too, and a NaN is what any of the three leaves in
+//     e3 after meeting a NaN, an infinity or an overflow.
+//   * |s| < 2^1023 fails: the new head is in f64's top binade or is not
+//     finite. A head up there can overflow at its next addition while the
+//     exact sum is still in range, and three terms that never overflow can
+//     total a sum that is out of range, which add() has to refuse. So the
+//     head never enters the top binade. From the value that would take it
+//     there the partials alone hold the sum, and Shewchuk's step answers
+//     false when its largest partial overflows. head_ is NaN from then on:
+//     every later value fails the test the same way, and value() and merge()
+//     see that the three terms no longer count.
+// A TwoSum is exact unless one of its operations overflows. The first cannot
+// while the head stays below 2^1023, before and after; an overflow in the
+// other two leaves a NaN in e3, which the partials refuse. So a sum whose
+// every add() answered true is exact.
+class ExactSum {
+ public:
+  class Adder;
 
-  [[nodiscard]] bool add(double x) {
-    std::size_t kept = 0;
-    for (std::size_t i = 0; i < partials.size(); ++i) {
-      double y = partials[i];
-      if (std::fabs(x) < std::fabs(y)) std::swap(x, y);
-      const double hi = x + y;
-      const double lo = y - (hi - x);
-      if (lo != 0.0) partials[kept++] = lo;
-      x = hi;
-    }
-    partials.resize(kept);
-    if (x != 0.0) {
-      if (!std::isfinite(x)) return false;
-      partials.push_back(x);
-    }
-    return true;
-  }
+  ExactSum() = default;
+  // A copy has partials of its own.
+  ExactSum(const ExactSum& other)
+      : partials_(other.partials_ ? std::make_unique<std::vector<double>>(*other.partials_) : nullptr),
+        head_(other.head_),
+        carry_(other.carry_),
+        spare_(other.spare_) {}
+  ExactSum(ExactSum&&) noexcept = default;
+  ExactSum& operator=(const ExactSum& other) { return *this = ExactSum(other); }
+  ExactSum& operator=(ExactSum&&) noexcept = default;
+
+  [[nodiscard]] bool add(double x) { return add_to(*this, head_, carry_, spare_, x); }
+
   [[nodiscard]] bool merge(const ExactSum& other) {
-    for (double partial : other.partials) {
-      if (!add(partial)) return false;
+    if (other.partials_) {
+      for (double partial : *other.partials_) {
+        if (!add(partial)) return false;
+      }
     }
-    return true;
+    return std::isnan(other.head_) || (add(other.spare_) && add(other.carry_) && add(other.head_));
   }
-  // The correctly rounded sum of the partials (CPython's final rounding,
-  // which makes half-even rounding work across partials).
+
+  void clear() {
+    if (partials_) partials_->clear();
+    head_ = carry_ = spare_ = 0.0;
+  }
+
+  // The correctly rounded sum. The three terms join a copy of the partials
+  // by Shewchuk's step, on the stack when the partials are few; the rounding
+  // is CPython's, which rounds half to even across partials.
   double value() const {
-    if (partials.empty()) return 0.0;
-    std::size_t n = partials.size();
-    double hi = partials[--n];
+    std::array<double, 16> local;
+    std::vector<double> heap;
+    double* parts = local.data();
+    std::size_t n = partials_ ? partials_->size() : 0;
+    if (n + 3 > local.size()) {
+      heap.resize(n + 3);
+      parts = heap.data();
+    }
+    if (partials_) std::copy(partials_->begin(), partials_->end(), parts);
+    if (!std::isnan(head_)) {
+      const double front[] = {spare_, carry_, head_};
+      for (double term : front) n = grow(parts, n, term);
+    }
+    if (n == 0) return 0.0;
+    double hi = parts[--n];
     double lo = 0.0;
     while (n > 0) {
       const double x = hi;
-      const double y = partials[--n];
+      const double y = parts[--n];
       hi = x + y;
       lo = y - (hi - x);
       if (lo != 0.0) break;
     }
-    if (n > 0 && ((lo < 0.0 && partials[n - 1] < 0.0) || (lo > 0.0 && partials[n - 1] > 0.0))) {
+    if (n > 0 && ((lo < 0.0 && parts[n - 1] < 0.0) || (lo > 0.0 && parts[n - 1] > 0.0))) {
       const double y = lo * 2.0;
       const double x = hi + y;
       if (y == x - hi) hi = x;
     }
     return hi;
   }
+
+  // The sum as doubles that total it exactly and depend on its value alone:
+  // the first is value(), and each next one is value() of what the ones
+  // before leave, until nothing is left. Each is at most 2^-53 of the one
+  // before, so there are at most 40. The three terms and the partials do not
+  // depend on the value alone: the same values in another order, or merged
+  // from other splits, can leave other doubles with the same total. A reader
+  // that rounds something it computes from each double, such as a product
+  // that underflows, reads these, and its result is then the same for every
+  // order and split.
+  std::vector<double> terms() const {
+    ExactSum rest = *this;
+    std::vector<double> all;
+    for (double top = rest.value(); top != 0.0; top = rest.value()) {
+      all.push_back(top);
+      // Taking the rounded sum away cannot fail, short of a sum that add()
+      // has refused, whose value is not finite.
+      if (!rest.add(-top)) break;
+    }
+    return all;
+  }
+
+ private:
+  // The head stays below this in magnitude: f64's top binade starts here.
+  static constexpr double kTopBinade = 0x1p1023;
+
+  struct Rounded {
+    double sum;   // a + b, rounded
+    double lost;  // a + b - sum, exactly
+  };
+
+  // Knuth's TwoSum (The Art of Computer Programming, volume 2, section
+  // 4.2.2), six operations with no branch: `sum - a` is the part of the
+  // rounded sum that came from b, `sum` minus that the part that came from
+  // a, and what a and b each have beyond their part is what was lost.
+  static Rounded two_sum(double a, double b) {
+    const double sum = a + b;
+    const double from_b = sum - a;
+    return {sum, (a - (sum - from_b)) + (b - from_b)};
+  }
+
+  // One value into a sum. `head`, `carry` and `spare` are the sum's own
+  // terms, or an Adder's copies of them; s, c and t are their sums with what
+  // comes down to each, and e1, e2 and e3 what each of those rounds away.
+  static bool add_to(ExactSum& sum, double& head, double& carry, double& spare, double x) {
+    const auto [s, e1] = two_sum(head, x);
+    const auto [c, e2] = two_sum(carry, e1);
+    const auto [t, e3] = two_sum(spare, e2);
+    if (e3 != 0.0 || !(std::fabs(s) < kTopBinade)) [[unlikely]] {
+      if (!sum.add_slowly(x, s, c, t, e3, head, carry, spare)) return false;
+      head = sum.head_;
+      carry = sum.carry_;
+      spare = sum.spare_;
+      return true;
+    }
+    head = s;
+    carry = c;
+    spare = t;
+    return true;
+  }
+
+  // The value that failed add_to's test: x, the three sums s, c and t it
+  // gave, what the third dropped, and the terms it was added to, which are
+  // passed by value because an Adder holds them outside the sum. Out of line
+  // and cold, so that a loop of adds carries only the additions.
+  [[gnu::noinline, gnu::cold]] bool add_slowly(double x, double s, double c, double t, double e3, double head,
+                                               double carry, double spare) {
+    // Only the third addition dropped something.
+    if (std::fabs(s) < kTopBinade) {
+      head_ = s;
+      carry_ = c;
+      spare_ = t;
+      return join(e3);
+    }
+    // The first value to take the head to the top binade or past it: the
+    // terms before it move to the partials, and so does every value from it.
+    if (!std::isnan(head)) {
+      head_ = std::numeric_limits<double>::quiet_NaN();
+      carry_ = spare_ = 0.0;
+      const double before[] = {spare, carry, head};
+      for (double term : before) {
+        if (!join(term)) return false;
+      }
+    }
+    return join(x);
+  }
+
+  // Dekker's Fast2Sum, the step of math.fsum: the same pair in three
+  // operations, exact once the larger of the two comes first.
+  static Rounded fast_two_sum(double a, double b) {
+    if (std::fabs(a) < std::fabs(b)) std::swap(a, b);
+    const double sum = a + b;
+    return {sum, b - (sum - a)};
+  }
+
+  // Shewchuk's step: x joins `size` non-overlapping partials by increasing
+  // magnitude, which stay so, and the new count comes back. `parts` has room
+  // for one more. Each partial and x make a rounded sum, which moves on as
+  // x, and what the rounding dropped, which stays as a partial unless it is
+  // zero.
+  //
+  // Up to seven partials are tested for that zero as they go. In a longer
+  // walk over the partials of a column the zeros fall where the processor
+  // cannot predict, and a wrong guess costs more than a partial's
+  // arithmetic: eight partials or more are walked with no test, each dropped
+  // part stored in its partial's place, and the zeros are closed up in a
+  // second pass. A StandardScaler fit of 1,000,000 float64 values spread
+  // over 160 binades takes 57 ms that way and 74 ms with the test in every
+  // walk. The second pass is the dearer of the two where the test is
+  // predictable: for walks of one or two partials (values spread over 40
+  // binades take 20.0 ms with two passes for every walk, in place of 17.5),
+  // and for a Normalizer row of 16 values spread over 600 binades, whose
+  // partials never drop a zero (200,000 rows take 90 ms, in place of 82).
+  // One thread, Apple M4.
+  static constexpr std::size_t kLongWalk = 8;
+
+  static std::size_t grow(double* parts, std::size_t size, double x) {
+    std::size_t kept = 0;
+    if (size < kLongWalk) {
+      for (std::size_t i = 0; i < size; ++i) {
+        const auto [sum, lost] = fast_two_sum(x, parts[i]);
+        if (lost != 0.0) parts[kept++] = lost;
+        x = sum;
+      }
+      if (x != 0.0) parts[kept++] = x;
+      return kept;
+    }
+    for (std::size_t i = 0; i < size; ++i) {
+      const auto [sum, lost] = fast_two_sum(x, parts[i]);
+      parts[i] = lost;
+      x = sum;
+    }
+    parts[size] = x;
+    for (std::size_t i = 0; i <= size; ++i) {
+      const double part = parts[i];
+      parts[kept] = part;
+      kept += part != 0.0 ? 1 : 0;
+    }
+    return kept;
+  }
+
+  // The same step on the partials themselves. False when the largest partial
+  // is not finite: the sum left f64's range, or x was a NaN or an infinity.
+  // That partial is then dropped: a caller that goes on adding to a refused
+  // sum, as k-means does, would leave one more with every value, for each
+  // later value to walk.
+  bool join(double x) {
+    if (!partials_) partials_ = std::make_unique<std::vector<double>>();
+    std::vector<double>& parts = *partials_;
+    parts.push_back(0.0);
+    const std::size_t kept = grow(parts.data(), parts.size() - 1, x);
+    parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(kept), parts.end());
+    if (parts.empty() || std::isfinite(parts.back())) return true;
+    parts.pop_back();
+    return false;
+  }
+
+  // Behind a pointer and absent until a value needs them, which almost none
+  // does: a sum is then 32 bytes. Held inline they make it 48, and an
+  // accumulator such as target_encode's 80 bytes instead of 64, which its
+  // loop indexes with a multiply instead of a shift: a fit of 1,000,000 rows
+  // on an integer target then takes 6.8 ms instead of 6.6 (Apple M4).
+  std::unique_ptr<std::vector<double>> partials_;
+  double head_ = 0.0;  // NaN once the partials alone hold the sum
+  double carry_ = 0.0;
+  double spare_ = 0.0;
+};
+
+// One sum's three terms in locals for the length of a loop. add() on the sum
+// itself loads and stores them every time, because its rare path is a call
+// that can change them; an Adder's copies stay in registers. A StandardScaler
+// fit of 1,000,000 normal float64 values takes 6.5 ms through Adders and
+// 9.4 ms through add() (one thread, Apple M4). The destructor and move_to()
+// write the terms back, so a sum is stale while an Adder is on it: read it
+// and add to it again only afterwards.
+class ExactSum::Adder {
+ public:
+  explicit Adder(ExactSum& sum) : sum_(&sum), head_(sum.head_), carry_(sum.carry_), spare_(sum.spare_) {}
+  Adder(const Adder&) = delete;
+  Adder& operator=(const Adder&) = delete;
+  ~Adder() { write_back(); }
+
+  // Leaves the sum it is on, its terms written back, for another one.
+  void move_to(ExactSum& sum) {
+    write_back();
+    sum_ = &sum;
+    head_ = sum.head_;
+    carry_ = sum.carry_;
+    spare_ = sum.spare_;
+  }
+
+  [[nodiscard]] bool add(double x) { return add_to(*sum_, head_, carry_, spare_, x); }
+
+  // The same sum as add(), for a value that is likely short, such as an
+  // integer: an addition to the head that drops nothing leaves the carry and
+  // the spare as they are, and one TwoSum is the whole add. Any other value
+  // takes add(), having paid for that TwoSum twice.
+  [[nodiscard]] bool add_short(double x) {
+    const auto [s, lost] = two_sum(head_, x);
+    if (lost == 0.0 && std::fabs(s) < kTopBinade) {
+      head_ = s;
+      return true;
+    }
+    return add(x);
+  }
+
+ private:
+  void write_back() {
+    sum_->head_ = head_;
+    sum_->carry_ = carry_;
+    sum_->spare_ = spare_;
+  }
+
+  ExactSum* sum_;
+  double head_;
+  double carry_;
+  double spare_;
 };
 
 // The exact product of two doubles, folded into an exact sum: the rounded

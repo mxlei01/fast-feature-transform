@@ -4,9 +4,14 @@
 
 #include <arrow/array.h>
 
+#include <algorithm>
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <cstddef>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "fastfeaturetransform/kernel.hpp"
 #include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
@@ -131,6 +136,59 @@ TEST_CASE("a shrinkage encoder merges worker states in either order and both pat
   }
   REQUIRE_THROWS_WITH(kernel->transform_row({{"c", int64_t{1}}}), ContainsSubstring("must be a string or null"));
   REQUIRE_THROWS_WITH(kernel->transform_row({{"n", int64_t{1}}}), ContainsSubstring("missing from record"));
+}
+
+TEST_CASE("james_stein_encode fits targets near 1e-155 alike however the workers split them") {
+  // REGRESSION: a category's variance multiplies the terms of its exact
+  // sums, which depend on the sums' values alone. It used to multiply the
+  // partials, which two workers can leave split differently than one, and
+  // near 1e-155 the products of two partials underflow and round: with the
+  // first targets the value of k0 differed in its last bit between one
+  // worker and several. The second targets do the same to a reader of the
+  // doubles the sums hold now.
+  struct Sample {
+    std::vector<double> targets;
+    std::vector<std::optional<std::string>> keys;
+  };
+  const std::vector<Sample> samples{
+      {{0x1.0759c9adb04ddp-515, 0x1.4b8e24878adebp-514, -0x1.64223bf27ff24p-514, 0x1.45f8a613e17f4p-513,
+        0x1.3f589a1be05f3p-511, 0x1.a492359d2f346p-514, 0x1.fb94454ba0f16p-513, 0x1.8d30c99cac762p-512,
+        0x1.f2aef4affa37cp-516, -0x1.2519373039992p-512, -0x1.380021070d57fp-514, 0x1.a3822ae3cedd7p-512},
+       {"k0", "k4", "k0", "k1", "k1", "k2", "k0", "k0", "k4", "k3", "k4", "k0"}},
+      {{0x1.2982d5355ea91p-517, -0x1.68a85a28a9d15p-515, 0x1.47e7a4707229bp-513, 0x1.6133e9e68afc8p-515,
+        0x1.4024db6f22feep-516, -0x1.7954e5f6aa07ap-514, -0x1.d1deb4bb08c46p-517, -0x1.209f7b7872f71p-513,
+        0x1.d414906000bf9p-516, 0x1.013937f0c2050p-514, -0x1.ded07c84fb602p-515, -0x1.31c8e5aa803a6p-515},
+       {"k0", "k2", "k3", "k4", "k4", "k0", "k2", "k1", "k3", "k0", "k3", "k3"}}};
+  const nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+  for (const Sample& sample : samples) {
+    const std::size_t count = sample.targets.size();
+    const auto rows = [&](std::size_t from, std::size_t to) {
+      const auto first = static_cast<std::ptrdiff_t>(from);
+      const auto last = static_cast<std::ptrdiff_t>(to);
+      const std::vector<std::optional<std::string>> keys(sample.keys.begin() + first, sample.keys.begin() + last);
+      const std::vector<double> targets(sample.targets.begin() + first, sample.targets.begin() + last);
+      return make_batch({"c", "y"}, {utf8_column(keys), f64_column(targets)});
+    };
+    const std::string whole = fit_kernel("james_stein_encode", params, kSchema, {rows(0, count)})->state().dump();
+    // Workers of two, three, four and six rows each, in file order and
+    // reversed.
+    for (const std::size_t size : {std::size_t{2}, std::size_t{3}, std::size_t{4}, std::size_t{6}}) {
+      CAPTURE(sample.targets.front(), size);
+      std::vector<fft::Batch> batches;
+      for (std::size_t first = 0; first < count; first += size) batches.push_back(rows(first, first + size));
+      REQUIRE(fit_kernel("james_stein_encode", params, kSchema, batches)->state().dump() == whole);
+      std::reverse(batches.begin(), batches.end());
+      REQUIRE(fit_kernel("james_stein_encode", params, kSchema, batches)->state().dump() == whole);
+    }
+    // Two workers, cut at every row, in both orders.
+    for (std::size_t cut = 1; cut < count; ++cut) {
+      CAPTURE(sample.targets.front(), cut);
+      const std::vector<fft::Batch> forward{rows(0, cut), rows(cut, count)};
+      const std::vector<fft::Batch> backward{rows(cut, count), rows(0, cut)};
+      REQUIRE(fit_kernel("james_stein_encode", params, kSchema, forward)->state().dump() == whole);
+      REQUIRE(fit_kernel("james_stein_encode", params, kSchema, backward)->state().dump() == whole);
+    }
+  }
 }
 
 TEST_CASE("each shrinkage model shrinks a category toward the prior") {

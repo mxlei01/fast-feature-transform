@@ -52,11 +52,8 @@ double handle_zeros(double divisor) { return divisor < kNearConstant ? 1.0 : div
 // exact remainder puts it back.
 double divided(const ExactSum& sum, double count, const std::string& what) {
   const double quotient = sum.value() / count;
-  ExactSum remainder;
-  bool held = true;
-  for (double partial : sum.partials) held = held && remainder.add(partial);
-  held = held && add_product(remainder, -quotient, count);
-  if (!held) throw Error(what + " leaves the range of f64");
+  ExactSum remainder = sum;
+  if (!add_product(remainder, -quotient, count)) throw Error(what + " leaves the range of f64");
   return quotient + remainder.value() / count;
 }
 
@@ -325,26 +322,46 @@ class StandardScale final : public Kernel {
         std::array<double, width> numbers;
         std::array<double, width> products;
         std::array<double, width> residuals;
+        ExactSum::Adder sum(accumulator.sum);
+        ExactSum::Adder squares(accumulator.squares);
+        const auto refuse = [&] { throw Error(stage + ": column '" + name + "' sums past the range of f64"); };
         for (int64_t first = 0; first < array.length(); first += width) {
           const int64_t count = std::min(width, array.length() - first);
+          bool inexact = false;
           for (int64_t i = 0; i < count; ++i) {
             const auto slot = static_cast<std::size_t>(i);
             numbers[slot] = static_cast<double>(input[first + i]);
             products[slot] = numbers[slot] * numbers[slot];
             residuals[slot] = std::fma(numbers[slot], numbers[slot], -products[slot]);
+            inexact |= residuals[slot] != 0.0;
           }
-          // Validation and all three accumulator updates run in row order and
-          // stop at the first failure, as in the general path below.
-          for (int64_t i = 0; i < count; ++i) {
-            const auto slot = static_cast<std::size_t>(i);
-            const double number = finite_number(numbers[slot], stage, name);
-            if (!accumulator.sum.add(number) || !accumulator.squares.add(products[slot]) ||
-                !accumulator.squares.add(residuals[slot])) {
-              throw Error(stage + ": column '" + name + "' sums past the range of f64");
+          // Validation and the accumulator updates run in row order and stop
+          // at the first failure, as in the general path below. A block whose
+          // squares are all exact, as those of float32 values and of integers
+          // up to 2^26 are, has no residual to add and takes the short add:
+          // its sums mostly stay within their heads. The choice is made once
+          // per block because a test per value between the adds costs more
+          // than it saves: the short add for every value takes a fit of
+          // 1,000,000 normal float64 values from 6.5 to 6.9 ms (one thread,
+          // Apple M4).
+          if (inexact) {
+            for (int64_t i = 0; i < count; ++i) {
+              const auto slot = static_cast<std::size_t>(i);
+              const double number = finite_number(numbers[slot], stage, name);
+              if (!sum.add(number) || !squares.add(products[slot]) || !squares.add(residuals[slot])) refuse();
+              ++accumulator.count;
+              accumulator.low = std::min(accumulator.low, number);
+              accumulator.high = std::max(accumulator.high, number);
             }
-            ++accumulator.count;
-            accumulator.low = std::min(accumulator.low, number);
-            accumulator.high = std::max(accumulator.high, number);
+          } else {
+            for (int64_t i = 0; i < count; ++i) {
+              const auto slot = static_cast<std::size_t>(i);
+              const double number = finite_number(numbers[slot], stage, name);
+              if (!sum.add_short(number) || !squares.add_short(products[slot])) refuse();
+              ++accumulator.count;
+              accumulator.low = std::min(accumulator.low, number);
+              accumulator.high = std::max(accumulator.high, number);
+            }
           }
         }
       };
@@ -505,12 +522,18 @@ class StandardScale final : public Kernel {
   // until the division. It is the exact Sum (x - mean)^2, which is
   // both order-independent and free of the catastrophic cancellation a
   // Sum x^2 - n*mean^2 would suffer on a column of large, close values.
+  //
+  // REGRESSION: mean * Sum x is formed from the sum's terms(), which depend
+  // on its value alone. It used to be formed from the partials, which two
+  // workers can leave split differently than one. Near 1e-155 the products
+  // underflow and round, so the fitted variance depended on the thread
+  // count by a subnormal step.
   static double population_variance(const Accumulator& accumulator, double mean, double rows,
                                     const std::string& where) {
-    ExactSum residual;
+    ExactSum residual = accumulator.squares;
+    const std::vector<double> terms = accumulator.sum.terms();
     bool held = true;
-    for (double partial : accumulator.squares.partials) held = held && residual.add(partial);
-    for (double partial : accumulator.sum.partials) held = held && add_product(residual, -2.0 * mean, partial);
+    for (double term : terms) held = held && add_product(residual, -2.0 * mean, term);
     const double square = mean * mean;
     held = held && add_product(residual, rows, square) && add_product(residual, rows, std::fma(mean, mean, -square));
     if (!held) throw Error(where + ": the variance leaves the range of f64");
@@ -1147,11 +1170,15 @@ class Normalize final : public Kernel {
       if (!std::isfinite(sum)) throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
       return handle_zeros(norm_ == Norm::L1 ? sum : std::sqrt(sum));
     }
-    total.partials.clear();
+    total.clear();
     bool held = true;
-    for (std::size_t index = 0; index < count; ++index) {
-      const double value = at(index);
-      held = held && total.add(norm_ == Norm::L1 ? std::fabs(value) : value * value);
+    {
+      // The Adder is gone, and its terms written back, before the sum is read.
+      ExactSum::Adder adder(total);
+      for (std::size_t index = 0; index < count; ++index) {
+        const double value = at(index);
+        held = held && adder.add(norm_ == Norm::L1 ? std::fabs(value) : value * value);
+      }
     }
     if (!held) throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
     return handle_zeros(norm_ == Norm::L1 ? total.value() : std::sqrt(total.value()));

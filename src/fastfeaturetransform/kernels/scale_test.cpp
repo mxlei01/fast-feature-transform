@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <string_view>
 #include <type_traits>
@@ -355,6 +356,28 @@ TEST_CASE("standard_scale answers a constant column with zeros, not NaN") {
                            {make_batch({"a"}, {doubles({0.0, 9e-162})})});
   REQUIRE(spread->state().at("variances").at("a") == std::ldexp(4.0, -1074));
   REQUIRE(spread->state().at("scales").at("a") == 4.445517498970155e-162);
+}
+
+TEST_CASE("standard_scale fits values near 1e-155 alike however the workers split them") {
+  // REGRESSION: the variance multiplies the terms of the exact sum, which
+  // depend on the sum's value alone. It used to multiply the partials, which
+  // two workers can leave split differently than one, and near 1e-155 those
+  // products underflow and round: these eight values fitted a variance one
+  // subnormal step larger for five of the seven ways to cut them in two.
+  const Doubles values{-0x1.f6ce40edf5c76p-515, 0x1.73575e9aed87fp-513, 0x1.e72ae1a4c72c6p-514, 0x1.a123fefa800d6p-513,
+                       0x1.bf71b1e54a35fp-513,  0x1.49aafe6faea33p-512, 0x1.275f886390578p-514, 0x1.042bc2ea82348p-511};
+  const fft::Schema schema{{{"a", "f64"}}};
+  const nlohmann::json params{{"columns", {"a"}}};
+  const auto whole = fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(values)})});
+  REQUIRE(whole->state().at("variances").at("a").get<double>() == 0x0.19ce25531acb2p-1022);
+  for (std::size_t cut = 1; cut < values.size(); ++cut) {
+    CAPTURE(cut);
+    const auto at = values.begin() + static_cast<std::ptrdiff_t>(cut);
+    const fft::Batch head = make_batch({"a"}, {doubles(Doubles(values.begin(), at))});
+    const fft::Batch tail = make_batch({"a"}, {doubles(Doubles(at, values.end()))});
+    REQUIRE(fit_scaler("standard_scale", params, schema, {head, tail})->state().dump() == whole->state().dump());
+    REQUIRE(fit_scaler("standard_scale", params, schema, {tail, head})->state().dump() == whole->state().dump());
+  }
 }
 
 TEST_CASE("standard_scale leaves out the centring or the division on request") {

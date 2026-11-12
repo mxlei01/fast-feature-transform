@@ -180,6 +180,7 @@ if(FFT_BUILD_TESTS)
     src/fastfeaturetransform/kernels/count_test.cpp
     src/fastfeaturetransform/kernels/ordinal_test.cpp
     src/fastfeaturetransform/kernels/output_test.cpp
+    src/fastfeaturetransform/kernels/util_test.cpp
     src/fastfeaturetransform/kernels/basen_test.cpp
     src/fastfeaturetransform/kernels/contrast_test.cpp
     src/fastfeaturetransform/kernels/hash_test.cpp
