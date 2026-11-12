@@ -1,7 +1,8 @@
 // Explicit C++ tests for Parquet I/O: content sniffing, the write_part ->
 // ParquetSource round trip, projection, empty row groups, list shapes,
-// timestamps, dictionary indices, cross-file schema validation, PartWriter
-// (its write buffer and dictionary page limit included), and MemmapSink.
+// timestamps, dictionary indices, the dictionary entries a batch keeps,
+// cross-file schema validation, PartWriter (its write buffer and dictionary
+// page limit included), and MemmapSink.
 
 #include "fastfeaturetransform/io.hpp"
 
@@ -13,6 +14,7 @@
 #include <arrow/memory_pool.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
+#include <arrow/type_traits.h>
 #include <arrow/util/decimal.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/column_page.h>
@@ -712,6 +714,464 @@ TEST_CASE("dictionary indices outside their dictionary are refused in both readi
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(task, 8, [&](fft::Batch) { ++batches; }), ContainsSubstring(message));
     REQUIRE(batches == 2);  // rows 0 to 15 are whole, row 16 is not
+  }
+}
+
+namespace {
+
+using Words = std::vector<std::optional<std::string>>;
+
+// One column as batch_from_arrow hands it to the engine.
+std::shared_ptr<arrow::Array> from_batch(const std::shared_ptr<arrow::Array>& column) {
+  const auto batch =
+      arrow::RecordBatch::Make(arrow::schema({arrow::field("c", column->type())}), column->length(), {column});
+  return fft::batch_from_arrow(*batch).cols[0];
+}
+
+// The strings or bytes of an array, a null as nullopt.
+Words binary_values(const arrow::Array& array) {
+  Words out;
+  for (int64_t i = 0; i < array.length(); ++i) {
+    if (array.IsNull(i)) {
+      out.emplace_back();
+    } else if (arrow::is_large_binary_like(array.type_id())) {
+      out.emplace_back(static_cast<const arrow::LargeBinaryArray&>(array).GetString(i));
+    } else {
+      out.emplace_back(static_cast<const arrow::BinaryArray&>(array).GetString(i));
+    }
+  }
+  return out;
+}
+
+Words entries_of(const arrow::Array& column) {
+  return binary_values(*static_cast<const arrow::DictionaryArray&>(column).dictionary());
+}
+
+// The type of a dictionary column's entries, as the array of entries names it.
+std::string entries_type(const arrow::Array& column) {
+  return static_cast<const arrow::DictionaryArray&>(column).dictionary()->type()->ToString();
+}
+
+// What each row of a dictionary column of strings or bytes holds: nullopt for
+// a null row, and for a row whose entry is null.
+Words row_values(const arrow::Array& column) {
+  const auto& dictionary = static_cast<const arrow::DictionaryArray&>(column);
+  const Words entries = entries_of(column);
+  Words out;
+  for (int64_t row = 0; row < column.length(); ++row) {
+    out.push_back(column.IsNull(row) ? std::nullopt
+                                     : entries.at(static_cast<std::size_t>(dictionary.GetValueIndex(row))));
+  }
+  return out;
+}
+
+// The int32 index stored in every slot of a dictionary column, null slots
+// included.
+std::vector<int32_t> stored_indices(const arrow::Array& column) {
+  const arrow::ArrayData& data = *static_cast<const arrow::DictionaryArray&>(column).indices()->data();
+  REQUIRE(data.type->id() == arrow::Type::INT32);
+  const int32_t* values = data.GetValues<int32_t>(1);
+  return {values, values + data.length};
+}
+
+// A dictionary column of `entries`, with a row per index and a null row per
+// nullopt, checked by Arrow.
+template <typename IndexType = arrow::Int32Type>
+std::shared_ptr<arrow::Array> dictionary_column(const std::shared_ptr<arrow::Array>& entries,
+                                                const std::vector<std::optional<typename IndexType::c_type>>& rows) {
+  auto column = arrow::DictionaryArray::FromArrays(numeric_column<IndexType>(rows), entries);
+  REQUIRE(column.ok());
+  REQUIRE((*column)->ValidateFull().ok());
+  return *column;
+}
+
+// One row group of one string column "c", written by Arrow with eight values
+// to a write batch. `limit` is the dictionary page limit in bytes, which the
+// writer checks after each write batch; 0 writes no dictionary at all.
+std::string string_file(const TempDir& dir, const std::string& name, const Words& rows, int64_t limit) {
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("c", arrow::utf8())}), {utf8_column(rows)});
+  const std::string path = (dir.path / (name + ".parquet")).string();
+  auto output = arrow::io::FileOutputStream::Open(path);
+  REQUIRE(output.ok());
+  parquet::WriterProperties::Builder properties;
+  properties.write_batch_size(8);
+  if (limit == 0) {
+    properties.disable_dictionary();
+  } else {
+    properties.dictionary_pagesize_limit(limit);
+  }
+  REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *output, 1024, properties.build()).ok());
+  REQUIRE((*output)->Close().ok());
+  return path;
+}
+
+}  // namespace
+
+TEST_CASE("a dictionary with more entries than rows that hold a value keeps the entries in use, in order of use") {
+  const auto letters = utf8_column({"a", "b", "c", "d", "e", "f"});
+
+  // Rows use the entries 4, 1 and 5 of six: the entries come out in the order
+  // the rows first use them, and a repeated one once.
+  const auto column = dictionary_column(letters, {4, 1, 4, 5});
+  const auto trimmed = from_batch(column);
+  REQUIRE(trimmed->type()->Equals(*column->type()));
+  REQUIRE(entries_type(*trimmed) == "string");
+  REQUIRE(trimmed->ValidateFull().ok());
+  REQUIRE(entries_of(*trimmed) == Words{"e", "b", "f"});
+  REQUIRE(stored_indices(*trimmed) == std::vector<int32_t>{0, 1, 0, 2});
+  REQUIRE(row_values(*trimmed) == Words{"e", "b", "e", "f"});
+
+  // One entry more than rows is enough, and the entries need not be next to
+  // each other in the dictionary.
+  const auto barely = from_batch(dictionary_column(letters, {5, 0, 5, 3, 0}));
+  REQUIRE(entries_of(*barely) == Words{"f", "a", "d"});
+  REQUIRE(row_values(*barely) == Words{"f", "a", "f", "d", "a"});
+
+  // A null row's index is not a value. Here each null slot holds the largest
+  // int32, far outside the dictionary: it is not followed, the row stays
+  // null, and its slot is written as 0.
+  const auto garbage = *arrow::DictionaryArray::FromArrays(
+      arrow::dictionary(arrow::int32(), arrow::utf8()),
+      fft::testing::indices_with_garbage<arrow::Int32Type>({2, std::nullopt, 0, std::nullopt, 2}), letters);
+  const auto with_nulls = from_batch(garbage);
+  REQUIRE(with_nulls->ValidateFull().ok());
+  REQUIRE(with_nulls->null_count() == 2);
+  REQUIRE(entries_of(*with_nulls) == Words{"c", "a"});
+  REQUIRE(stored_indices(*with_nulls) == std::vector<int32_t>{0, 0, 1, 0, 0});
+  REQUIRE(row_values(*with_nulls) == Words{"c", std::nullopt, "a", std::nullopt, "c"});
+
+  // Null rows hold no value, so they do not count: of seven rows five hold
+  // one, fewer than the six entries.
+  const auto sparse = from_batch(dictionary_column(letters, {5, std::nullopt, 4, 3, std::nullopt, 2, 1}));
+  REQUIRE(sparse->ValidateFull().ok());
+  REQUIRE(entries_of(*sparse) == Words{"f", "e", "d", "c", "b"});
+  REQUIRE(row_values(*sparse) == Words{"f", std::nullopt, "e", "d", std::nullopt, "c", "b"});
+
+  // A batch of nulls uses no entry and keeps none, however many rows it has.
+  for (const std::size_t rows : {std::size_t{3}, std::size_t{6}, std::size_t{9}}) {
+    CAPTURE(rows);
+    const auto all_null = from_batch(dictionary_column(letters, std::vector<std::optional<int32_t>>(rows)));
+    REQUIRE(all_null->ValidateFull().ok());
+    REQUIRE(all_null->type()->Equals(*column->type()));
+    REQUIRE(all_null->null_count() == static_cast<int64_t>(rows));
+    REQUIRE(entries_of(*all_null).empty());
+    REQUIRE(stored_indices(*all_null) == std::vector<int32_t>(rows, 0));
+    REQUIRE(row_values(*all_null) == Words(rows));
+  }
+
+  // A batch without rows keeps none either.
+  const auto no_rows = from_batch(dictionary_column(letters, {}));
+  REQUIRE(no_rows->ValidateFull().ok());
+  REQUIRE(no_rows->type()->Equals(*column->type()));
+  REQUIRE(no_rows->length() == 0);
+  REQUIRE(entries_of(*no_rows).empty());
+}
+
+TEST_CASE("every dictionary column of a batch keeps the entries its own rows use") {
+  const auto letters = utf8_column({"a", "b", "c", "d", "e", "f"});
+
+  // The first and the third column are dictionaries over the same six
+  // entries and use different ones; the second holds numbers and passes as
+  // the array it is.
+  const auto first = dictionary_column(letters, {4, 1, 4, 5});
+  const auto numbers = numeric_column<arrow::Int64Type>({7, 8, 9, 10});
+  const auto third = dictionary_column(letters, {3, 3, 0, 2});
+  const auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("first", first->type()), arrow::field("numbers", numbers->type()),
+                     arrow::field("third", third->type())}),
+      4, {first, numbers, third});
+  const fft::Batch cut = fft::batch_from_arrow(*batch);
+  REQUIRE(cut.rows == 4);
+  REQUIRE(cut.names == std::vector<std::string>{"first", "numbers", "third"});
+  REQUIRE(entries_of(*cut.cols[0]) == Words{"e", "b", "f"});
+  REQUIRE(row_values(*cut.cols[0]) == Words{"e", "b", "e", "f"});
+  REQUIRE(cut.cols[1] == numbers);
+  REQUIRE(entries_of(*cut.cols[2]) == Words{"d", "a", "c"});
+  REQUIRE(row_values(*cut.cols[2]) == Words{"d", "d", "a", "c"});
+}
+
+TEST_CASE("a trimmed dictionary column keeps its values through slices, wide offsets, bytes and null entries") {
+  const auto letters = utf8_column({"a", "b", "c", "d", "e", "f"});
+
+  // A slice of rows: its first row is the third of the buffers. The two rows
+  // before it use an entry ("f") that the slice does not, and the null among
+  // them is not the slice's null.
+  const auto sliced = dictionary_column(letters, {5, std::nullopt, 0, 2, std::nullopt, 1, 3})->Slice(2, 4);
+  REQUIRE(sliced->offset() == 2);
+  const auto from_slice = from_batch(sliced);
+  REQUIRE(from_slice->ValidateFull().ok());
+  REQUIRE(from_slice->offset() == 0);
+  REQUIRE(from_slice->null_count() == 1);
+  REQUIRE(entries_of(*from_slice) == Words{"a", "c", "b"});
+  REQUIRE(stored_indices(*from_slice) == std::vector<int32_t>{0, 1, 0, 2});
+  REQUIRE(row_values(*from_slice) == Words{"a", "c", std::nullopt, "b"});
+
+  // A slice of entries: the dictionary starts at the third entry of its
+  // buffers, so index 0 is "c".
+  const auto late = dictionary_column(letters->Slice(2), {3, 0, 3});
+  REQUIRE(entries_of(*from_batch(late)) == Words{"f", "c"});
+  REQUIRE(row_values(*from_batch(late)) == Words{"f", "c", "f"});
+
+  // Strings with 64-bit offsets, and bytes with either width, keep their type.
+  const auto wide = dictionary_column(fft::testing::large_utf8_column({"a", "b", "c", "d"}), {3, 1});
+  REQUIRE(from_batch(wide)->type()->Equals(*arrow::dictionary(arrow::int32(), arrow::large_utf8())));
+  REQUIRE(entries_type(*from_batch(wide)) == "large_string");
+  REQUIRE(entries_of(*from_batch(wide)) == Words{"d", "b"});
+  REQUIRE(row_values(*from_batch(wide)) == Words{"d", "b"});
+  for (const bool large : {false, true}) {
+    CAPTURE(large);
+    const Words stored{"a", std::string("\0\xff", 2), "c"};
+    const auto type = large ? arrow::large_binary() : arrow::binary();
+    const auto text = large ? fft::testing::large_utf8_column(stored) : utf8_column(stored);
+    const auto bytes = dictionary_column(*text->View(type), {1, 1});
+    const auto trimmed_bytes = from_batch(bytes);
+    REQUIRE(trimmed_bytes->type()->Equals(*arrow::dictionary(arrow::int32(), type)));
+    REQUIRE(entries_type(*trimmed_bytes) == type->ToString());
+    REQUIRE(entries_of(*trimmed_bytes) == Words{std::string("\0\xff", 2)});
+    REQUIRE(row_values(*trimmed_bytes) == Words{std::string("\0\xff", 2), std::string("\0\xff", 2)});
+    // That one entry is a slice of the dictionary. The entries 2 and 1,
+    // first used in that order, are copied, and the copy is of bytes too.
+    const auto copied_bytes = from_batch(dictionary_column(*text->View(type), {2, 1}));
+    REQUIRE(copied_bytes->ValidateFull().ok());
+    REQUIRE(copied_bytes->type()->Equals(*arrow::dictionary(arrow::int32(), type)));
+    REQUIRE(entries_type(*copied_bytes) == type->ToString());
+    REQUIRE(entries_of(*copied_bytes) == Words{"c", std::string("\0\xff", 2)});
+    REQUIRE(row_values(*copied_bytes) == Words{"c", std::string("\0\xff", 2)});
+  }
+
+  // A null entry, which only an array made in memory holds, stays a null
+  // entry for the rows that use it; one that no row uses is dropped. The
+  // entries 2 and 1, first used in that order, are copied; the entries 1 and
+  // 2 are a slice of the dictionary.
+  const auto holes = utf8_column({"a", std::nullopt, "c", std::nullopt, "e"});
+  const auto copied = from_batch(dictionary_column(holes, {2, 1, 2}));
+  REQUIRE(copied->ValidateFull().ok());
+  REQUIRE(copied->null_count() == 0);  // the rows hold indices; their entry is the null
+  REQUIRE(entries_of(*copied) == Words{"c", std::nullopt});
+  REQUIRE(row_values(*copied) == Words{"c", std::nullopt, "c"});
+  const auto in_slice = from_batch(dictionary_column(holes, {1, 2, 1}));
+  REQUIRE(in_slice->ValidateFull().ok());
+  REQUIRE(in_slice->null_count() == 0);
+  REQUIRE(entries_of(*in_slice) == Words{std::nullopt, "c"});
+  REQUIRE(row_values(*in_slice) == Words{std::nullopt, "c", std::nullopt});
+
+  // An empty string is a value like any other.
+  const auto blanks = from_batch(dictionary_column(utf8_column({"a", "", "c", "", "e"}), {3, 0, 3}));
+  REQUIRE(entries_of(*blanks) == Words{"", "a"});
+  REQUIRE(row_values(*blanks) == Words{"", "a", ""});
+
+  // Two entries with equal text are two entries: rows are told apart by
+  // index, as the writer of the file numbered them.
+  const auto twins = from_batch(dictionary_column(utf8_column({"a", "a", "b", "c"}), {1, 0, 1}));
+  REQUIRE(entries_of(*twins) == Words{"a", "a"});
+  REQUIRE(stored_indices(*twins) == std::vector<int32_t>{0, 1, 0});
+}
+
+TEST_CASE("entries used as one run, in the dictionary's order, are kept as a slice of it and not copied") {
+  const auto letters = utf8_column({"a", "b", "c", "d", "e", "f"});
+  const auto shared = letters->data()->buffers[2];  // the bytes of the six entries
+  const auto bytes_of = [](const arrow::Array& column) {
+    return static_cast<const arrow::DictionaryArray&>(column).dictionary()->data()->buffers[2];
+  };
+
+  // The rows first use the entries 2, 3 and 4, in that order, with a repeat
+  // and a null between them.
+  const auto run = from_batch(dictionary_column(letters, {2, 3, 3, std::nullopt, 2, 4}));
+  REQUIRE(run->ValidateFull().ok());
+  REQUIRE(entries_of(*run) == Words{"c", "d", "e"});
+  REQUIRE(stored_indices(*run) == std::vector<int32_t>{0, 1, 1, 0, 0, 2});
+  REQUIRE(row_values(*run) == Words{"c", "d", "d", std::nullopt, "c", "e"});
+  REQUIRE(bytes_of(*run) == shared);
+
+  // The same entries first used in another order, and entries with a gap
+  // between them, are copied in the order of their first use.
+  const auto mixed = from_batch(dictionary_column(letters, {2, 4, 3}));
+  REQUIRE(entries_of(*mixed) == Words{"c", "e", "d"});
+  REQUIRE(row_values(*mixed) == Words{"c", "e", "d"});
+  REQUIRE(bytes_of(*mixed) != shared);
+  const auto gap = from_batch(dictionary_column(letters, {2, 3, 5}));
+  REQUIRE(entries_of(*gap) == Words{"c", "d", "f"});
+  REQUIRE(row_values(*gap) == Words{"c", "d", "f"});
+  REQUIRE(bytes_of(*gap) != shared);
+
+  // A run of a dictionary that is itself a slice is counted from that
+  // slice's first entry.
+  const auto late = from_batch(dictionary_column(letters->Slice(2), {1, 2}));
+  REQUIRE(late->ValidateFull().ok());
+  REQUIRE(entries_of(*late) == Words{"d", "e"});
+  REQUIRE(row_values(*late) == Words{"d", "e"});
+  REQUIRE(bytes_of(*late) == shared);
+}
+
+TEST_CASE("a dictionary with no more entries than values, or one the reader never gives, is left as it is") {
+  const auto letters = utf8_column({"a", "b", "c", "d", "e", "f"});
+  const auto unchanged = [](const std::shared_ptr<arrow::Array>& column) { return from_batch(column) == column; };
+
+  // As many entries as rows that hold a value, used or not, or fewer: the
+  // kernels' caches and the sink are sized for that.
+  REQUIRE(unchanged(dictionary_column(letters, {0, 1, 2, 3, 4, 5})));
+  REQUIRE(unchanged(dictionary_column(letters, {5, 5, 5, 5, 5, 5})));
+  REQUIRE(unchanged(dictionary_column(letters, {0, std::nullopt, 0, 0, 0, 0, 0})));
+  REQUIRE(unchanged(dictionary_column(letters->Slice(0, 0), {std::nullopt, std::nullopt})));
+  REQUIRE_FALSE(unchanged(dictionary_column(letters, {0, 1, 2, 3, 4})));
+  REQUIRE_FALSE(unchanged(dictionary_column(letters, {0, std::nullopt, 0, 0, 0, 0})));
+
+  // Indices of any type but int32, which only an array made in memory has.
+  REQUIRE(unchanged(dictionary_column<arrow::Int8Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::Int16Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::Int64Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::UInt8Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::UInt16Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::UInt32Type>(letters, {4, 1})));
+  REQUIRE(unchanged(dictionary_column<arrow::UInt64Type>(letters, {4, 1})));
+
+  // Entries that are neither strings nor bytes.
+  REQUIRE(unchanged(dictionary_column(numeric_column<arrow::Int64Type>({10, 11, 12, 13}), {3, 1})));
+
+  // A type that says the order of its entries has a meaning: numbering the
+  // entries by first use would change that order.
+  const auto ordered = *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::utf8(), true),
+                                                           numeric_column<arrow::Int32Type>({4, 1}), letters);
+  REQUIRE(unchanged(ordered));
+
+  // A row whose index lies outside the dictionary, past its end or before
+  // its start: no entry is read for it. Arrow's own check would refuse these
+  // columns, so they are made without it. The first is one past the end of
+  // three empty strings, where reading the entry would find the zeros that
+  // pad Arrow's buffers and not fail by itself.
+  const auto one_past =
+      std::make_shared<arrow::DictionaryArray>(arrow::dictionary(arrow::int32(), arrow::utf8()),
+                                               numeric_column<arrow::Int32Type>({0, 3}), utf8_column({"", "", ""}));
+  REQUIRE(unchanged(one_past));
+  for (const int32_t outside : {6, std::numeric_limits<int32_t>::max(), -1, std::numeric_limits<int32_t>::min()}) {
+    CAPTURE(outside);
+    const auto broken = std::make_shared<arrow::DictionaryArray>(
+        arrow::dictionary(arrow::int32(), arrow::utf8()), numeric_column<arrow::Int32Type>({2, outside}), letters);
+    REQUIRE(unchanged(broken));
+  }
+}
+
+TEST_CASE("random dictionary columns keep every row's value, and exactly the entries in use") {
+  // 400 columns from a fixed generator: up to 39 rows over up to 59 entries,
+  // nulls in none, some or all rows, rows and entries sliced or not. One
+  // column in four walks forward through its entries, a row repeating the
+  // entry before it or taking the next one, so the entries in use are a run.
+  uint64_t state = 20;
+  const auto draw = [&](uint64_t below) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (state >> 33) % below;
+  };
+  int trimmed_columns = 0;
+  int sliced = 0;  // of those, the ones whose entries are a slice of the column's dictionary
+  for (int round = 0; round < 400; ++round) {
+    CAPTURE(round);
+    const auto entry_offset = static_cast<int64_t>(draw(3));
+    const auto entry_count = static_cast<int64_t>(draw(60));
+    const auto row_offset = static_cast<int64_t>(draw(3));
+    const auto row_count = static_cast<int64_t>(draw(40));
+    const uint64_t null_share = draw(3);  // 0: none, 1: one row in four, 2: every row
+    const bool walk = draw(4) == 0;
+    auto next = static_cast<int32_t>(entry_count == 0 ? 0 : draw(static_cast<uint64_t>(entry_count)));
+    Words words;
+    for (int64_t entry = 0; entry < entry_offset + entry_count; ++entry) {
+      words.emplace_back("w" + std::to_string(entry) + std::string(static_cast<std::size_t>(draw(4)), 'x'));
+    }
+    std::vector<std::optional<int32_t>> indices;
+    for (int64_t row = 0; row < row_offset + row_count; ++row) {
+      const bool null = entry_count == 0 || null_share == 2 || (null_share == 1 && draw(4) == 0);
+      if (null) {
+        indices.emplace_back();
+      } else if (walk) {
+        indices.emplace_back(next);
+        if (next + 1 < entry_count && draw(2) == 0) ++next;
+      } else {
+        indices.emplace_back(static_cast<int32_t>(draw(static_cast<uint64_t>(entry_count))));
+      }
+    }
+    const auto column = dictionary_column(utf8_column(words)->Slice(entry_offset), indices)->Slice(row_offset);
+    const auto result = from_batch(column);
+    REQUIRE(result->ValidateFull().ok());
+    REQUIRE(result->length() == row_count);
+    REQUIRE(result->null_count() == column->null_count());
+    REQUIRE(entries_type(*result) == "string");
+    REQUIRE(row_values(*result) == row_values(*column));
+    if (entry_count <= row_count - column->null_count()) {
+      REQUIRE(result == column);
+      continue;
+    }
+    ++trimmed_columns;
+    // The entries are the distinct indices of the valid rows, in row order.
+    std::vector<int32_t> used;
+    Words expected;
+    for (int64_t row = 0; row < row_count; ++row) {
+      const auto& index = indices[static_cast<std::size_t>(row_offset + row)];
+      if (!index || std::find(used.begin(), used.end(), *index) != used.end()) continue;
+      used.push_back(*index);
+      expected.push_back(words[static_cast<std::size_t>(entry_offset + *index)]);
+    }
+    REQUIRE(entries_of(*result) == expected);
+    const auto& kept = *static_cast<const arrow::DictionaryArray&>(*result).dictionary();
+    const auto& given = *static_cast<const arrow::DictionaryArray&>(*column).dictionary();
+    if (kept.data()->buffers[2] == given.data()->buffers[2]) ++sliced;
+  }
+  INFO("trimmed " << trimmed_columns << " columns, " << sliced << " of them to a slice");
+  REQUIRE(trimmed_columns > 100);
+  REQUIRE(sliced > 40);
+  REQUIRE(trimmed_columns - sliced > 100);
+}
+
+// REGRESSION: a batch carries only the dictionary entries its rows use. The
+// reader builds one dictionary for a column chunk of plain pages as it reads
+// it, and every batch used to arrive with all the entries of the batches
+// before it, which a sink then wrote again.
+TEST_CASE("each batch of a row group stored with plain pages carries the entries of its own rows") {
+  TempDir dir;
+  // 40 rows read 8 at a time. Most hold a value of their own; rows 17 and 33
+  // repeat row 3, so their batches use an entry that an earlier batch added,
+  // and rows 5 and 22 are null.
+  Words rows;
+  for (int row = 0; row < 40; ++row) rows.emplace_back("value-" + std::to_string(100 + row));
+  rows[17] = rows[33] = rows[3];
+  rows[5] = rows[22] = std::nullopt;
+
+  // Written without a dictionary, every page is plain. With a dictionary page
+  // limit of 64 bytes the writer gives its dictionary up after the first
+  // write batch of 8 values and stores the rest plain.
+  const std::string plain = string_file(dir, "plain", rows, 0);
+  const ChunkPages plain_pages = chunk_pages(plain, 0);
+  REQUIRE(plain_pages.dictionary_entries == 0);
+  REQUIRE(plain_pages.index_values == 0);
+  REQUIRE(plain_pages.plain_values == 40);
+  const std::string fallen_back = string_file(dir, "fallen_back", rows, 64);
+  const ChunkPages fallen_back_pages = chunk_pages(fallen_back, 0);
+  REQUIRE(fallen_back_pages.dictionary_entries > 0);
+  REQUIRE(fallen_back_pages.index_values > 0);
+  REQUIRE(fallen_back_pages.plain_values > 0);
+
+  for (const std::string& path : {plain, fallen_back}) {
+    CAPTURE(path);
+    auto source = fft::open_source({path});
+    // Read whole, the row group has one dictionary of its 36 distinct values.
+    const fft::Batch whole = source->read_task(source->plan_tasks()[0], nullptr);
+    REQUIRE(entries_of(*whole.cols[0]).size() == 36);
+    REQUIRE(row_values(*whole.cols[0]) == rows);
+
+    Words streamed;
+    std::size_t batches = 0;
+    source->readers(1, nullptr)[0]->read_batches(source->plan_tasks()[0], 8, [&](fft::Batch batch) {
+      CAPTURE(batches);
+      REQUIRE(batch.rows == 8);
+      const Words values = row_values(*batch.cols[0]);
+      Words distinct;
+      for (const auto& value : values) {
+        if (value && std::find(distinct.begin(), distinct.end(), value) == distinct.end()) distinct.push_back(value);
+      }
+      REQUIRE(entries_of(*batch.cols[0]) == distinct);
+      streamed.insert(streamed.end(), values.begin(), values.end());
+      ++batches;
+    });
+    REQUIRE(batches == 5);
+    REQUIRE(streamed == rows);
   }
 }
 

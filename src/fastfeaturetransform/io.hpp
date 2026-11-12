@@ -216,8 +216,10 @@ int sync_to_disk(int fd);
 void flush_to_disk(const std::string& path, bool directory);
 
 // Arrow schemas and record batches in the engine's terms: type tags with a
-// duplicate-name check, and timestamps as int64 epoch microseconds. The
-// Parquet reader uses both; PartWriter checks its schema with the first.
+// duplicate-name check, timestamps as int64 epoch microseconds, and each
+// dictionary of strings or bytes cut to the entries its rows use when it
+// holds more entries than the batch has rows with a value. The Parquet
+// reader uses both; PartWriter checks its schema with the first.
 Schema schema_from_arrow(const arrow::Schema& schema, const std::string& where);
 Batch batch_from_arrow(const arrow::RecordBatch& batch);
 
