@@ -286,3 +286,73 @@ def test_shrinkage_validates_its_arguments() -> None:
         "handle_unknown": "value",
         "handle_missing": "value",
     }
+
+
+@pytest.mark.parametrize(
+    ("targets", "devices"),
+    [
+        (
+            [
+                "0x1.0759c9adb04ddp-515",
+                "0x1.4b8e24878adebp-514",
+                "-0x1.64223bf27ff24p-514",
+                "0x1.45f8a613e17f4p-513",
+                "0x1.3f589a1be05f3p-511",
+                "0x1.a492359d2f346p-514",
+                "0x1.fb94454ba0f16p-513",
+                "0x1.8d30c99cac762p-512",
+                "0x1.f2aef4affa37cp-516",
+                "-0x1.2519373039992p-512",
+                "-0x1.380021070d57fp-514",
+                "0x1.a3822ae3cedd7p-512",
+            ],
+            ["k0", "k4", "k0", "k1", "k1", "k2", "k0", "k0", "k4", "k3", "k4", "k0"],
+        ),
+        (
+            [
+                "0x1.2982d5355ea91p-517",
+                "-0x1.68a85a28a9d15p-515",
+                "0x1.47e7a4707229bp-513",
+                "0x1.6133e9e68afc8p-515",
+                "0x1.4024db6f22feep-516",
+                "-0x1.7954e5f6aa07ap-514",
+                "-0x1.d1deb4bb08c46p-517",
+                "-0x1.209f7b7872f71p-513",
+                "0x1.d414906000bf9p-516",
+                "0x1.013937f0c2050p-514",
+                "-0x1.ded07c84fb602p-515",
+                "-0x1.31c8e5aa803a6p-515",
+            ],
+            ["k0", "k2", "k3", "k4", "k4", "k0", "k2", "k1", "k3", "k0", "k3", "k3"],
+        ),
+    ],
+    ids=["partials split by the merge", "terms split by the merge"],
+)
+def test_james_stein_fits_targets_near_1e_155_alike_for_every_split_and_thread_count(
+    tmp_path: Path, targets: list[str], devices: list[str]
+) -> None:
+    """Targets whose squares are subnormal fit one table, whatever the row groups and the thread count.
+
+    REGRESSION: a category's variance reads the terms of its exact sums, which
+    depend on the sums' values alone. It used to read the partials, which two
+    workers can leave split differently than one, and near 1e-155 the products
+    of two partials underflow and round: with the first targets the value of
+    category k0 differed in its last bit between one thread and two or four.
+    The second targets do the same to a reader of the doubles the sums hold now.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        targets: The target column, as hexadecimal floats.
+        devices: The category of each row.
+
+    """
+    table: pa.Table = pa.table({"device": devices, "clicks": [float.fromhex(text) for text in targets]})
+    states: set[str] = set()
+    for rows_per_group in (2, 4, 6, 12):
+        path: str = _write(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
+        for threads in (1, 2, 4):
+            for _ in range(3):  # which worker takes which row group varies from run to run
+                encoder: JamesSteinEncoder = JamesSteinEncoder(columns=["device"], target="clicks")
+                encoder.fit([path], threads=threads)
+                states.add(encoder._require_handle().stage_state("jamessteinencoder"))
+    assert len(states) == 1  # byte-identical, not merely close

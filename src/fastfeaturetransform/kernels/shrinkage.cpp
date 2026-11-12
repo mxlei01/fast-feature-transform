@@ -421,14 +421,22 @@ class Shrinkage : public Kernel {
   // before its one rounding. Rounding the sums first leaves two terms that
   // cancel: for a target near 1e9 with a spread of 1, n * sum(x^2) and sum(x)^2
   // agree in every digit a double keeps, and their difference is noise.
+  //
+  // REGRESSION: the products are formed from the sums' terms(), which depend
+  // on their values alone. They used to be formed from the partials, which
+  // two workers can leave split differently than one. Near 1e-155 the
+  // products underflow and round, so a category's value depended on the
+  // thread count in its last bits.
   double variance_of(const Acc& acc) const {
     if (acc.count < 2) return 0.0;
     const auto n = static_cast<double>(acc.count);
     ExactSum scaled;
     bool held = true;
-    for (double square : acc.square.partials) held = held && add_product(scaled, n, square);
-    for (double left : acc.sum.partials) {
-      for (double right : acc.sum.partials) held = held && add_product(scaled, -left, right);
+    const std::vector<double> squares = acc.square.terms();
+    const std::vector<double> sums = acc.sum.terms();
+    for (double square : squares) held = held && add_product(scaled, n, square);
+    for (double left : sums) {
+      for (double right : sums) held = held && add_product(scaled, -left, right);
     }
     if (!held) throw Error(overflow());
     return std::max(0.0, scaled.value() / (n * (n - 1)));

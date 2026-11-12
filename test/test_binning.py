@@ -404,6 +404,26 @@ def test_kmeans_reproduces_upstream_empty_cluster_relocation(tmp_path: Path) -> 
         assert binner.transform_dict({"price": value}) == row
 
 
+def test_kmeans_stops_at_the_first_pass_whose_centers_barely_move(tmp_path: Path) -> None:
+    """A kmeans fit stops once its centers move less than the tolerance, as scikit-learn 1.9.0 does.
+
+    On the cubes of 0 to 299 at ``n_bins=3`` that is the ninth Lloyd pass, three
+    before the labels stop changing, and the edges are that pass's. The squared
+    center shifts are summed afresh in every pass: a sum carried over from the
+    earlier passes never falls under the tolerance, and the fit then runs on to
+    other edges.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    source: str = _write(tmp_path / "cubes.parquet", pa.table({"price": [float(i**3) for i in range(300)]}))
+    binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=3, encode="ordinal", strategy="kmeans").fit(
+        [source]
+    )
+    assert binner.bin_edges_ == {"price": [0.0, 5868953.75, 15616841.25, 26730899.0]}
+
+
 def test_every_fitted_bin_table_loads_back(tmp_path: Path) -> None:
     """Round-trip every fitted bin table: fit -> state() -> save() -> load() holds for every column shape a fit accepts.
 

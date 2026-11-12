@@ -506,3 +506,89 @@ def test_standard_scaler_centres_on_the_exactly_rounded_mean(tmp_path: Path) -> 
     assert [row["price"] for row in rows] == [-2.0, 2.0, -2.0, -2.0, 2.0]
     for value, row in zip(values, rows, strict=True):
         assert scaler.transform_dict({"price": value}) == row
+
+
+def test_standard_scaler_fits_values_near_1e_155_alike_for_every_split_and_thread_count(tmp_path: Path) -> None:
+    """Values whose squares are subnormal fit one state, whatever the row groups and the thread count.
+
+    REGRESSION: the variance reads the terms of the exact sum, which depend on
+    the sum's value alone. It used to read the partials, which two workers can
+    leave split differently than one, and near 1e-155 the products with them
+    underflow and round: these eight values fitted a variance one subnormal
+    step larger with two or four threads than with one.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    values: list[float] = [
+        float.fromhex(text)
+        for text in (
+            "-0x1.f6ce40edf5c76p-515",
+            "0x1.73575e9aed87fp-513",
+            "0x1.e72ae1a4c72c6p-514",
+            "0x1.a123fefa800d6p-513",
+            "0x1.bf71b1e54a35fp-513",
+            "0x1.49aafe6faea33p-512",
+            "0x1.275f886390578p-514",
+            "0x1.042bc2ea82348p-511",
+        )
+    ]
+    table: pa.Table = pa.table({"x": values})
+    states: set[str] = set()
+    for rows_per_group in (1, 2, 4, 8):
+        path: str = _write(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
+        for threads in (1, 2, 4):
+            for _ in range(3):  # which worker takes which row group varies from run to run
+                scaler: StandardScaler = StandardScaler(columns=["x"]).fit([path], threads=threads)
+                states.add(scaler._require_handle().stage_state("standardscaler"))
+    assert len(states) == 1  # byte-identical, not merely close
+    assert json.loads(states.pop())["variances"] == {"x": float.fromhex("0x0.19ce25531acb2p-1022")}
+
+
+@pytest.mark.parametrize(
+    ("norm", "row"),
+    [
+        # The largest f64 and three values of half its last step: the sum is
+        # past the range, yet no single addition to the largest overflows.
+        ("l1", [1.7976931348623157e308, 2.0**969, 2.0**969, 2.0**969]),
+        ("l2", [math.nextafter(2.0**512, 0.0), 2.0**485, 2.0**485, 2.0**485]),
+    ],
+    ids=["l1", "l2"],
+)
+def test_normalizer_refuses_a_row_whose_norm_leaves_the_range_through_both_paths(
+    tmp_path: Path, norm: str, row: list[float]
+) -> None:
+    """A row whose exact norm is past f64's range is an error, never a row of NaN.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        norm: The norm to divide by.
+        row: One row whose norm leaves the range.
+
+    """
+    names: list[str] = ["a", "b", "c", "d"]
+    table: pa.Table = pa.table({name: [1.0, value] for name, value in zip(names, row, strict=True)})
+    path: str = _write(tmp_path / "top.parquet", table)
+    normalizer: Normalizer = Normalizer(columns=names, norm=norm).fit([path])
+    message: str = rf"a row's {norm} norm leaves the range of f64$"
+    with pytest.raises(EngineError, match=message):
+        normalizer.transform_dict(dict(zip(names, row, strict=True)))
+    with pytest.raises(EngineError, match=message):
+        normalizer.transform_parquet([path], output_dir=tmp_path / "out")
+
+
+def test_normalizer_divides_a_row_whose_norm_is_the_largest_f64(tmp_path: Path) -> None:
+    """A row whose exact l1 norm rounds to the largest f64 is normalized, on both paths."""
+    largest: float = 1.7976931348623157e308
+    row: dict[str, float] = {
+        "a": 2.0**1023,
+        "b": 2.0**971 - 2.0**969 - 2.0**960,
+        "c": 2.0**1023 - 2.0**972 + 2.0**970,
+    }
+    assert math.fsum(row.values()) == largest
+    path: str = _write(tmp_path / "top.parquet", pa.table({name: [value] for name, value in row.items()}))
+    normalizer: Normalizer = Normalizer(columns=list(row), norm="l1").fit([path])
+    expected: dict[str, float] = {name: value / largest for name, value in row.items()}
+    assert normalizer.transform_dict(row) == expected
+    assert _rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == [expected]
