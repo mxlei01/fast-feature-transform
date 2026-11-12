@@ -85,11 +85,13 @@ def _row_groups(path: Path) -> list[int]:
     return [metadata.row_group(group).num_rows for group in range(metadata.num_row_groups)]
 
 
-# Each part holds more rows than one batch, so the sink writes several row
-# groups per part: 65,536-row batches for the narrow output and 21,845 for
-# the wide one, whose batches shrink to fit their wider rows. A part no
-# larger than a batch is one row group however the write-back lays it out.
-@pytest.mark.parametrize(("columns", "rows_per_part"), [(2, 150_000), (32, 50_000)])
+# Each part holds more rows than one row group, so the sink writes several
+# per part: a 65,536-row batch each for the narrow output and a 21,845-row
+# batch each for the wider one, whose batches shrink to fit their wider rows.
+# With 300 columns a batch holds 2,330 rows, fewer than the 4,096 a row group
+# waits for, so the sink writes two batches to a row group. A part no larger
+# than a row group is one row group however the write-back lays it out.
+@pytest.mark.parametrize(("columns", "rows_per_part"), [(2, 150_000), (32, 50_000), (300, 6_000)])
 def test_write_back_matches_our_sinks_parquet_settings(tmp_path, columns, rows_per_part):
     names: list[str] = [f"c{i}" for i in range(columns)]
     values: np.ndarray = np.random.default_rng(0).normal(100.0, 25.0, (2 * rows_per_part, columns))
@@ -117,7 +119,27 @@ def test_write_back_matches_our_sinks_parquet_settings(tmp_path, columns, rows_p
 
 def test_write_parts_refuses_a_layout_that_does_not_cover_the_table(tmp_path):
     with pytest.raises(ValueError, match="the layout covers 4 rows, the table has 6"):
-        MEASURE.write_parts(pa.table({"x": np.arange(6)}), tmp_path, [(2, 2), (2, 2)])
+        MEASURE.write_parts(pa.table({"x": np.arange(6)}), tmp_path, [[2], [2]])
+
+
+def test_write_parts_writes_a_part_without_rows_as_one_row_group_without_rows(tmp_path: Path) -> None:
+    # An input row group without rows becomes a part of one row group without
+    # rows, and the write-back copies that part too.
+    table: pa.Table = pa.table({"x": np.arange(5, dtype=np.float64)})
+    source: Path = tmp_path / "in.parquet"
+    with pq.ParquetWriter(source, table.schema) as writer:
+        writer.write_table(table.slice(0, 3))
+        writer.write_table(table.slice(0, 0))
+        writer.write_table(table.slice(3, 2))
+    ours: list[Path] = (
+        Select(columns=["x"]).fit([str(source)]).transform_parquet([str(source)], output_dir=tmp_path / "ours")
+    )
+    layout: list[list[int]] = MEASURE.sink_layout(ours)
+    assert layout == [[3], [0], [2]]
+    MEASURE.write_parts(table, tmp_path / "theirs", layout)
+    theirs: list[Path] = sorted((tmp_path / "theirs").glob("*.parquet"))
+    assert [_row_groups(part) for part in theirs] == layout
+    assert pa.concat_tables([pq.read_table(part) for part in theirs]).equals(table)
 
 
 def test_dictionary_columns_follows_the_sinks_float_rule():
@@ -235,8 +257,9 @@ def test_write_parts_opens_each_part_through_a_buffer_as_large_as_the_sinks(
 
     monkeypatch.setattr(pa, "output_stream", watched)
     table: pa.Table = pa.table({"x": np.arange(6)})
-    MEASURE.write_parts(table, tmp_path, [(4, 2), (2, 2)])
+    MEASURE.write_parts(table, tmp_path, [[3, 1], [2]])
     assert opened == [("part-00000.parquet", 64 * 1024), ("part-00001.parquet", 64 * 1024)]
+    assert [_row_groups(tmp_path / name) for name, _ in opened] == [[3, 1], [2]]
     assert pa.concat_tables([pq.read_table(tmp_path / name) for name, _ in opened]).equals(table)
 
 

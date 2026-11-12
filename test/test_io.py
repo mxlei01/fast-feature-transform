@@ -193,6 +193,113 @@ def test_output_parts_are_compressed_and_floats_skip_dictionary_encoding(tmp_pat
     assert {name for name, leaf in leaves.items() if dictionary & set(leaf.encodings)} == {"device", "pair.n"}
 
 
+def _row_group_rows(part: Path) -> list[int]:
+    """List the row counts of a part's row groups, in order.
+
+    Args:
+        part: The Parquet file to describe.
+
+    Returns:
+        One row count per row group.
+
+    """
+    metadata = pq.ParquetFile(part).metadata
+    return [metadata.row_group(group).num_rows for group in range(metadata.num_row_groups)]
+
+
+@pytest.mark.parametrize(
+    ("columns", "rows", "row_groups"),
+    [
+        (300, 6_000, [2 * 2_330, 1_340]),  # a batch of 2,330 rows: two reach 4,096
+        (900, 5_000, [6 * 776, 344]),  # a batch of 776 rows: six of them
+    ],
+)
+def test_a_wide_output_gathers_its_small_batches_into_row_groups(
+    tmp_path: Path, columns: int, rows: int, row_groups: list[int]
+) -> None:
+    # REGRESSION: a batch of fewer than 4,096 rows shares a row group with the
+    # ones after it, until the row group holds 4,096 rows or six batches. Each
+    # batch used to be a row group, and a batch holds fewer rows the wider the
+    # output is (5,592,405 bytes at 8 bytes a number), so a very wide output
+    # was hundreds of row groups that held little but their own headers.
+    values: np.ndarray = np.arange(rows * columns, dtype=np.float64).reshape(rows, columns)
+    table: pa.Table = pa.table({f"x{i}": values[:, i] for i in range(columns)})
+    source: str = _write(tmp_path / "wide.parquet", table, row_group_size=rows)
+    parts: list[Path] = (
+        Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "wide")
+    )
+    assert _row_group_rows(parts[0]) == row_groups
+    assert pq.read_table(parts).equals(table)
+
+
+def test_strings_read_from_plain_pages_share_one_dictionary_in_a_row_group(tmp_path: Path) -> None:
+    # A string column stored in plain pages is read with a dictionary that
+    # grows from batch to batch, and Arrow's writer keeps a row group's
+    # dictionary only while every batch brings an equal one. Each word here
+    # fills 1,000 rows, so every batch brings words the batch before it did
+    # not have. The sink gives the two batches of a row group one dictionary,
+    # and the column chunk of the first row group is 110 bytes: five words
+    # and runs of one index. Without that it is 25,399 bytes, the 2,299 rows
+    # of the second batch written as words.
+    rows, columns = 6_000, 300
+    words: np.ndarray = np.array([f"word-{i:02d}" for i in range(20)])
+    numbers: np.ndarray = np.arange(rows * columns, dtype=np.float64).reshape(rows, columns)
+    table: pa.Table = pa.table(
+        {"s": words[np.arange(rows) // 1_000], **{f"x{i}": numbers[:, i] for i in range(columns)}}
+    )
+    source: str = _write(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
+    parts: list[Path] = (
+        Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    )
+    assert _row_group_rows(parts[0]) == [2 * 2_299, rows - 2 * 2_299]
+    assert _first_chunk(parts[0], "s").total_uncompressed_size < 5_000
+    assert pq.read_table(parts).equals(table)
+
+
+def test_strings_in_a_list_read_from_plain_pages_share_one_dictionary_in_a_row_group(tmp_path: Path) -> None:
+    # The strings of a list column are read with a growing dictionary too, one
+    # level below the column, and the sink gives the two batches of a row group
+    # one dictionary there as well. Each row holds two strings and each word
+    # fills 1,000 rows, so the column chunk of the first row group is 1,287
+    # bytes. Without the one dictionary it is 51,867 bytes, the 4,598
+    # strings of the second batch written as words.
+    rows, columns = 6_000, 300
+    words: np.ndarray = np.array([f"word-{i:02d}" for i in range(20)])
+    numbers: np.ndarray = np.arange(rows * columns, dtype=np.float64).reshape(rows, columns)
+    tags: pa.Array = pa.ListArray.from_arrays(
+        pa.array(np.arange(0, 2 * rows + 1, 2, dtype=np.int32)), pa.array(words[np.arange(2 * rows) // 2_000])
+    )
+    table: pa.Table = pa.table({"tags": tags, **{f"x{i}": numbers[:, i] for i in range(columns)}})
+    source: str = _write(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
+    parts: list[Path] = (
+        Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    )
+    assert _row_group_rows(parts[0]) == [2 * 2_299, rows - 2 * 2_299]
+    assert _first_chunk(parts[0], "tags.list.element").total_uncompressed_size < 10_000
+    assert pq.read_table(parts).equals(table)
+
+
+@pytest.mark.parametrize(
+    ("columns", "row_groups"),
+    [
+        (2, [_BATCH_ROWS, _BATCH_ROWS, 18_928]),
+        (20, [34_952, 34_952, 34_952, 34_952, 10_192]),
+        (32, [21_845, 21_845, 21_845, 21_845, 21_845, 21_845, 18_930]),
+    ],
+)
+def test_a_batch_of_4096_rows_or_more_is_a_row_group_of_its_own(
+    tmp_path: Path, columns: int, row_groups: list[int]
+) -> None:
+    rows: int = 150_000
+    table: pa.Table = pa.table({f"x{i}": np.arange(rows, dtype=np.float64) + i for i in range(columns)})
+    source: str = _write(tmp_path / "source.parquet", table, row_group_size=rows)
+    parts: list[Path] = (
+        Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    )
+    assert _row_group_rows(parts[0]) == row_groups
+    assert pq.read_table(parts).equals(table)
+
+
 def test_a_numbers_only_output_ends_a_dictionary_of_distinct_integers_at_248_kib(tmp_path: Path) -> None:
     # Arrow's writer hashes an integer column into a dictionary until the dictionary page reaches a limit, 1 MiB by
     # default, which the 65,536 rows of a row group never do. When every output column is a number the sink lowers
