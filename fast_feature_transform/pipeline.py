@@ -9,7 +9,6 @@ path, and a list of Parquet paths takes the batch path.
 """
 
 import json
-import tempfile
 import threading
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -56,6 +55,7 @@ from fast_feature_transform.transformers import (
     _cached_manifest,
     _check_threads,
     _fit_engine,
+    _output_directory,
     _source_paths,
 )
 
@@ -119,9 +119,9 @@ def parquet_to_memmap(X: Sequence[str | Path], *, output_dir: str | Path | None 
     Args:
         X: List of Parquet file paths.
         output_dir: Directory for ``data.mmap`` and ``index.json``; a temporary
-            directory is created when omitted. A previous memmap there is
-            replaced only after every row is written, so a run that fails
-            before then leaves it untouched.
+            directory is created when omitted, and removed again if the run
+            fails. A previous memmap there is replaced only after every row is
+            written, so a run that fails before then leaves it untouched.
         threads: Worker threads; 0 uses all cores.
 
     Returns:
@@ -136,9 +136,9 @@ def parquet_to_memmap(X: Sequence[str | Path], *, output_dir: str | Path | None 
 
     """
     sources: list[str] = _source_paths(X)
-    count: int = _check_threads(threads)  # before mkdtemp, so a bad argument leaves no directory behind
-    out_dir: str = str(output_dir) if output_dir is not None else tempfile.mkdtemp(prefix="fast_feature_transform_")
-    return Path(_core.parquet_to_memmap(sources, out_dir, count))
+    count: int = _check_threads(threads)
+    with _output_directory(output_dir) as out_dir:
+        return Path(_core.parquet_to_memmap(sources, out_dir, count))
 
 
 def _validated_steps(steps: Iterable[Step]) -> list[Step]:
@@ -300,9 +300,9 @@ class Pipeline:
         Args:
             X: List of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted. Existing ``part-NNNNN.parquet`` files
-                in it are replaced once the run starts, and a run that fails
-                midway leaves none.
+                is created when omitted, and removed again if the run fails.
+                Existing ``part-NNNNN.parquet`` files in it are replaced once
+                the run starts, and a run that fails midway leaves none.
 
         Returns:
             The paths of the part files written, one per input row group, in
@@ -317,8 +317,8 @@ class Pipeline:
 
         """
         handle: _core.FittedPipeline = self._require_handle()
-        out_dir: str = str(output_dir) if output_dir is not None else tempfile.mkdtemp(prefix="fast_feature_transform_")
-        return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
+        with _output_directory(output_dir) as out_dir:
+            return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
 
     def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
         """Write transformed training records without intermediate Parquet files.

@@ -6,6 +6,7 @@ import json
 import pickle
 import subprocess  # nosec B404
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,15 @@ import pyarrow.parquet as pq
 import pytest
 
 import fast_feature_transform
-from fast_feature_transform import EngineError, LabelEncoder, Pipeline, Select, Transformer, _core
+from fast_feature_transform import (
+    EngineError,
+    LabelEncoder,
+    Pipeline,
+    Select,
+    Transformer,
+    _core,
+    parquet_to_memmap,
+)
 
 # LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
 MOB_INDEX: int = 2
@@ -116,6 +125,36 @@ def test_the_version_is_the_installed_one_and_comes_from_the_extension(tmp_path:
     command: list[str] = [sys.executable, "-c", script]
     child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path)  # nosec B603
     assert child.stdout.split() in (["False", "False"], ["True", "True"])
+
+
+@pytest.mark.parametrize("call", ["pipeline", "transformer", "memmap"])
+def test_a_failed_batch_call_removes_the_temporary_directory_it_made(
+    call: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # REGRESSION: a call given no output_dir makes a temporary directory, and
+    # removes it again when it fails. It used to leave the empty directory.
+    temporary: Path = tmp_path / "temporary"
+    temporary.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+    numbers: Path = tmp_path / "numbers.parquet"
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), numbers)
+    calls: dict[str, Any] = {
+        "pipeline": Pipeline([("select", Select(columns=["x"]))]).fit([numbers]).transform_parquet,
+        "transformer": Select(columns=["x"]).fit([numbers]).transform_parquet,
+        "memmap": parquet_to_memmap,
+    }
+    with pytest.raises(EngineError):
+        calls[call]([tmp_path / "missing.parquet"])
+    assert list(temporary.iterdir()) == []
+    with pytest.raises(TypeError, match="not a single path"):
+        calls[call](str(numbers))
+    assert list(temporary.iterdir()) == []
+
+    # A call that succeeds keeps the directory, which holds what it wrote.
+    written = calls[call]([numbers])
+    (made,) = temporary.iterdir()
+    assert made.name.startswith("fast_feature_transform_")
+    assert {path.parent for path in ([written] if call == "memmap" else written)} == {made}
 
 
 def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str]) -> None:
