@@ -1,7 +1,9 @@
 """Tests for artifact integrity: provenance, validation on load, and how engine errors surface."""
 
 import importlib.metadata
+import inspect
 import json
+import math
 import pickle
 from decimal import Decimal
 from pathlib import Path
@@ -12,9 +14,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import fast_feature_transform
 from fast_feature_transform import EngineError, _core
-from fast_feature_transform.pipeline import Pipeline
-from fast_feature_transform.transformers import LabelEncoder, Select
+from fast_feature_transform.pipeline import _SHELLS, Pipeline
+from fast_feature_transform.transformers import LabelEncoder, Select, StandardScaler, Transformer
 
 INT64_MAX: int = 2**63 - 1
 
@@ -144,6 +147,95 @@ def test_kernel_params_are_validated_by_the_core_too() -> None:
         _core.FittedPipeline.load_json(manifest("label_encode", {"columns": [], "min_count": 1}))
     with pytest.raises(EngineError, match="'columns' must be a non-empty list"):
         _core.FittedPipeline.load_json(manifest("select", {"columns": []}))
+
+
+class _MisspelledScaler(StandardScaler):
+    """A StandardScaler whose plan spells ``with_mean`` as ``with_means``."""
+
+    def params(self) -> dict[str, Any]:
+        """Kernel parameters with one name misspelled.
+
+        Returns:
+            StandardScaler's parameters, with ``with_mean`` renamed ``with_means``.
+
+        """
+        named: dict[str, Any] = super().params()
+        named["with_means"] = named.pop("with_mean")
+        return named
+
+
+MISSPELLED: str = "standard_scale: unknown parameter 'with_means' (accepted: columns, with_mean, with_std)"
+# The fixture's prices are 1, 2 and 3: their mean is 2 and their variance 2/3,
+# so the mean itself scales to this without centering and to 0 with it.
+UNCENTERED_MEAN: float = 2.0 / math.sqrt(2.0 / 3.0)
+
+
+# REGRESSION: a parameter name the kernel does not know is an error. The core
+# used to read the names it knew and pass over every other one, so a plan or a
+# manifest that spelled with_mean as with_means fitted or loaded without an
+# error and centered the column, as the default with_mean=True does.
+def test_a_plan_that_misspells_a_parameter_name_is_refused_at_fit(source: str) -> None:
+    with pytest.raises(EngineError) as refused:
+        Pipeline([("scale", _MisspelledScaler(columns=["price"], with_mean=False))]).fit([source])
+    assert str(refused.value) == MISSPELLED
+    with pytest.raises(EngineError) as refused:
+        _MisspelledScaler(columns=["price"], with_mean=False).fit([source])
+    assert str(refused.value) == MISSPELLED
+    # Under its own name the parameter is read: the column is not centered.
+    scaler: StandardScaler = StandardScaler(columns=["price"], with_mean=False).fit([source])
+    assert scaler.transform_dict({"price": 2.0}) == {"price": UNCENTERED_MEAN}
+
+
+def test_a_manifest_that_misspells_a_parameter_name_is_refused_at_load(source: str, tmp_path: Path) -> None:
+    pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["price"], with_mean=False))]).fit([source])
+    pipeline.save(tmp_path / "saved")
+    assert Pipeline.load(tmp_path / "saved").transform_dict({"price": 2.0}) == {"price": UNCENTERED_MEAN}
+
+    path: Path = tmp_path / "saved" / "manifest.json"
+    manifest: dict[str, Any] = json.loads(path.read_text())
+    params: dict[str, Any] = manifest["ops"][0]["params"]
+    assert params == {"columns": ["price"], "with_mean": False, "with_std": True}
+    params["with_means"] = params.pop("with_mean")
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(EngineError) as refused:
+        Pipeline.load(tmp_path / "saved")
+    assert str(refused.value) == MISSPELLED
+    with pytest.raises(EngineError) as refused:
+        _core.FittedPipeline.load_json(json.dumps(manifest))
+    assert str(refused.value) == MISSPELLED
+
+
+# What each constructor requires, by argument name.
+_REQUIRED: dict[str, Any] = {
+    "columns": ["x"],
+    "types": {"x": "f64"},
+    "key": "k",
+    "aggs": {"x": ["sum"]},
+    "target": "y",
+}
+
+
+# For every class, the names params() sends, the names its kernel reports and
+# the constructor's arguments are one set. The core refuses a name the kernel
+# does not report, so a name that only params() sends fails every fit.
+# Pipeline.load builds each step from the names the kernel reports, so a name
+# the constructor does not take fails every load.
+def test_every_transformer_sends_the_names_its_kernel_reports_and_takes_them_back() -> None:
+    exported: list[Any] = [getattr(fast_feature_transform, name) for name in fast_feature_transform.__all__]
+    classes: set[Any] = {each for each in exported if isinstance(each, type) and issubclass(each, Transformer)}
+    assert set(_SHELLS.values()) == classes - {Transformer}
+    for kernel, shell in _SHELLS.items():
+        arguments: list[inspect.Parameter] = list(inspect.signature(shell).parameters.values())
+        required: list[str] = [each.name for each in arguments if each.default is each.empty]
+        step: Transformer = shell(**{name: _REQUIRED[name] for name in required})
+        sent: dict[str, Any] = step.params()
+        assert set(sent) == {each.name for each in arguments}, kernel
+        # The kernel names what it accepts when it refuses a name.
+        op: dict[str, Any] = {"stage": "s", "kernel": kernel, "params": sent | {"no_such_parameter": 1}, "state": {}}
+        with pytest.raises(EngineError) as refused:
+            _core.FittedPipeline.load_json(json.dumps({"schema_version": "0.3.0", "ops": [op]}))
+        accepted: str = ", ".join(sorted(sent))
+        assert str(refused.value) == f"{kernel}: unknown parameter 'no_such_parameter' (accepted: {accepted})"
 
 
 def test_transform_dict_rejects_unconvertible_values_by_name(source: str) -> None:

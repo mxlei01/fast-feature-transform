@@ -28,6 +28,9 @@ class Kernel {
   virtual ~Kernel() = default;
 
   virtual std::string id() const = 0;
+  // Every parameter the constructor reads, by name, with the value in effect.
+  // make_kernel refuses a name that is not reported here, so a name left out
+  // makes every plan and manifest that spells it an error.
   virtual nlohmann::json params() const = 0;
 
   // Resolve column bindings against the incoming schema (raising Error on a
@@ -83,8 +86,13 @@ class Kernel {
 };
 
 // The kernel catalog: one flat table in one place (kernel.cpp), with each
-// kernel implemented under kernels/. Throws Error on an unknown id or
-// malformed params so artifacts fail loudly at load time.
+// kernel implemented under kernels/. `params` is a JSON object of parameter
+// names and values, or null for no parameters. Throws Error on an unknown id,
+// on a value the kernel refuses, on a name the kernel does not report in its
+// own params(), and on params that are neither an object nor null, so a plan
+// fails at fit and a manifest at load instead of running on a default. The
+// names are checked once the kernel is constructed, so a refused value is
+// reported before an unknown name.
 std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json& params);
 
 std::vector<std::string> list_kernels();

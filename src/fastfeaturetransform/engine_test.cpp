@@ -24,6 +24,7 @@
 
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Equals;
 using fft::testing::f64_column;
 using fft::testing::make_batch;
 using fft::testing::TempDir;
@@ -280,6 +281,23 @@ TEST_CASE("load_json enforces the same invariants as compile_plan, with context"
     REQUIRE(message.starts_with("invalid manifest"));
     for (char c : message) REQUIRE(static_cast<unsigned char>(c) < 0x80);
   }
+}
+
+// make_kernel's refusal reaches the caller as it is. A plan fails when it is
+// compiled, which a fit does before it opens a file, and a manifest when it
+// is loaded.
+TEST_CASE("a plan and a manifest are refused for a parameter name the kernel does not report") {
+  const std::string message = "label_encode: unknown parameter 'min_counts' (accepted: columns, min_count)";
+  const std::string plan = R"({"type": "pipeline", "steps": [
+    ["enc", {"kernel": "label_encode", "params": {"columns": ["device"], "min_counts": 2}}]]})";
+  REQUIRE_THROWS_WITH(fft::compile_plan(plan), Equals(message));
+  REQUIRE_THROWS_WITH(fft::Engine(1).fit(plan, {"no-such-file.parquet"}), Equals(message));
+
+  nlohmann::json manifest = nlohmann::json::parse(kManifest);
+  nlohmann::json& params = manifest["ops"][0]["params"];
+  params["min_counts"] = params.at("min_count");
+  params.erase("min_count");
+  REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(manifest.dump()), Equals(message));
 }
 
 TEST_CASE("a failed save leaves nothing new behind") {

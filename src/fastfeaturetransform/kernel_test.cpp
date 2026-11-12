@@ -52,6 +52,198 @@ TEST_CASE("make_kernel rejects unknown ids loudly") {
   REQUIRE_THROWS_AS(fft::make_kernel("flux_capacitor", {}), fft::Error);
 }
 
+// REGRESSION: a parameter name the kernel does not know is an error. A
+// constructor used to read the names it knew and pass over every other one,
+// so 'with_means' for 'with_mean' built a kernel that centered its columns,
+// as the default with_mean=true does.
+TEST_CASE("make_kernel refuses a parameter name the kernel does not report") {
+  const std::string accepted = " (accepted: columns, with_mean, with_std)";
+  const auto misspelled = nlohmann::json::parse(R"({"columns": ["x"], "with_means": false})");
+  REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", misspelled),
+                      Equals("standard_scale: unknown parameter 'with_means'" + accepted));
+  // The refusal is an Error, the one type the Python module raises as
+  // EngineError.
+  REQUIRE_THROWS_AS(fft::make_kernel("standard_scale", misspelled), fft::Error);
+  const auto spelled = nlohmann::json::parse(R"({"columns": ["x"], "with_mean": false})");
+  REQUIRE_FALSE(fft::make_kernel("standard_scale", spelled)->params().at("with_mean").get<bool>());
+
+  // Names compare byte for byte, and whole: no part of a name stands for it.
+  for (const std::string name :
+       {"With_mean", "with_mean ", " with_mean", "with-mean", "with_mea", "with", "mean", ""}) {
+    CAPTURE(name);
+    REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", nlohmann::json::object({{name, false}})),
+                        Equals("standard_scale: unknown parameter '" + name + "'" + accepted));
+  }
+  REQUIRE_THROWS_WITH(fft::make_kernel("select", nlohmann::json::parse(R"({"columns": ["x"], "column": ["y"]})")),
+                      Equals("select: unknown parameter 'column' (accepted: columns)"));
+  // standard_scale reads a null value as a parameter left out. Under a name
+  // it does not report, a null is refused like any other value.
+  const auto left_out = nlohmann::json::parse(R"({"with_mean": null})");
+  REQUIRE(fft::make_kernel("standard_scale", left_out)->params().at("with_mean").get<bool>());
+  REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", nlohmann::json::parse(R"({"with_means": null})")),
+                      Equals("standard_scale: unknown parameter 'with_means'" + accepted));
+  // Of several unknown names the first in byte order is reported, wherever
+  // the plan wrote it.
+  REQUIRE_THROWS_WITH(
+      fft::make_kernel("standard_scale", nlohmann::json::parse(R"({"zeta": 1, "with_std": false, "alpha": 2})")),
+      Equals("standard_scale: unknown parameter 'alpha'" + accepted));
+  // A value the kernel refuses is reported before an unknown name, and an
+  // unknown kernel before either.
+  REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", nlohmann::json::parse(R"({"with_mean": "yes", "alpha": 2})")),
+                      Equals("standard_scale: 'with_mean' must be true or false"));
+  REQUIRE_THROWS_WITH(fft::make_kernel("flux_capacitor", nlohmann::json::parse(R"({"alpha": 2})")),
+                      ContainsSubstring("unknown kernel: flux_capacitor"));
+  // A name inside a value is not a parameter name: cast keys its types by
+  // column, and group_agg its aggs.
+  REQUIRE_NOTHROW(fft::make_kernel("cast", nlohmann::json::parse(R"({"types": {"with_means": "f64"}})")));
+  REQUIRE_NOTHROW(
+      fft::make_kernel("group_agg", nlohmann::json::parse(R"({"key": "k", "aggs": {"with_means": ["sum"]}})")));
+}
+
+TEST_CASE("make_kernel takes params as an object, or as null for no parameters") {
+  const auto defaults = nlohmann::json::parse(R"({"columns": null, "with_mean": true, "with_std": true})");
+  REQUIRE(fft::make_kernel("standard_scale", nlohmann::json())->params() == defaults);
+  REQUIRE(fft::make_kernel("standard_scale", nlohmann::json::object())->params() == defaults);
+  // Any other value holds no names, so every optional parameter would take
+  // its default without an error.
+  const std::pair<const char*, const char*> others[] = {
+      {"[]", "array"},
+      {R"(["with_mean"])", "array"},
+      {R"([{"with_mean": false}])", "array"},
+      {"\"with_mean\"", "string"},
+      {"5", "number"},
+      {"1.5", "number"},
+      {"false", "boolean"},
+  };
+  for (const auto& [text, type] : others) {
+    CAPTURE(text);
+    REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", nlohmann::json::parse(text)),
+                        Equals("standard_scale: params must be an object of parameter names and values (got " +
+                               std::string(type) + ")"));
+    REQUIRE_THROWS_AS(fft::make_kernel("standard_scale", nlohmann::json::parse(text)), fft::Error);
+  }
+}
+
+namespace {
+
+// Every kernel of the catalog, in catalog order, with every parameter it
+// takes. Each value differs from the parameter's default, except
+// hash_method, for which hash_encode accepts 'md5' alone.
+struct EveryParam {
+  const char* id;
+  const char* params;
+};
+
+const EveryParam kEveryParam[] = {
+    {"select", R"({"columns": ["b", "a"]})"},
+    {"cast", R"({"types": {"a": "f32", "b": "utf8"}})"},
+    {"label_encode", R"({"columns": ["c"], "min_count": 3})"},
+    {"group_agg", R"({"key": "k", "aggs": {"x": ["max", "count"], "y": ["median"]}})"},
+    {"count_encode",
+     R"({"columns": ["c"], "normalize": true, "min_group_size": 3, "min_group_name": "rare",
+         "combine_min_nan_groups": "force", "handle_unknown": 7, "handle_missing": "error"})"},
+    {"ordinal_encode",
+     R"({"columns": ["c"], "index_start": 5, "handle_unknown": "return_nan", "handle_missing": "error"})"},
+    {"one_hot_encode",
+     R"({"columns": ["c"], "use_cat_names": true, "handle_unknown": "indicator", "handle_missing": "return_nan"})"},
+    {"rank_hot_encode",
+     R"({"columns": ["c"], "use_cat_names": true, "handle_unknown": "error", "handle_missing": "return_nan"})"},
+    {"hash_encode", R"({"columns": ["c"], "n_components": 16, "hash_method": "md5"})"},
+    {"target_encode",
+     R"({"columns": ["c"], "target": "y", "min_samples_leaf": 5, "smoothing": 2.5, "handle_unknown": "return_nan",
+         "handle_missing": "error"})"},
+    {"m_estimate_encode",
+     R"({"columns": ["c"], "target": "y", "m": 2.5, "handle_unknown": "error", "handle_missing": "return_nan"})"},
+    {"woe_encode",
+     R"({"columns": ["c"], "target": "y", "regularization": 0.5, "handle_unknown": "return_nan",
+         "handle_missing": "error"})"},
+    {"james_stein_encode",
+     R"({"columns": ["c"], "target": "y", "model": "pooled", "handle_unknown": "error",
+         "handle_missing": "return_nan"})"},
+    {"leave_one_out_encode",
+     R"({"columns": ["c"], "target": "y", "handle_unknown": "return_nan", "handle_missing": "error"})"},
+    {"cat_boost_encode",
+     R"({"columns": ["c"], "target": "y", "a": 2.5, "handle_unknown": "error", "handle_missing": "return_nan"})"},
+    {"quantile_encode",
+     R"({"columns": ["c"], "target": "y", "quantile": 0.25, "m": 2.5, "handle_unknown": "return_nan",
+         "handle_missing": "error"})"},
+    {"summary_encode",
+     R"({"columns": ["c"], "target": "y", "quantiles": [0.1, 0.9], "m": 2.5, "handle_unknown": "error",
+         "handle_missing": "return_nan"})"},
+    {"basen_encode", R"({"columns": ["c"], "base": 3, "handle_unknown": "indicator", "handle_missing": "return_nan"})"},
+    {"binary_encode", R"({"columns": ["c"], "handle_unknown": "indicator", "handle_missing": "error"})"},
+    {"gray_encode", R"({"columns": ["c"], "handle_unknown": "return_nan", "handle_missing": "error"})"},
+    {"backward_difference_encode",
+     R"({"columns": ["c"], "handle_unknown": "indicator", "handle_missing": "return_nan"})"},
+    {"helmert_encode", R"({"columns": ["c"], "handle_unknown": "error", "handle_missing": "return_nan"})"},
+    {"sum_encode", R"({"columns": ["c"], "handle_unknown": "return_nan", "handle_missing": "error"})"},
+    {"polynomial_encode", R"({"columns": ["c"], "handle_unknown": "indicator", "handle_missing": "error"})"},
+    {"standard_scale", R"({"columns": ["x"], "with_mean": false, "with_std": false})"},
+    {"min_max_scale", R"({"columns": ["x"], "feature_range": [-2.0, 3.0], "clip": true})"},
+    {"max_abs_scale", R"({"columns": ["x"], "clip": true})"},
+    {"binarize", R"({"columns": ["x"], "threshold": 1.5})"},
+    {"normalize", R"({"columns": ["x", "y"], "norm": "max"})"},
+    {"robust_scale",
+     R"({"columns": ["x"], "with_centering": false, "with_scaling": false, "quantile_range": [10.0, 90.0],
+         "unit_variance": true})"},
+    {"quantile_transform", R"({"columns": ["x"], "n_quantiles": 10, "output_distribution": "normal"})"},
+    {"k_bins_discretize",
+     R"({"columns": ["x"], "n_bins": 3, "encode": "ordinal", "strategy": "kmeans", "quantile_method": "linear"})"},
+    {"polynomial_features",
+     R"({"columns": ["x", "y"], "degree": [1, 3], "interaction_only": true, "include_bias": false})"},
+    {"spline_transform",
+     R"({"columns": ["x"], "n_knots": 4, "degree": 2, "knots": "quantile", "extrapolation": "periodic",
+         "include_bias": false, "handle_missing": "zeros"})"},
+    {"power_transform", R"({"columns": ["x"], "method": "box-cox", "standardize": false})"},
+};
+
+// The names of a params object as a message lists them: in byte order.
+std::string listed_names(const nlohmann::json& params) {
+  std::vector<std::string> names;
+  for (const auto& [name, value] : params.items()) names.push_back(name);
+  std::sort(names.begin(), names.end());
+  std::string listed;
+  for (const std::string& name : names) listed += (listed.empty() ? "" : ", ") + name;
+  return listed;
+}
+
+}  // namespace
+
+// make_kernel takes a kernel's own params() for the names it accepts, so the
+// constructor and params() have to agree in every kernel. A name the
+// constructor reads and params() leaves out would make a valid plan an error;
+// a name params() reports and the constructor does not read would be accepted
+// and do nothing.
+TEST_CASE("every kernel reports each parameter it is given, by name and by value") {
+  std::string ids;
+  for (const EveryParam& entry : kEveryParam) {
+    CAPTURE(entry.id);
+    ids += (ids.empty() ? "" : ", ") + std::string(entry.id);
+    const nlohmann::json given = nlohmann::json::parse(entry.params);
+    const auto kernel = fft::make_kernel(entry.id, given);
+    REQUIRE(kernel->id() == entry.id);
+    REQUIRE(kernel->params() == given);
+    // A manifest holds params(), which builds the same kernel again.
+    REQUIRE(fft::make_kernel(entry.id, kernel->params())->params() == given);
+  }
+  // The table holds the whole catalog, which names its kernels when it
+  // refuses an id.
+  REQUIRE_THROWS_WITH(fft::make_kernel("no_such_kernel", nlohmann::json::object()),
+                      Equals("unknown kernel: no_such_kernel (this runtime knows: " + ids + ")"));
+}
+
+TEST_CASE("every kernel refuses a parameter name it does not report and lists the names it accepts") {
+  for (const EveryParam& entry : kEveryParam) {
+    CAPTURE(entry.id);
+    nlohmann::json params = nlohmann::json::parse(entry.params);
+    const std::string accepted = listed_names(params);
+    params["no_such_parameter"] = 1;
+    REQUIRE_THROWS_WITH(
+        fft::make_kernel(entry.id, params),
+        Equals(std::string(entry.id) + ": unknown parameter 'no_such_parameter' (accepted: " + accepted + ")"));
+  }
+}
+
 TEST_CASE("select projects and reorders columns; row and batch agree") {
   auto kernel = fft::make_kernel("select", {{"columns", {"b", "a"}}});
   kernel->stage = "sel";
