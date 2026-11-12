@@ -103,7 +103,7 @@ def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
 
     Yields:
         The directory's path. A temporary directory made here is removed
-        again if the call raises.
+        again if the call raises and leaves it empty.
 
     """
     if output_dir is not None:
@@ -113,8 +113,9 @@ def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
     try:
         yield created
     except BaseException:
-        # A call that fails leaves no file behind, so the directory is empty,
-        # and rmdir removes nothing else.
+        # rmdir removes the directory only while it is empty. A call that
+        # fails in the engine leaves no file in it, and an interrupt raised
+        # once the engine has written its output leaves that output in place.
         with contextlib.suppress(OSError):
             os.rmdir(created)
         raise
@@ -643,7 +644,9 @@ class Cast(Transformer):
                 raise ValueError(
                     f"Cast: unsupported type {tag!r} for column {column!r}; choose one of {sorted(TYPE_TAGS)}"
                 )
-        self.types: dict[str, str] = dict(types)
+        # A tag given as a str subclass, such as an Enum with a str mixin, is
+        # stored as the plain string it equals, as _one_of stores an option.
+        self.types: dict[str, str] = {column: str.__str__(tag) for column, tag in types.items()}
 
     @override
     def params(self) -> dict[str, Any]:
@@ -734,7 +737,7 @@ class GroupAgg(Transformer):
                     )
             if len(set(names)) != len(names):
                 raise ValueError(f"GroupAgg: column {column!r} lists an aggregate more than once")
-            validated[column] = list(names)
+            validated[column] = [str.__str__(name) for name in names]
         self.key: str = key
         self.aggs: dict[str, list[str]] = validated
 
@@ -845,8 +848,7 @@ class CountEncoder(Transformer):
 
         """
         self.columns: list[str] | None = _optional_columns(columns, "CountEncoder")
-        if not isinstance(normalize, bool):
-            raise TypeError(f"CountEncoder: normalize must be True or False, got {normalize!r}")
+        _flag(normalize, "CountEncoder", "normalize")
         if min_group_size is not None:
             _group_size(min_group_size)
         if min_group_name is not None and not isinstance(min_group_name, str):
@@ -870,7 +872,9 @@ class CountEncoder(Transformer):
         self.normalize: bool = normalize
         self.min_group_size: float | None = min_group_size
         self.min_group_name: str | None = min_group_name
-        self.combine_min_nan_groups: bool | str = combine_min_nan_groups
+        self.combine_min_nan_groups: bool | str = (
+            combine_min_nan_groups if isinstance(combine_min_nan_groups, bool) else "force"
+        )
         self.handle_unknown: str | int = (
             handle_unknown
             if isinstance(handle_unknown, int)
@@ -1000,9 +1004,7 @@ class _Expanding(Transformer):
         what: str = type(self).__name__
         allowed: frozenset[str] = _HANDLE_UNKNOWN | ({"indicator"} if self.kernel_id == "one_hot_encode" else set())
         self.columns: list[str] | None = _optional_columns(columns, what)
-        if not isinstance(use_cat_names, bool):
-            raise TypeError(f"{what}: use_cat_names must be True or False, got {use_cat_names!r}")
-        self.use_cat_names: bool = use_cat_names
+        self.use_cat_names: bool = _flag(use_cat_names, what, "use_cat_names")
         self.handle_unknown: str = _one_of(handle_unknown, allowed, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
@@ -1390,7 +1392,7 @@ class HashingEncoder(Transformer):
             raise ValueError(f"HashingEncoder: n_components must be between 1 and {MAX_COMPONENTS}, got {n_components}")
         if hash_method != "md5":
             raise ValueError(f"HashingEncoder: hash_method must be 'md5', got {hash_method!r}")
-        self.hash_method: str = hash_method
+        self.hash_method: str = "md5"
 
     @override
     def params(self) -> dict[str, Any]:
@@ -3149,12 +3151,8 @@ class PolynomialFeatures(Transformer):
                     "which would make a generated name ambiguous"
                 )
         self.degree: int | tuple[int, int] = _degree(degree)
-        if not isinstance(interaction_only, bool):
-            raise TypeError(f"PolynomialFeatures: interaction_only must be True or False, got {interaction_only!r}")
-        if not isinstance(include_bias, bool):
-            raise TypeError(f"PolynomialFeatures: include_bias must be True or False, got {include_bias!r}")
-        self.interaction_only: bool = interaction_only
-        self.include_bias: bool = include_bias
+        self.interaction_only: bool = _flag(interaction_only, "PolynomialFeatures", "interaction_only")
+        self.include_bias: bool = _flag(include_bias, "PolynomialFeatures", "include_bias")
         maximum: int = self.degree if isinstance(self.degree, int) else self.degree[1]
         if maximum == 0 and not include_bias:
             raise ValueError("PolynomialFeatures: degree 0 with include_bias False would generate no columns")
@@ -3304,9 +3302,7 @@ class SplineTransformer(Transformer):
             raise ValueError(f"SplineTransformer: degree must be between 0 and {MAX_OUTPUTS}, got {degree!r}")
         self.knots: str = _one_of(knots, frozenset({"uniform", "quantile"}), "SplineTransformer", "knots")
         self.extrapolation: str = _one_of(extrapolation, _EXTRAPOLATION, "SplineTransformer", "extrapolation")
-        if not isinstance(include_bias, bool):
-            raise TypeError(f"SplineTransformer: include_bias must be True or False, got {include_bias!r}")
-        self.include_bias: bool = include_bias
+        self.include_bias: bool = _flag(include_bias, "SplineTransformer", "include_bias")
         self.handle_missing: str = _one_of(handle_missing, _SPLINE_MISSING, "SplineTransformer", "handle_missing")
         if self.extrapolation == "periodic" and self.n_knots <= self.degree:
             raise ValueError(
@@ -3425,9 +3421,7 @@ class PowerTransformer(Transformer):
         """
         self.columns: list[str] = _column_list(columns, "PowerTransformer")
         self.method: str = _one_of(method, frozenset({"yeo-johnson", "box-cox"}), "PowerTransformer", "method")
-        if not isinstance(standardize, bool):
-            raise TypeError(f"PowerTransformer: standardize must be True or False, got {standardize!r}")
-        self.standardize: bool = standardize
+        self.standardize: bool = _flag(standardize, "PowerTransformer", "standardize")
 
     @override
     def params(self) -> dict[str, Any]:
