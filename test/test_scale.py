@@ -38,8 +38,16 @@ from fast_feature_transform import LabelEncoder, Pipeline, Select
 
 
 def peak():
-    maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return maxrss if sys.platform == "darwin" else maxrss * 1024  # macOS reports bytes, Linux kilobytes
+    if sys.platform != "linux":
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # macOS reports bytes
+    # On Linux ru_maxrss starts at the peak of the process that started this
+    # one, a test run that has grown far past anything measured here. The
+    # high-water mark in /proc belongs to this process alone.
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024  # kilobytes
+    raise RuntimeError("no VmHWM line in /proc/self/status")
 
 
 def fit(files):
