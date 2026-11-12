@@ -1,8 +1,7 @@
 """Feature preprocessing for machine learning, written in C++ with a Python API."""
 
-import importlib.metadata
-
 from fast_feature_transform._core import EngineError
+from fast_feature_transform._core import library_version as _library_version
 from fast_feature_transform.pipeline import Pipeline, parquet_to_memmap
 from fast_feature_transform.transformers import (
     BackwardDifferenceEncoder,
@@ -43,7 +42,11 @@ from fast_feature_transform.transformers import (
     WOEEncoder,
 )
 
-__version__: str = importlib.metadata.version("fast-feature-transform")
+# The extension holds the version it was built as, the string it writes into
+# every saved pipeline, and a wheel's metadata holds the same one. Asking the
+# metadata for it imports importlib.metadata and searches the installed
+# distributions.
+__version__: str = _library_version()
 
 __all__ = [
     "BackwardDifferenceEncoder",

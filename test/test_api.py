@@ -1,8 +1,11 @@
 """Tests for the Python API surface: validation, nesting rules, pickling, and ergonomics."""
 
 import copy
+import importlib.metadata
 import json
 import pickle
+import subprocess  # nosec B404
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -13,7 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import fast_feature_transform
-from fast_feature_transform import EngineError, LabelEncoder, Pipeline, Select, Transformer
+from fast_feature_transform import EngineError, LabelEncoder, Pipeline, Select, Transformer, _core
 
 # LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
 MOB_INDEX: int = 2
@@ -93,6 +96,26 @@ def test_package_exports_the_public_api() -> None:
     assert issubclass(Select, Transformer)
     assert issubclass(EngineError, RuntimeError)
     assert fast_feature_transform.__version__
+
+
+def test_the_version_is_the_installed_one_and_comes_from_the_extension(tmp_path: Path) -> None:
+    assert type(fast_feature_transform.__version__) is str
+    assert fast_feature_transform.__version__ == _core.library_version()
+    assert fast_feature_transform.__version__ == importlib.metadata.version("fast-feature-transform")
+    # REGRESSION: importing the package does not import importlib.metadata. It
+    # used to ask the installed metadata for the version, and that import and
+    # its search of the installed distributions took a third of this one. A
+    # child process shows it, because this process has imported the metadata.
+    # Where the interpreter's own start imports it, there is nothing to show.
+    script: str = (
+        "import sys\n"
+        "before = 'importlib.metadata' in sys.modules\n"
+        "import fast_feature_transform\n"
+        "print(before, 'importlib.metadata' in sys.modules)\n"
+    )
+    command: list[str] = [sys.executable, "-c", script]
+    child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path)  # nosec B603
+    assert child.stdout.split() in (["False", "False"], ["True", "True"])
 
 
 def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str]) -> None:
