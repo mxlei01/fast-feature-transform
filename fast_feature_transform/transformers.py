@@ -14,7 +14,7 @@ import os
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Self, overload
+from typing import Any, ClassVar, Self, overload, override
 
 from fast_feature_transform import _core
 
@@ -207,6 +207,24 @@ def _column_list(columns: object, what: str) -> list[str]:
     if not columns:
         raise ValueError(f"{what}: columns must name at least one column")
     return list(columns)
+
+
+def _optional_columns(columns: object, what: str) -> list[str] | None:
+    """Validate a ``columns`` argument that may be None.
+
+    Args:
+        columns: The value passed for ``columns``; None leaves the choice to the fit.
+        what: The transformer name, for the error message.
+
+    Returns:
+        The column names, or None.
+
+    Raises:
+        TypeError: If columns is a bare string or holds non-strings.
+        ValueError: If columns is empty.
+
+    """
+    return None if columns is None else _column_list(columns, what)
 
 
 class Transformer:
@@ -422,7 +440,7 @@ class Transformer:
             this transformer owns its handle.
 
         """
-        transient: tuple[str, ...] = ("_handle", "_stage", "_standalone", "_state_cache", "_vocab_size_cache")
+        transient: tuple[str, ...] = ("_handle", "_stage", "_standalone", "_state_cache")
         state: dict[str, Any] = {key: value for key, value in self.__dict__.items() if key not in transient}
         if self._handle is not None and self._standalone:
             state["_manifest"] = _cached_manifest(self._handle)
@@ -502,13 +520,8 @@ class Select(Transformer):
         """
         self.columns: list[str] = _column_list(columns, "Select")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the select kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns}
 
 
@@ -524,7 +537,6 @@ class LabelEncoder(Transformer):
     """
 
     kernel_id: ClassVar[str] = "label_encode"
-    _vocab_size_cache: dict[str, int]
 
     def __init__(self, columns: list[str] | None = None, min_count: int = 1) -> None:
         """Initialize the encoder.
@@ -541,41 +553,13 @@ class LabelEncoder(Transformer):
                 2**63 - 1.
 
         """
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, "LabelEncoder")
+        self.columns: list[str] | None = _optional_columns(columns, "LabelEncoder")
         self.min_count: int = _integer(min_count, "LabelEncoder: min_count")
         if self.min_count < 1:
             raise ValueError(f"LabelEncoder: min_count must be >= 1, got {min_count}")
-        self._vocab_size_cache = {}
 
-    def _bind(self, handle: _core.FittedPipeline, stage: str, *, standalone: bool) -> None:
-        """Bind fitted state and replace the per-column vocabulary-size cache.
-
-        Args:
-            handle: The fitted native pipeline.
-            stage: This encoder's stage name.
-            standalone: Whether this encoder owns the pipeline handle.
-
-        """
-        super()._bind(handle, stage, standalone=standalone)
-        self._vocab_size_cache = {}
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore the transformer with a fresh, transient vocabulary-size cache.
-
-        Args:
-            state: The pickled transformer state.
-
-        """
-        self._vocab_size_cache = {}
-        super().__setstate__(state)
-
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the label_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "min_count": self.min_count}
 
     @property
@@ -591,8 +575,6 @@ class LabelEncoder(Transformer):
     def vocab_size(self, column: str) -> int:
         """Number of embedding rows needed for a column (len(map) + 1 for unknown).
 
-        Successful queries are cached per column until the encoder is rebound.
-
         Args:
             column: The encoded column name.
 
@@ -604,26 +586,17 @@ class LabelEncoder(Transformer):
             RuntimeError: If the encoder is not fitted.
 
         """
-        cache = self._vocab_size_cache
-        try:
-            return cache[column]
-        except KeyError, TypeError:
-            pass
         handle = self._require_handle()
         assert self._stage is not None
         if not isinstance(column, str):
             # Preserve Python dict key semantics for unusual invalid arguments.
             return self._state()["vocab_sizes"][column]
         try:
-            size = handle.vocab_size(self._stage, column)
+            return handle.vocab_size(self._stage, column)
         except _core.EngineError:
             # A column this encoder does not encode raises KeyError, as its
             # docstring says, from a lookup in the materialized state.
             return self._state()["vocab_sizes"][column]
-        # A concurrent rebind replaces this dict. A query already in progress
-        # can only populate the old binding's captured cache.
-        cache[column] = size
-        return size
 
 
 TYPE_TAGS: frozenset[str] = frozenset({"utf8", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"})
@@ -672,13 +645,8 @@ class Cast(Transformer):
                 )
         self.types: dict[str, str] = dict(types)
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the cast kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"types": self.types}
 
 
@@ -692,7 +660,7 @@ def _one_of(value: object, allowed: frozenset[str] | set[str], what: str, option
         option: The option name, for the error message.
 
     Returns:
-        The value.
+        The value, as a plain ``str``.
 
     Raises:
         ValueError: If the value is not one of the accepted ones.
@@ -700,7 +668,9 @@ def _one_of(value: object, allowed: frozenset[str] | set[str], what: str, option
     """
     if value not in allowed:
         raise ValueError(f"{what}: {option} must be one of {sorted(allowed)}, got {value!r}")
-    return str(value)
+    # A str subclass, such as an Enum with a str mixin, equals an accepted
+    # value and prints as something else. The kernel takes the value itself.
+    return str.__str__(value) if isinstance(value, str) else str(value)
 
 
 _HANDLE_UNKNOWN: frozenset[str] = frozenset({"value", "return_nan", "error"})
@@ -768,13 +738,8 @@ class GroupAgg(Transformer):
         self.key: str = key
         self.aggs: dict[str, list[str]] = validated
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the group_agg kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"key": self.key, "aggs": self.aggs}
 
     @property
@@ -879,7 +844,7 @@ class CountEncoder(Transformer):
                 "return_nan".
 
         """
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, "CountEncoder")
+        self.columns: list[str] | None = _optional_columns(columns, "CountEncoder")
         if not isinstance(normalize, bool):
             raise TypeError(f"CountEncoder: normalize must be True or False, got {normalize!r}")
         if min_group_size is not None:
@@ -897,10 +862,7 @@ class CountEncoder(Transformer):
                 f"CountEncoder: handle_unknown must be an integer or one of {sorted(_HANDLE_UNKNOWN)}, "
                 f"got {handle_unknown!r}"
             )
-        if handle_missing not in _HANDLE_MISSING:
-            raise ValueError(
-                f"CountEncoder: handle_missing must be one of {sorted(_HANDLE_MISSING)}, got {handle_missing!r}"
-            )
+        handle_missing = _one_of(handle_missing, _HANDLE_MISSING, "CountEncoder", "handle_missing")
         if isinstance(handle_unknown, int):
             _integer(handle_unknown, "CountEncoder: handle_unknown")
         if combine_min_nan_groups == "force" and handle_missing == "return_nan":
@@ -909,16 +871,15 @@ class CountEncoder(Transformer):
         self.min_group_size: float | None = min_group_size
         self.min_group_name: str | None = min_group_name
         self.combine_min_nan_groups: bool | str = combine_min_nan_groups
-        self.handle_unknown: str | int = handle_unknown
+        self.handle_unknown: str | int = (
+            handle_unknown
+            if isinstance(handle_unknown, int)
+            else _one_of(handle_unknown, _HANDLE_UNKNOWN, "CountEncoder", "handle_unknown")
+        )
         self.handle_missing: str = handle_missing
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the count_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "normalize": self.normalize,
@@ -981,18 +942,13 @@ class OrdinalEncoder(Transformer):
                 option is not one of the accepted values.
 
         """
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, "OrdinalEncoder")
+        self.columns: list[str] | None = _optional_columns(columns, "OrdinalEncoder")
         self.index_start: int = _integer(index_start, "OrdinalEncoder: index_start")
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, "OrdinalEncoder", "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, "OrdinalEncoder", "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the ordinal_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "index_start": self.index_start,
@@ -1043,20 +999,15 @@ class _Expanding(Transformer):
         """
         what: str = type(self).__name__
         allowed: frozenset[str] = _HANDLE_UNKNOWN | ({"indicator"} if self.kernel_id == "one_hot_encode" else set())
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, what)
+        self.columns: list[str] | None = _optional_columns(columns, what)
         if not isinstance(use_cat_names, bool):
             raise TypeError(f"{what}: use_cat_names must be True or False, got {use_cat_names!r}")
         self.use_cat_names: bool = use_cat_names
         self.handle_unknown: str = _one_of(handle_unknown, allowed, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the encoding kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "use_cat_names": self.use_cat_names,
@@ -1148,17 +1099,12 @@ class _Positional(Transformer):
 
         """
         what: str = type(self).__name__
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, what)
+        self.columns: list[str] | None = _optional_columns(columns, what)
         self.handle_unknown: str = _one_of(handle_unknown, _POSITIONAL_UNKNOWN, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the encoding kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "handle_unknown": self.handle_unknown,
@@ -1231,13 +1177,8 @@ class BaseNEncoder(_Positional):
         if self.base < 1:
             raise ValueError(f"BaseNEncoder: base must be 1 or more, got {base!r}")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the basen_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {**super().params(), "base": self.base}
 
 
@@ -1303,17 +1244,12 @@ class _Contrast(Transformer):
 
         """
         what: str = type(self).__name__
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, what)
+        self.columns: list[str] | None = _optional_columns(columns, what)
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN | {"indicator"}, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the contrast kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "handle_unknown": self.handle_unknown,
@@ -1454,13 +1390,8 @@ class HashingEncoder(Transformer):
             raise ValueError(f"HashingEncoder: hash_method must be 'md5', got {hash_method!r}")
         self.hash_method: str = hash_method
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the hash_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "n_components": self.n_components, "hash_method": self.hash_method}
 
     @property
@@ -1523,15 +1454,11 @@ class _TargetBlend(Transformer):
         what: str = type(self).__name__
         if not isinstance(target, str) or not target:
             raise TypeError(f"{what}: target must be a column name, got {target!r}")
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, what)
+        self.columns: list[str] | None = _optional_columns(columns, what)
         _target_outside(target, self.columns, what)
-        if handle_unknown not in _HANDLE_UNKNOWN:
-            raise ValueError(f"{what}: handle_unknown must be one of {sorted(_HANDLE_UNKNOWN)}, got {handle_unknown!r}")
-        if handle_missing not in _HANDLE_MISSING:
-            raise ValueError(f"{what}: handle_missing must be one of {sorted(_HANDLE_MISSING)}, got {handle_missing!r}")
         self.target: str = target
-        self.handle_unknown: str = handle_unknown
-        self.handle_missing: str = handle_missing
+        self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, what, "handle_unknown")
+        self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
     def _shared_params(self) -> dict[str, Any]:
         """Parameters every kernel in the family takes.
@@ -1657,13 +1584,8 @@ class TargetEncoder(_TargetBlend):
         self.min_samples_leaf: int = _integer(min_samples_leaf, "TargetEncoder: min_samples_leaf")
         self.smoothing: float = _positive(smoothing, "TargetEncoder: smoothing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the target_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return self._shared_params() | {"min_samples_leaf": self.min_samples_leaf, "smoothing": self.smoothing}
 
 
@@ -1722,13 +1644,8 @@ class MEstimateEncoder(_TargetBlend):
             raise ValueError(f"MEstimateEncoder: m must be a finite number >= 0, got {m!r}")
         self.m: float = float(m)
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the m_estimate_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return self._shared_params() | {"m": self.m}
 
 
@@ -1785,13 +1702,8 @@ class WOEEncoder(_TargetBlend):
         super().__init__(target, columns, handle_unknown, handle_missing)
         self.regularization: float = _positive(regularization, "WOEEncoder: regularization")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the woe_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return self._shared_params() | {"regularization": self.regularization}
 
 
@@ -1832,25 +1744,16 @@ class _ShrinkageEncoder(Transformer):
 
         """
         what: str = type(self).__name__
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, what)
+        self.columns: list[str] | None = _optional_columns(columns, what)
         if not isinstance(target, str) or not target:
             raise TypeError(f"{what}: target must be a column name, got {target!r}")
         _target_outside(target, self.columns, what)
-        if handle_unknown not in _HANDLE_UNKNOWN:
-            raise ValueError(f"{what}: handle_unknown must be one of {sorted(_HANDLE_UNKNOWN)}, got {handle_unknown!r}")
-        if handle_missing not in _HANDLE_MISSING:
-            raise ValueError(f"{what}: handle_missing must be one of {sorted(_HANDLE_MISSING)}, got {handle_missing!r}")
         self.target: str = target
-        self.handle_unknown: str = handle_unknown
-        self.handle_missing: str = handle_missing
+        self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, what, "handle_unknown")
+        self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters shared by the shrinkage encoders.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "target": self.target,
@@ -1949,17 +1852,10 @@ class JamesSteinEncoder(_ShrinkageEncoder):
                 "optimizer leaves behind, so it is not reproducible from the formula and not portable; "
                 f"choose one of {sorted(JAMES_STEIN_MODELS)}"
             )
-        if model not in JAMES_STEIN_MODELS:
-            raise ValueError(f"JamesSteinEncoder: model must be one of {sorted(JAMES_STEIN_MODELS)}, got {model!r}")
-        self.model: str = model
+        self.model: str = _one_of(model, JAMES_STEIN_MODELS, "JamesSteinEncoder", "model")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the james_stein_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {**super().params(), "model": self.model}
 
 
@@ -2063,13 +1959,8 @@ class CatBoostEncoder(_ShrinkageEncoder):
             raise ValueError(f"CatBoostEncoder: a must be a finite number >= 0, got {a!r}")
         self.a: float = float(a)
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the cat_boost_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {**super().params(), "a": self.a}
 
 
@@ -2137,27 +2028,6 @@ def _smoothing(m: object, what: str) -> float:
     return float(m)
 
 
-def _handling(option: object, accepted: frozenset[str], what: str, key: str) -> str:
-    """Validate one of the unknown/missing strategies the supervised encoders share.
-
-    Args:
-        option: The value passed for the strategy.
-        accepted: The strategies this argument accepts.
-        what: The transformer name, for the error message.
-        key: The argument name, for the error message.
-
-    Returns:
-        The strategy.
-
-    Raises:
-        ValueError: If the strategy is not one of the accepted values.
-
-    """
-    if option not in accepted:
-        raise ValueError(f"{what}: {key} must be one of {sorted(accepted)}, got {option!r}")
-    return str(option)
-
-
 class QuantileEncoder(Transformer):
     """Categorical utf8 -> a quantile of the target, shrunk toward the global quantile.
 
@@ -2216,20 +2086,15 @@ class QuantileEncoder(Transformer):
 
         """
         self.target: str = _target(target, "QuantileEncoder")
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, "QuantileEncoder")
+        self.columns: list[str] | None = _optional_columns(columns, "QuantileEncoder")
         _target_outside(self.target, self.columns, "QuantileEncoder")
         self.quantile: float = _quantile(quantile, "QuantileEncoder", "quantile")
         self.m: float = _smoothing(m, "QuantileEncoder")
-        self.handle_unknown: str = _handling(handle_unknown, _HANDLE_UNKNOWN, "QuantileEncoder", "handle_unknown")
-        self.handle_missing: str = _handling(handle_missing, _HANDLE_MISSING, "QuantileEncoder", "handle_missing")
+        self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, "QuantileEncoder", "handle_unknown")
+        self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, "QuantileEncoder", "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the quantile_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "target": self.target,
@@ -2319,7 +2184,7 @@ class SummaryEncoder(Transformer):
 
         """
         self.target: str = _target(target, "SummaryEncoder")
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, "SummaryEncoder")
+        self.columns: list[str] | None = _optional_columns(columns, "SummaryEncoder")
         _target_outside(self.target, self.columns, "SummaryEncoder")
         if isinstance(quantiles, str) or not isinstance(quantiles, (list, tuple)) or not quantiles:
             raise TypeError(f"SummaryEncoder: quantiles must be a non-empty list of numbers, got {quantiles!r}")
@@ -2328,16 +2193,11 @@ class SummaryEncoder(Transformer):
         if len(set(percentiles)) != len(percentiles):
             raise ValueError(f"SummaryEncoder: two quantiles round to the same percentile, got {self.quantiles!r}")
         self.m: float = _smoothing(m, "SummaryEncoder")
-        self.handle_unknown: str = _handling(handle_unknown, _HANDLE_UNKNOWN, "SummaryEncoder", "handle_unknown")
-        self.handle_missing: str = _handling(handle_missing, _HANDLE_MISSING, "SummaryEncoder", "handle_missing")
+        self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, "SummaryEncoder", "handle_unknown")
+        self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, "SummaryEncoder", "handle_missing")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the summary_encode kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "target": self.target,
@@ -2444,7 +2304,7 @@ class _Scaler(Transformer):
             ValueError: If columns is empty.
 
         """
-        self.columns: list[str] | None = None if columns is None else _column_list(columns, type(self).__name__)
+        self.columns: list[str] | None = _optional_columns(columns, type(self).__name__)
 
     @property
     def scale_(self) -> dict[str, float]:
@@ -2505,13 +2365,8 @@ class StandardScaler(_Scaler):
         self.with_mean: bool = _flag(with_mean, "StandardScaler", "with_mean")
         self.with_std: bool = _flag(with_std, "StandardScaler", "with_std")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the standard_scale kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "with_mean": self.with_mean, "with_std": self.with_std}
 
     @property
@@ -2599,13 +2454,8 @@ class MinMaxScaler(_Scaler):
         self.feature_range: tuple[float, float] = (low, high)
         self.clip: bool = _flag(clip, "MinMaxScaler", "clip")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the min_max_scale kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "feature_range": list(self.feature_range), "clip": self.clip}
 
     @property
@@ -2692,13 +2542,8 @@ class MaxAbsScaler(_Scaler):
         super().__init__(columns)
         self.clip: bool = _flag(clip, "MaxAbsScaler", "clip")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the max_abs_scale kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "clip": self.clip}
 
     @property
@@ -2755,13 +2600,8 @@ class Binarizer(Transformer):
         self.columns: list[str] = _column_list(columns, "Binarizer")
         self.threshold: float = _finite(threshold, "Binarizer", "threshold")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the binarize kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "threshold": self.threshold}
 
 
@@ -2807,13 +2647,8 @@ class Normalizer(Transformer):
         self.columns: list[str] = _column_list(columns, "Normalizer")
         self.norm: str = _one_of(norm, NORMS, "Normalizer", "norm")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the normalize kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "norm": self.norm}
 
 
@@ -2836,25 +2671,6 @@ _QUANTILE_METHODS: frozenset[str] = frozenset(
         "normal_unbiased",
     }
 )
-
-
-def _boolean(value: object, what: str) -> bool:
-    """Validate a flag, refusing the truthy values that are not bools.
-
-    Args:
-        value: The value passed for the flag.
-        what: What the value is, for the error message.
-
-    Returns:
-        The flag.
-
-    Raises:
-        TypeError: If the value is not a bool.
-
-    """
-    if not isinstance(value, bool):
-        raise TypeError(f"{what} must be True or False, got {value!r}")
-    return value
 
 
 def _percentile_range(value: object, what: str) -> tuple[float, float]:
@@ -2882,24 +2698,6 @@ def _percentile_range(value: object, what: str) -> tuple[float, float]:
     if not 0.0 <= bounds[0] <= bounds[1] <= 100.0:
         raise ValueError(f"{what}: quantile_range must satisfy 0 <= q_min <= q_max <= 100, got {value!r}")
     return bounds[0], bounds[1]
-
-
-def _numeric_columns(columns: object, what: str) -> list[str] | None:
-    """Validate the ``columns`` argument the sklearn.preprocessing ports share.
-
-    Args:
-        columns: The value passed for ``columns``; None binds every numeric column.
-        what: The transformer name, for the error message.
-
-    Returns:
-        The column names, or None.
-
-    Raises:
-        TypeError: If columns is a bare string or holds non-strings.
-        ValueError: If columns is empty.
-
-    """
-    return None if columns is None else _column_list(columns, what)
 
 
 class RobustScaler(Transformer):
@@ -2960,10 +2758,10 @@ class RobustScaler(Transformer):
                 not ``0 < q_min < q_max < 100`` or ``q_min / 100`` rounds to 0.
 
         """
-        self.columns: list[str] | None = _numeric_columns(columns, "RobustScaler")
-        self.with_centering: bool = _boolean(with_centering, "RobustScaler: with_centering")
-        self.with_scaling: bool = _boolean(with_scaling, "RobustScaler: with_scaling")
-        self.unit_variance: bool = _boolean(unit_variance, "RobustScaler: unit_variance")
+        self.columns: list[str] | None = _optional_columns(columns, "RobustScaler")
+        self.with_centering: bool = _flag(with_centering, "RobustScaler", "with_centering")
+        self.with_scaling: bool = _flag(with_scaling, "RobustScaler", "with_scaling")
+        self.unit_variance: bool = _flag(unit_variance, "RobustScaler", "unit_variance")
         self.quantile_range: tuple[float, float] = _percentile_range(quantile_range, "RobustScaler")
         q_min, q_max = self.quantile_range
         if self.unit_variance and not 0.0 < q_min < q_max < 100.0:
@@ -2974,13 +2772,8 @@ class RobustScaler(Transformer):
         if self.unit_variance and q_min / 100.0 == 0.0:
             raise ValueError(f"RobustScaler: unit_variance needs q_min / 100 above 0, and {q_min!r} / 100 rounds to 0")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the robust_scale kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "with_centering": self.with_centering,
@@ -3065,7 +2858,7 @@ class QuantileTransformer(Transformer):
                 values.
 
         """
-        self.columns: list[str] | None = _numeric_columns(columns, "QuantileTransformer")
+        self.columns: list[str] | None = _optional_columns(columns, "QuantileTransformer")
         self.n_quantiles: int = _integer(n_quantiles, "QuantileTransformer: n_quantiles")
         if not 1 <= self.n_quantiles <= MAX_QUANTILES:
             raise ValueError(
@@ -3075,13 +2868,8 @@ class QuantileTransformer(Transformer):
             output_distribution, _OUTPUT_DISTRIBUTIONS, "QuantileTransformer", "output_distribution"
         )
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the quantile_transform kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "n_quantiles": self.n_quantiles,
@@ -3195,7 +2983,7 @@ class KBinsDiscretizer(Transformer):
                 4096, or an option is not one of the accepted values.
 
         """
-        self.columns: list[str] | None = _numeric_columns(columns, "KBinsDiscretizer")
+        self.columns: list[str] | None = _optional_columns(columns, "KBinsDiscretizer")
         self.n_bins: int = _integer(n_bins, "KBinsDiscretizer: n_bins")
         if not 2 <= self.n_bins <= MAX_OUTPUTS:
             raise ValueError(f"KBinsDiscretizer: n_bins must be between 2 and {MAX_OUTPUTS}, got {n_bins!r}")
@@ -3203,13 +2991,8 @@ class KBinsDiscretizer(Transformer):
         self.strategy: str = _one_of(strategy, _KBINS_STRATEGIES, "KBinsDiscretizer", "strategy")
         self.quantile_method: str = _one_of(quantile_method, _QUANTILE_METHODS, "KBinsDiscretizer", "quantile_method")
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the k_bins_discretize kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "n_bins": self.n_bins,
@@ -3378,13 +3161,8 @@ class PolynomialFeatures(Transformer):
                 "PolynomialFeatures: column '1' has the bias column's name; rename it or set include_bias=False"
             )
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the polynomial_features kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "degree": self.degree if isinstance(self.degree, int) else list(self.degree),
@@ -3543,13 +3321,8 @@ class SplineTransformer(Transformer):
                 f"than the {MAX_OUTPUTS} columns allowed"
             )
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the spline_transform kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {
             "columns": self.columns,
             "n_knots": self.n_knots,
@@ -3653,13 +3426,8 @@ class PowerTransformer(Transformer):
             raise TypeError(f"PowerTransformer: standardize must be True or False, got {standardize!r}")
         self.standardize: bool = standardize
 
+    @override
     def params(self) -> dict[str, Any]:
-        """Kernel parameters for the power_transform kernel.
-
-        Returns:
-            The declarative parameter mapping.
-
-        """
         return {"columns": self.columns, "method": self.method, "standardize": self.standardize}
 
     @property
