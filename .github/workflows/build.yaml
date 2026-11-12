@@ -25,7 +25,10 @@ concurrency:
 
 jobs:
   Test:
-    runs-on: ubuntu-latest
+    # The image release.yaml builds on, named so that a new ubuntu-latest
+    # cannot change what CI tests. On ubuntu-26.04 the dependency build stops
+    # at snappy 1.2.2, which does not compile with that image's g++-14.
+    runs-on: ubuntu-24.04
     # A cold Arrow build takes about 45 minutes and a warm run about 17. The
     # default is six hours, which a hung test would otherwise spend.
     timeout-minutes: 90
@@ -82,7 +85,7 @@ jobs:
   # this one runs the Python suite against the other build, the only place a
   # test that the bindings release the GIL can fail.
   Standard-CPython:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       CC: gcc-14
@@ -121,7 +124,7 @@ jobs:
   # than on every pull request.
   Thread-sanitizer:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       CC: gcc-14
