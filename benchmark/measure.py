@@ -18,6 +18,12 @@ import pyarrow.parquet as pq
 
 REPEATS: int = 7
 ROW_GROUP_SIZE: int = 500_000
+LOW_DICTIONARY_LIMIT: int = 248 * 1024
+# The sink writes each part through a buffer of this size (``kPartBufferBytes``
+# in ``src/fastfeaturetransform/io.cpp``). pyarrow opens a path without one
+# and hands the file every page header and every page body in a write call of
+# its own, so the write-back opens its parts through the same buffer.
+PART_BUFFER_BYTES: int = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,47 @@ def dictionary_columns(schema: pa.Schema) -> list[str]:
     return [field.name for field in schema if not pa.types.is_floating(field.type)]
 
 
+def dictionary_page_limit(schema: pa.Schema) -> int | None:
+    """Return the dictionary page limit the sink writes a table of this schema with.
+
+    ``PartWriter`` lowers Arrow's limit of 1 MiB to 248 KiB when every column
+    is an integer, a float, a bool, a date, a time, a timestamp, a duration,
+    or a dictionary of strings or bytes, and keeps Arrow's limit when any
+    column is something else (``suits_low_dictionary_limit`` in
+    ``src/fastfeaturetransform/io.cpp``). A matched write-back has to do the
+    same: at 1 MiB pyarrow hashes every value of a column of distinct
+    integers into a dictionary, work the sink stops at 248 KiB.
+
+    Args:
+        schema: The output schema about to be written.
+
+    Returns:
+        The limit in bytes, or None to keep Arrow's.
+
+    """
+
+    def suits(kind: pa.DataType) -> bool:
+        if pa.types.is_dictionary(kind):
+            values: pa.DataType = kind.value_type
+            return (
+                pa.types.is_string(values)
+                or pa.types.is_large_string(values)
+                or pa.types.is_binary(values)
+                or pa.types.is_large_binary(values)
+            )
+        return (
+            pa.types.is_integer(kind)
+            or pa.types.is_floating(kind)
+            or pa.types.is_boolean(kind)
+            or pa.types.is_date(kind)
+            or pa.types.is_time(kind)
+            or pa.types.is_timestamp(kind)
+            or pa.types.is_duration(kind)
+        )
+
+    return LOW_DICTIONARY_LIMIT if all(suits(field.type) for field in schema) else None
+
+
 def as_table(output: Any) -> pa.Table:
     """Convert an upstream transform's output into the Arrow table a Parquet write needs.
 
@@ -189,11 +236,13 @@ def write_parts(table: pa.Table, directory: Path, layout: Sequence[tuple[int, in
 
     It writes the parts and row groups ``layout`` describes (see
     ``sink_layout``) with the settings ``PartWriter`` uses: Snappy
-    compression, Parquet format 2.6, no stored Arrow schema, and dictionary
-    encoding off for floats and on for everything else. Our sink also deletes
-    the directory's existing part files when a run starts and writes each part
-    under a temporary name and renames it; this does neither, since both cost
-    a few file operations per part, not per row.
+    compression, Parquet format 2.6, no stored Arrow schema, dictionary
+    encoding off for floats and on for everything else, the sink's
+    dictionary page limit (see ``dictionary_page_limit``), and the sink's
+    write buffer of ``PART_BUFFER_BYTES`` in front of each file. Our sink also
+    deletes the directory's existing part files when a run starts and writes
+    each part under a temporary name and renames it; this does neither, since
+    both cost a few file operations per part, not per row.
 
     Args:
         table: The values to write.
@@ -209,17 +258,20 @@ def write_parts(table: pa.Table, directory: Path, layout: Sequence[tuple[int, in
         raise ValueError(f"the layout covers {covered:,} rows, the table has {table.num_rows:,}")
     directory.mkdir(parents=True, exist_ok=True)
     dictionary: list[str] = dictionary_columns(table.schema)
+    limit: int | None = dictionary_page_limit(table.schema)
     start: int = 0
     for index, (rows, row_group_rows) in enumerate(layout):
-        pq.write_table(
-            table.slice(start, rows),
-            directory / f"part-{index:05d}.parquet",
-            row_group_size=row_group_rows,
-            compression="snappy",
-            use_dictionary=dictionary,
-            version="2.6",
-            store_schema=False,
-        )
+        with pa.output_stream(directory / f"part-{index:05d}.parquet", buffer_size=PART_BUFFER_BYTES) as part:
+            pq.write_table(
+                table.slice(start, rows),
+                part,
+                row_group_size=row_group_rows,
+                compression="snappy",
+                use_dictionary=dictionary,
+                dictionary_pagesize_limit=limit,
+                version="2.6",
+                store_schema=False,
+            )
         start += rows
 
 

@@ -96,6 +96,23 @@ def _column_facts(path: Path) -> list[tuple[Any, ...]]:
     return facts
 
 
+def _stored_bytes(path: Path, column: str) -> tuple[int, int]:
+    """Return the stored size of a column's dictionary page and of its whole chunk in a file's first row group.
+
+    Args:
+        path: The Parquet file to describe.
+        column: The column's name.
+
+    Returns:
+        The bytes from the dictionary page to the first data page, which follows it, and the bytes of every page of
+        the chunk, as compressed in the file.
+
+    """
+    group = pq.ParquetFile(path).metadata.row_group(0)
+    chunk = next(group.column(i) for i in range(group.num_columns) if group.column(i).path_in_schema == column)
+    return chunk.data_page_offset - chunk.dictionary_page_offset, chunk.total_compressed_size
+
+
 def _row_groups(path: Path) -> list[int]:
     """List the row counts of a Parquet file's row groups, in order.
 
@@ -150,6 +167,119 @@ def test_dictionary_columns_follows_the_sinks_float_rule():
         [("f64", pa.float64()), ("f32", pa.float32()), ("tag", pa.string()), ("n", pa.int64()), ("flag", pa.bool_())]
     )
     assert MEASURE.dictionary_columns(schema) == ["tag", "n", "flag"]
+
+
+def test_dictionary_page_limit_follows_the_sinks_rule() -> None:
+    lowered: pa.Schema = pa.schema(
+        [
+            ("i8", pa.int8()),
+            ("i16", pa.int16()),
+            ("i32", pa.int32()),
+            ("i64", pa.int64()),
+            ("u8", pa.uint8()),
+            ("u16", pa.uint16()),
+            ("u32", pa.uint32()),
+            ("u64", pa.uint64()),
+            ("f16", pa.float16()),
+            ("f32", pa.float32()),
+            ("f64", pa.float64()),
+            ("flag", pa.bool_()),
+            ("date32", pa.date32()),
+            ("date64", pa.date64()),
+            ("time32", pa.time32("ms")),
+            ("time64", pa.time64("us")),
+            ("timestamp", pa.timestamp("us")),
+            ("duration", pa.duration("us")),
+            ("text", pa.dictionary(pa.int32(), pa.string())),
+            ("large_text", pa.dictionary(pa.int32(), pa.large_string())),
+            ("bytes", pa.dictionary(pa.int8(), pa.binary())),
+            ("large_bytes", pa.dictionary(pa.int32(), pa.large_binary())),
+        ]
+    )
+    assert MEASURE.dictionary_page_limit(lowered) == 248 * 1024
+    for name in lowered.names:
+        assert MEASURE.dictionary_page_limit(pa.schema([lowered.field(name)])) == 248 * 1024, name
+    kept: list[pa.DataType] = [
+        pa.string(),
+        pa.large_string(),
+        pa.binary(),
+        pa.binary(16),
+        pa.decimal128(38, 4),
+        pa.list_(pa.int64()),
+        pa.list_(pa.float32(), 8),
+        pa.struct([("n", pa.int64())]),
+        pa.dictionary(pa.int32(), pa.int64()),
+    ]
+    # One such column keeps Arrow's limit wherever it stands, last or first.
+    for kind in kept:
+        other: pa.Field = pa.field("other", kind)
+        assert MEASURE.dictionary_page_limit(lowered.append(other)) is None, kind
+        assert MEASURE.dictionary_page_limit(lowered.insert(0, other)) is None, kind
+
+
+# The sink is the reference: one table goes through it and through the
+# write-back, and its column of distinct integers has to come out of both the
+# same size. Beside numbers that is 248 KiB of dictionary and the rest of the
+# rows whole; beside a plain string, a decimal or a list it is every value in
+# the dictionary, because one such column keeps Arrow's 1 MiB for the part.
+@pytest.mark.parametrize("beside", ["numbers", "plain string", "decimal", "list"])
+def test_write_parts_lowers_the_dictionary_limit_when_the_sink_does(tmp_path: Path, beside: str) -> None:
+    rows: int = 65_536
+    rng = np.random.default_rng(4)
+    ids: np.ndarray = rng.integers(-(2**62), 2**62, rows, dtype=np.int64)
+    assert len(np.unique(ids)) == rows
+    small: np.ndarray = np.arange(rows) % 7
+    options: dict[str, Any] = {}
+    if beside == "numbers":
+        columns: dict[str, Any] = {"x": rng.normal(size=rows), "flag": small > 3, "n": small.astype(np.int32)}
+    elif beside == "plain string":
+        # Delta-encoded strings reach the sink as plain strings, as the write-back's are.
+        columns = {"other": pa.array([f"s{value}" for value in small])}
+        options = {"use_dictionary": ["id"], "column_encoding": {"other": "DELTA_BYTE_ARRAY"}}
+    elif beside == "decimal":
+        columns = {"other": pa.array(small).cast(pa.decimal128(38, 2))}
+    else:
+        columns = {"other": pa.ListArray.from_arrays(np.arange(rows + 1, dtype=np.int32), pa.array(small))}
+    table: pa.Table = pa.table({"id": ids, **columns})
+    source: Path = tmp_path / "in.parquet"
+    pq.write_table(table, source, **options)
+
+    ours: list[Path] = (
+        Select(columns=table.column_names)
+        .fit([str(source)])
+        .transform_parquet([str(source)], output_dir=tmp_path / "ours")
+    )
+    MEASURE.write_parts(table, tmp_path / "theirs", MEASURE.sink_layout(ours))
+    theirs: list[Path] = sorted((tmp_path / "theirs").glob("*.parquet"))
+
+    assert [path.name for path in theirs] == [path.name for path in ours] == ["part-00000.parquet"]
+    assert _row_groups(ours[0]) == _row_groups(theirs[0]) == [rows]
+    ours_dictionary, ours_chunk = _stored_bytes(ours[0], "id")
+    theirs_dictionary, theirs_chunk = _stored_bytes(theirs[0], "id")
+    assert (ours_dictionary < 256 * 1024) == (beside == "numbers")
+    assert (ours_dictionary >= 8 * rows) == (beside != "numbers")
+    assert abs(theirs_dictionary - ours_dictionary) < 0.01 * ours_dictionary
+    assert abs(theirs_chunk - ours_chunk) < 0.01 * ours_chunk
+
+
+def test_write_parts_opens_each_part_through_a_buffer_as_large_as_the_sinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The sink writes each part through a 64 KiB buffer. pyarrow writes a path without one, so write_parts opens
+    # every part itself. The buffer changes the write calls the file sees and not its bytes, so the test watches how
+    # each part is opened, and reads the table back.
+    opened: list[tuple[str, int | None]] = []
+    open_stream = pa.output_stream
+
+    def watched(source: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append((Path(source).name, kwargs.get("buffer_size")))
+        return open_stream(source, *args, **kwargs)
+
+    monkeypatch.setattr(pa, "output_stream", watched)
+    table: pa.Table = pa.table({"x": np.arange(6)})
+    MEASURE.write_parts(table, tmp_path, [(4, 2), (2, 2)])
+    assert opened == [("part-00000.parquet", 64 * 1024), ("part-00001.parquet", 64 * 1024)]
+    assert pa.concat_tables([pq.read_table(tmp_path / name) for name, _ in opened]).equals(table)
 
 
 def test_read_matrix_does_not_copy_a_one_column_file(tmp_path):

@@ -3,7 +3,9 @@
 #include <arrow/api.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
+#include <arrow/io/buffered.h>
 #include <arrow/io/file.h>
+#include <arrow/io/interfaces.h>
 #include <arrow/table.h>
 #include <arrow/type_traits.h>
 #include <arrow/util/int_util.h>
@@ -631,11 +633,64 @@ std::unique_ptr<RecordBatchSource> open_source(const std::vector<std::string>& f
   return std::make_unique<ParquetSource>(files, workers);
 }
 
+namespace {
+
+// The Parquet writer hands its sink every page header and every page body in
+// a write of its own, and asks for the position before each page. The buffer
+// gathers them into write calls of up to 64 KiB; a single write of 64 KiB or
+// more still goes straight to the file. A write the disk refuses is
+// therefore reported up to 64 KiB of output later, and for a part smaller
+// than the buffer only when finish() closes the file.
+constexpr int64_t kPartBufferBytes = 64 * 1024;
+
+// The dictionary page limit of a part in which every column passes
+// suits_low_dictionary_limit. Arrow's writer hashes each column of plain
+// values into a dictionary and gives the dictionary up for plain pages only
+// when its page reaches a limit, 1 MiB by default. A row group here holds at
+// most 65,536 rows, so a column of distinct 8-byte values (an id, a
+// timestamp) never reaches 1 MiB: it is written as a dictionary of every
+// value plus an index per row, which is larger than the values. The writer
+// checks the limit after each batch of at most 1,024 values, so under
+// 248 KiB a dictionary of 8-byte values ends with at most 32,767 entries,
+// one fewer than the 32,768 at which the encoder's hash table grows fourfold.
+//
+// Measured against the 1 MiB limit on an Apple M4, with a transform that
+// passes one i64 column through on one thread, in row groups of 65,536 rows:
+// distinct values take 0.57 to 0.74 of the time and 0.83 to 0.90 of the
+// bytes (at 256 KiB, 0.77 to 0.88 of the time), and a row group of at most
+// 31,743 distinct values is written byte for byte as under 1 MiB. The cost
+// is a row group of 31,744 to about 55,000 distinct values: its rows after
+// the limit are written whole, though the dictionary would have held them.
+// It is up to 13% larger with the values in random order (38,000 distinct),
+// and up to 54% larger when the distinct values come first and the rest
+// repeat them (32,000 distinct).
+constexpr int64_t kLowDictionaryLimit = 248 * 1024;
+
+// Whether the lower limit suits a column of this type. An integer, a date, a
+// time, a timestamp and a duration are stored as 4 or 8 bytes; a float and a
+// bool are written without a dictionary; a dictionary of strings or bytes is
+// written as the dictionary it already is, whatever the limit. A plain
+// string, a decimal and a list keep Arrow's limit: with 248 KiB forced on
+// them, 36-character strings of 8,000 distinct values take 3.8 times the
+// bytes, decimals of 20,000 distinct values 1.6 times and lists of integers
+// drawn from 100,000 values 1.4 times (row groups of 65,536 rows).
+bool suits_low_dictionary_limit(const arrow::DataType& type) {
+  const arrow::Type::type id = type.id();
+  if (id == arrow::Type::DICTIONARY) {
+    return arrow::is_base_binary_like(static_cast<const arrow::DictionaryType&>(type).value_type()->id());
+  }
+  return arrow::is_integer(id) || arrow::is_floating(id) || id == arrow::Type::BOOL || id == arrow::Type::TIMESTAMP ||
+         id == arrow::Type::DATE32 || id == arrow::Type::DATE64 || id == arrow::Type::TIME32 ||
+         id == arrow::Type::TIME64 || id == arrow::Type::DURATION;
+}
+
+}  // namespace
+
 struct PartWriter::Impl {
   std::string path, temp;
   int64_t expected_rows = 0, rows = 0;
   std::shared_ptr<arrow::Schema> schema;
-  std::shared_ptr<arrow::io::FileOutputStream> output;
+  std::shared_ptr<arrow::io::OutputStream> output;  // the part file behind its write buffer
   std::unique_ptr<parquet::arrow::FileWriter> writer;
   bool finished = false, abandoned = false, owns_temp = false;
 };
@@ -682,6 +737,14 @@ void PartWriter::append(const Batch& batch) {
       state.schema = std::move(schema);
       parquet::WriterProperties::Builder properties;
       properties.compression(parquet::Compression::SNAPPY);
+      // The limit is one setting for the whole file, so it is lowered only
+      // when that suits every column.
+      const arrow::FieldVector& columns = state.schema->fields();
+      if (std::all_of(columns.begin(), columns.end(), [](const std::shared_ptr<arrow::Field>& column) {
+            return suits_low_dictionary_limit(*column->type());
+          })) {
+        properties.dictionary_pagesize_limit(kLowDictionaryLimit);
+      }
       // Floats rarely repeat, so a dictionary of them costs time and space.
       // Encoding settings name Parquet leaves, and the floats of a list or
       // struct column sit below its name ("emb.list.element"), so the leaves
@@ -697,10 +760,13 @@ void PartWriter::append(const Batch& batch) {
           properties.disable_dictionary(leaf.path());
         }
       }
-      auto output = arrow::io::FileOutputStream::Open(state.temp);
-      if (!output.ok()) throw Error(state.temp + ": " + output.status().ToString());
-      state.output = *output;
+      auto file = arrow::io::FileOutputStream::Open(state.temp);
+      if (!file.ok()) throw Error(state.temp + ": " + file.status().ToString());
+      state.output = *file;
       state.owns_temp = true;
+      auto buffered = arrow::io::BufferedOutputStream::Create(kPartBufferBytes, arrow::default_memory_pool(), *file);
+      if (!buffered.ok()) throw Error(state.temp + ": " + buffered.status().ToString());
+      state.output = *buffered;
       auto writer = parquet::arrow::FileWriter::Open(*state.schema, arrow::default_memory_pool(), state.output,
                                                      properties.build());
       if (!writer.ok()) throw Error(state.path + ": " + writer.status().ToString());
@@ -744,6 +810,9 @@ std::string PartWriter::finish() {
     auto status = state.writer->Close();
     if (!status.ok()) throw Error(state.path + ": " + status.ToString());
     state.writer.reset();
+    // Closing writes the bytes still in the buffer, then closes the file. A
+    // part smaller than the buffer reaches the disk only here, so a write
+    // the disk refuses fails this call and the part is not published.
     status = state.output->Close();
     if (!status.ok()) throw Error(state.path + ": " + status.ToString());
     state.output.reset();
@@ -771,6 +840,10 @@ void PartWriter::abandon() noexcept {
     state.writer.reset();
   }
   if (state.output) {
+    // The file is removed below, so a buffer that cannot be written is not
+    // an error here. Closing explicitly matters: Arrow's stream closes
+    // itself when destroyed, and a debug build of Arrow aborts the process
+    // if that close fails.
     try {
       (void)state.output->Close();
     } catch (...) {
