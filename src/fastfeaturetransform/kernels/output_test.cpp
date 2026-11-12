@@ -9,16 +9,23 @@
 #include <bit>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
 #include <set>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "fastfeaturetransform/kernel.hpp"
 #include "fastfeaturetransform/kernels/categories.hpp"
 #include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
+#include "fastfeaturetransform/kernels/util.hpp"
 #include "fastfeaturetransform/test_support.hpp"
 
 namespace fft = fastfeaturetransform;
@@ -707,6 +714,193 @@ TEST_CASE("wide record bindings retain caller key order and fitted validation or
   *fft::row_find(input, "c30") = int64_t{1};
   std::erase_if(input, [](const auto& field) { return field.first == "c73"; });
   REQUIRE_THROWS_WITH(kernel->transform_row(input), ContainsSubstring("key 'c30' must be a string or null"));
+}
+
+namespace {
+
+// A field name that counts how often it is read as text. A record lookup
+// reads a name once for each comparison it makes with it, so the count is
+// the number of fields a lookup tried.
+struct CountedName {
+  std::string text;
+  static inline std::size_t reads = 0;
+  operator std::string_view() const {  // NOLINT(google-explicit-constructor): read wherever a name is
+    ++reads;
+    return text;
+  }
+};
+using CountedRecord = std::vector<std::pair<CountedName, fft::RowValue>>;
+using Counts = std::vector<std::size_t>;
+
+// Fields f0, f1, ... in that order, each holding its own position.
+CountedRecord counted_record(std::size_t fields) {
+  CountedRecord record;
+  for (std::size_t i = 0; i < fields; ++i) {
+    record.emplace_back(CountedName{"f" + std::to_string(i)}, static_cast<int64_t>(i));
+  }
+  return record;
+}
+
+// Looks `names` up in this order through one lookup and returns how many
+// fields each of them compared. Every answer is checked against a plain
+// search of the record, which reads no name through the counter.
+Counts comparisons(CountedRecord& record, const std::vector<std::string>& names) {
+  fft::RecordLookup lookup(record, names.size());
+  Counts counts;
+  for (const std::string& name : names) {
+    const auto field =
+        std::find_if(record.begin(), record.end(), [&](const auto& entry) { return entry.first.text == name; });
+    CountedName::reads = 0;
+    const fft::RowValue* found = lookup.find(name);
+    counts.push_back(CountedName::reads);
+    REQUIRE(found == (field == record.end() ? nullptr : &field->second));
+  }
+  return counts;
+}
+
+}  // namespace
+
+TEST_CASE("a record lookup compares one name for each field read in the record's order") {
+  CountedRecord record = counted_record(6);
+  REQUIRE(comparisons(record, {"f0", "f1", "f2", "f3", "f4", "f5"}) == Counts{1, 1, 1, 1, 1, 1});
+  // A run that begins inside the record pays one scan to reach it.
+  REQUIRE(comparisons(record, {"f3", "f4", "f5"}) == Counts{4, 1, 1});
+  // A gap pays the field tried first and then the scan.
+  REQUIRE(comparisons(record, {"f0", "f2", "f3", "f5"}) == Counts{1, 4, 1, 7});
+}
+
+TEST_CASE("a record lookup pays one comparison more than a scan at most in any other order") {
+  CountedRecord record = counted_record(6);
+  // Reversed: the first two lookups have no field to try first, one before
+  // any hit and one after a hit on the last field.
+  REQUIRE(comparisons(record, {"f5", "f4", "f3", "f2", "f1", "f0"}) == Counts{6, 5, 5, 4, 3, 2});
+  REQUIRE(comparisons(record, {"f3", "f0", "f5", "f1", "f4", "f2"}) == Counts{4, 2, 7, 2, 6, 4});
+  // The last field, then the first: the scan finds it at once, and the
+  // field after it is tried first again.
+  REQUIRE(comparisons(record, {"f5", "f0", "f1"}) == Counts{6, 1, 1});
+  // A name asked twice is found by the scan the second time.
+  REQUIRE(comparisons(record, {"f2", "f2", "f3"}) == Counts{3, 4, 1});
+  // A miss between two hits leaves the field to try where it was.
+  REQUIRE(comparisons(record, {"f0", "absent", "f1"}) == Counts{1, 7, 1});
+}
+
+// A step of one column builds a lookup for one name. Trying a field before
+// any hit would cost it a second comparison of the first field whenever its
+// column is another one.
+TEST_CASE("a record lookup's first name costs the scan alone") {
+  CountedRecord record = counted_record(6);
+  for (std::size_t i = 0; i < record.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE(comparisons(record, {record[i].first.text}) == Counts{i + 1});
+  }
+  REQUIRE(comparisons(record, {"absent"}) == Counts{6});
+}
+
+TEST_CASE("a record lookup answers as a plain search does for every sequence of names") {
+  CountedRecord record = counted_record(5);
+  const std::vector<std::string> names{"f0", "f1", "f2", "f3", "f4", "absent"};
+  // Every sequence of one to four lookups, repeats and misses included.
+  for (std::size_t length = 1; length <= 4; ++length) {
+    std::size_t sequences = 1;
+    for (std::size_t i = 0; i < length; ++i) sequences *= names.size();
+    for (std::size_t code = 0; code < sequences; ++code) {
+      std::vector<std::size_t> picks;
+      for (std::size_t rest = code; picks.size() < length; rest /= names.size()) picks.push_back(rest % names.size());
+      std::vector<std::string> sequence;
+      for (const std::size_t pick : picks) sequence.push_back(names[pick]);
+      const Counts counts = comparisons(record, sequence);
+      std::optional<std::size_t> hit;  // the field the previous hit was on
+      for (std::size_t i = 0; i < length; ++i) {
+        CAPTURE(code, i);
+        // What a search from the first field compares: every field up to
+        // the name's own, or all five for a name the record lacks.
+        const std::size_t scan = std::min(picks[i] + 1, record.size());
+        // A field is tried first when one follows the previous hit.
+        const bool tries = hit.has_value() && *hit + 1 < record.size();
+        if (tries && picks[i] == *hit + 1) {
+          REQUIRE(counts[i] == 1);
+        } else {
+          REQUIRE(counts[i] == scan + (tries ? 1 : 0));
+        }
+        if (picks[i] < record.size()) hit = picks[i];
+      }
+    }
+  }
+}
+
+TEST_CASE("a record lookup finds each field of a record whatever order they are asked in") {
+  fft::Row record{{"", std::monostate{}},         {"ab", int64_t{1}},
+                  {"price", std::string("p")},    {"prize", true},
+                  {"a_name_of_twenty_one!", 5.0}, {"a_name_of_twenty_one?", 6.0}};
+  std::vector<std::size_t> order(record.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  do {
+    fft::RecordLookup lookup(record, order.size());
+    for (const std::size_t index : order) REQUIRE(lookup.find(record[index].first) == &record[index].second);
+  } while (std::next_permutation(order.begin(), order.end()));
+  // A step writes its result through what it finds.
+  const fft::RecordLookup lookup(record, 3);
+  REQUIRE(lookup.find("Price") == nullptr);
+  *lookup.find("price") = int64_t{3};
+  *lookup.find("prize") = std::monostate{};
+  REQUIRE(std::get<int64_t>(record[2].second) == 3);
+  REQUIRE(std::holds_alternative<std::monostate>(record[3].second));
+}
+
+TEST_CASE("a record lookup tells names of one size apart by any of their bytes") {
+  for (std::size_t size = 1; size <= 40; ++size) {
+    CAPTURE(size);
+    // The name itself, then one field for each byte another name differs in.
+    const std::string name(size, 'n');
+    fft::Row record{{name, int64_t{-1}}};
+    for (std::size_t byte = 0; byte < size; ++byte) {
+      std::string other = name;
+      other[byte] = 'm';
+      record.emplace_back(other, static_cast<int64_t>(byte));
+    }
+    // In the record's order each name after the first is the field tried
+    // first. Last field first, each is compared with the field after the
+    // previous hit, which is another name, and then scanned for.
+    fft::RecordLookup forward(record, record.size());
+    for (std::size_t i = 0; i < record.size(); ++i) REQUIRE(forward.find(record[i].first) == &record[i].second);
+    fft::RecordLookup backward(record, record.size());
+    for (std::size_t i = record.size(); i-- > 0;) REQUIRE(backward.find(record[i].first) == &record[i].second);
+    std::string absent = name;
+    absent[size / 2] = 'o';
+    REQUIRE(backward.find(absent) == nullptr);
+    REQUIRE(backward.find(name + "n") == nullptr);
+  }
+}
+
+TEST_CASE("a record lookup indexes a record of 128 fields that is read 16 times") {
+  std::vector<std::string> names;
+  for (std::size_t i = 0; i < 16; ++i) names.push_back("f" + std::to_string(127 - 5 * i));
+  // Through the index a lookup compares no name of the record, in any order.
+  CountedRecord wide = counted_record(128);
+  REQUIRE(comparisons(wide, names) == Counts(16, 0));
+  // One lookup or one field fewer keeps the linear lookup, which scans to
+  // the last field for the first name.
+  REQUIRE(comparisons(wide, std::vector<std::string>(names.begin(), names.begin() + 15)).front() == 128);
+  CountedRecord narrower = counted_record(127);
+  names.front() = "f126";
+  REQUIRE(comparisons(narrower, names).front() == 127);
+}
+
+TEST_CASE("a record lookup answers with one field of a name the record holds twice") {
+  fft::Row record{{"a", int64_t{1}}, {"b", int64_t{2}}, {"a", int64_t{3}}};
+  // The scan answers with the first of the two.
+  fft::RecordLookup scan(record, 1);
+  REQUIRE(scan.find("a") == &record[0].second);
+  // The field after the previous hit is tried first, and here it is the
+  // second of the two.
+  fft::RecordLookup cursor(record, 2);
+  REQUIRE(cursor.find("b") == &record[1].second);
+  REQUIRE(cursor.find("a") == &record[2].second);
+  // The index keeps the first, whatever was found before.
+  for (int i = 0; i < 126; ++i) record.emplace_back("f" + std::to_string(i), int64_t{0});
+  fft::RecordLookup indexed(record, 16);
+  REQUIRE(indexed.find("b") == &record[1].second);
+  REQUIRE(indexed.find("a") == &record[0].second);
 }
 
 TEST_CASE("cached BaseN words retain binary indicator spelling for Gray codes") {

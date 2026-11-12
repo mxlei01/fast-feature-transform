@@ -151,6 +151,98 @@ def test_cast_refuses_lossy_or_unlisted_conversions(tmp_path: Path) -> None:
         Cast({"nope": "i64"}).fit([path])
 
 
+# Every refusal the cast table has for a value: the target, the type and the
+# value it refuses, and its text after the place it names. The record path
+# builds its place, "<stage>: key '<name>'", only for a refused value, so each
+# text is held to the batch path's, which names the column instead of the key.
+_REFUSALS: list[tuple[str, pa.DataType, Any, str]] = [
+    ("i8", pa.int64(), 300, "value 300 does not fit in i8"),
+    ("u8", pa.int64(), -1, "value -1 does not fit in u8"),
+    ("i64", pa.float64(), 1.5, "value 1.5 is not a whole number"),
+    ("i64", pa.float64(), float("nan"), "value nan is not a whole number"),
+    ("i64", pa.float64(), 1e19, "value 1e+19 does not fit in a 64-bit integer"),
+    ("i64", pa.string(), "12x", "'12x' is not an integer"),
+    ("i64", pa.string(), "1\x002", "'1\x002' is not an integer"),
+    ("i64", pa.string(), "9223372036854775808", "'9223372036854775808' does not fit in a 64-bit integer"),
+    (
+        "f64",
+        pa.int64(),
+        TWO_POW_53 + 1,
+        "value 9007199254740993 is beyond 2^53 in magnitude, where f64 no longer holds every integer exactly",
+    ),
+    (
+        "f32",
+        pa.int64(),
+        2**24 + 1,
+        "value 16777217 is beyond 2^24 in magnitude, where f32 no longer holds every integer exactly",
+    ),
+    ("f32", pa.float64(), 1e39, "value 1e+39 does not fit in f32"),
+    ("f64", pa.string(), "two", "'two' is not a number"),
+    ("f64", pa.string(), "1e400", "'1e400' is out of range for f64"),
+    (
+        "utf8",
+        pa.float64(),
+        2.0,
+        "cannot cast a float to utf8 (a float has no single spelling; cast to an integer first)",
+    ),
+    ("utf8", pa.bool_(), True, "cannot cast a bool to utf8"),
+    ("f64", pa.bool_(), True, "cannot cast a bool to f64"),
+]
+
+
+@pytest.mark.parametrize(
+    ("target", "source", "value", "text"), _REFUSALS, ids=[f"{case[0]} from {case[2]!r}" for case in _REFUSALS]
+)
+def test_a_refused_record_value_names_its_stage_and_key_and_reads_as_the_batch_path_does(
+    target: str, source: pa.DataType, value: Any, text: str, tmp_path: Path
+) -> None:
+    accepted: str = _write(
+        tmp_path / "accepted.parquet", pa.table({"kept": pa.array([1], pa.int64()), "n": pa.array([1], pa.int64())})
+    )
+    refused: str = _write(
+        tmp_path / "refused.parquet", pa.table({"kept": pa.array([1], pa.int64()), "n": pa.array([value], source)})
+    )
+    # Cast walks its columns in sorted order, so the refused one is its second:
+    # the key a message names is the refused value's, not the first one's.
+    pipeline: Pipeline = Pipeline([("types", Cast({"kept": "i64", "n": target}))]).fit([accepted])
+    with pytest.raises(EngineError) as record_error:
+        pipeline.transform_dict({"n": value, "kept": 1})
+    assert str(record_error.value) == f"types: key 'n': {text}"
+    with pytest.raises(EngineError) as batch_error:
+        pipeline.transform_parquet([refused], output_dir=tmp_path / "out")
+    assert str(batch_error.value) == f"types: column 'n': {text}"
+
+
+def test_a_refused_record_value_spells_its_stage_and_key_in_full(tmp_path: Path) -> None:
+    key: str = "prix d'été"
+    path: str = _write(tmp_path / "t.parquet", pa.table({key: pa.array([1], pa.int64())}))
+    nested: Pipeline = Pipeline([("outer", Pipeline([("it's", Cast({key: "i8"}))]))]).fit([path])
+    with pytest.raises(EngineError) as nested_error:
+        nested.transform_dict({key: 300})
+    assert str(nested_error.value) == f"outer.it's: key '{key}': value 300 does not fit in i8"
+    alone: Cast = Cast({key: "i8"}).fit([path])
+    with pytest.raises(EngineError) as alone_error:
+        alone.transform_dict({key: -300})
+    assert str(alone_error.value) == f"cast: key '{key}': value -300 does not fit in i8"
+
+
+def test_cast_names_the_refused_key_among_several_and_refuses_no_null(tmp_path: Path) -> None:
+    columns: list[str] = ["a", "b", "c"]
+    path: str = _write(tmp_path / "t.parquet", pa.table({column: pa.array([1], pa.int64()) for column in columns}))
+    pipeline: Pipeline = Pipeline([("types", Cast(dict.fromkeys(columns, "i8")))]).fit([path])
+    for refused in columns:
+        # The record's keys are not in the order Cast walks its columns in.
+        record: dict[str, Any] = {"c": 1, "a": 2, "b": 3} | {refused: 300}
+        with pytest.raises(EngineError) as error:
+            pipeline.transform_dict(record)
+        assert str(error.value) == f"types: key '{refused}': value 300 does not fit in i8"
+    with pytest.raises(EngineError) as missing:
+        pipeline.transform_dict({"c": 1, "a": 2})
+    assert str(missing.value) == "types: key 'b' missing from record"
+    for target in ("utf8", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"):
+        assert Cast({"a": target}).fit([path]).transform_dict({"a": None, "b": 7}) == {"a": None, "b": 7}
+
+
 def test_cast_survives_artifacts_and_pickle(tmp_path: Path) -> None:
     path: str = _write(tmp_path / "t.parquet", pa.table({"user_id": pa.array([3, 4], pa.int32()), "p": [1.0, 2.0]}))
     pipeline: Pipeline = Pipeline(
