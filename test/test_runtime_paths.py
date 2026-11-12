@@ -1,5 +1,6 @@
 """Runtime boundaries: direct training output, error reporting, output directories, and concurrency."""
 
+import itertools
 import json
 import pickle
 import threading
@@ -459,17 +460,18 @@ def large_artifact(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root / "artifact"
 
 
-def _wakeups_during(call: Callable[[], object]) -> tuple[int, float]:
-    """Run a call while another thread wakes every millisecond, and count its wake-ups inside the call.
+def _longest_pause_during(call: Callable[[], object]) -> tuple[float, float]:
+    """Run a call while another thread wakes every millisecond, and find the longest time that thread slept in it.
 
-    Holding the GIL for the whole call leaves the other thread no wake-ups at
-    all; releasing it leaves roughly one per millisecond.
+    Holding the GIL for the whole call keeps the other thread asleep for all of
+    it; releasing it lets that thread wake about every millisecond.
 
     Args:
         call: The call to measure.
 
     Returns:
-        The other thread's wake-ups during the call, and the call's duration in milliseconds.
+        The longest stretch of the call in which the other thread did not wake, and the call's duration, both in
+        milliseconds.
 
     """
     wakeups: list[float] = []
@@ -490,7 +492,8 @@ def _wakeups_during(call: Callable[[], object]) -> tuple[int, float]:
     finally:
         stop.set()
         ticker.join()
-    return sum(start < wakeup < end for wakeup in wakeups), (end - start) * 1e3
+    inside: list[float] = [start, *(wakeup for wakeup in wakeups if start < wakeup < end), end]
+    return max(later - earlier for earlier, later in itertools.pairwise(inside)) * 1e3, (end - start) * 1e3
 
 
 @pytest.mark.parametrize("operation", ["save", "load", "pickle.dumps", "pickle.loads", "stages_state"])
@@ -507,11 +510,14 @@ def test_artifact_calls_let_other_threads_run(large_artifact: Path, tmp_path: Pa
         "pickle.loads": lambda: pickle.loads(payload).transform_dict({"key": "key-0000001"}),
         "stages_state": pipeline.stages_state,
     }
-    wakeups, duration = _wakeups_during(calls[operation])
-    # Holding the GIL leaves no wake-ups at all. Releasing it leaves about one
-    # per millisecond, but a loaded machine can stretch a 1 ms sleep past 4 ms,
-    # so one per 20 ms is required.
-    assert wakeups >= duration / 20, f"{operation}: another thread woke {wakeups} times in {duration:.0f} ms"
+    longest, duration = _longest_pause_during(calls[operation])
+    # Holding the GIL keeps the other thread asleep for the whole call.
+    # Releasing it lets that thread wake every 1.3 ms at most on an idle
+    # machine (measured on an Apple M4). A loaded machine stretches the
+    # sleeps: a macOS release runner woke only 22 times in a 622 ms save, one
+    # per 28 ms. So the bound is half the call, which a call that holds the
+    # GIL cannot meet however fast or slow the machine is.
+    assert longest < duration / 2, f"{operation}: another thread slept {longest:.0f} ms of a {duration:.0f} ms call"
 
 
 @pytest.mark.parametrize("kind", ["parquet", "memmap", "convert"])
