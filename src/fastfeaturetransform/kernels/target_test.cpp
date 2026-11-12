@@ -9,6 +9,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "fastfeaturetransform/kernel.hpp"
 #include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
@@ -17,6 +18,7 @@
 namespace fft = fastfeaturetransform;
 using Catch::Approx;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Equals;
 using fft::testing::make_batch;
 using fft::testing::numeric_column;
 using fft::testing::utf8_column;
@@ -259,6 +261,60 @@ TEST_CASE("the target-mean family refuses an encoding that is not finite") {
       ContainsSubstring("must be a finite number"));
 }
 
+// A row whose target is null teaches nothing, even when its category is the
+// null one: the fit is the same without it.
+TEST_CASE("every target encoder skips a null whose target is null") {
+  const auto batch = [](bool targetless) {
+    std::vector<std::optional<std::string>> keys{"a", "a", "b", "b", std::nullopt, std::nullopt};
+    std::vector<std::optional<int64_t>> targets{1, 0, 1, 0, 1, 1};
+    if (targetless) {
+      keys.emplace_back(std::nullopt);
+      targets.emplace_back(std::nullopt);
+    }
+    return make_batch({"c", "y"}, {utf8_column(keys), numeric_column<arrow::Int64Type>(targets)});
+  };
+  const nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+  for (const char* id : {"target_encode", "m_estimate_encode", "woe_encode", "james_stein_encode",
+                         "leave_one_out_encode", "cat_boost_encode"}) {
+    CAPTURE(id);
+    REQUIRE(fit_blend(id, params, kSchema, {batch(true)})->state() ==
+            fit_blend(id, params, kSchema, {batch(false)})->state());
+  }
+}
+
+// The fit computes the null category's value only when it keeps it, under
+// handle_missing='value', so a value that would not be finite fails the fit
+// under that option alone.
+TEST_CASE("a target encoder encodes the null category only where it keeps it") {
+  // cat_boost_encode: a and b are singletons, which take the prior, 25, and
+  // the null category's (70 + 25 * 1e308) / (2 + 1e308) is not finite.
+  const fft::Batch boost = make_batch({"c", "y"}, {utf8_column({"a", "b", std::nullopt, std::nullopt}),
+                                                   numeric_column<arrow::Int64Type>({10, 20, 30, 40})});
+  // woe_encode: the null category holds no 1s, and 5e-324 / 2 rounds to 0.
+  const fft::Batch woe = make_batch({"c", "y"}, {utf8_column({"a", "b", "c", "c", std::nullopt, std::nullopt}),
+                                                 numeric_column<arrow::Int64Type>({1, 0, 1, 0, 0, 0})});
+  struct Case {
+    const char* id;
+    nlohmann::json param;
+    fft::Batch batch;
+    const char* refused;
+  };
+  const Case cases[] = {
+      {"cat_boost_encode", {{"a", 1e308}}, boost, "encodes to a value that is not finite; check 'a'"},
+      {"woe_encode", {{"regularization", 5e-324}}, woe, "weight of evidence is not finite; check 'regularization'"}};
+  for (const Case& entry : cases) {
+    CAPTURE(entry.id);
+    nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+    params.update(entry.param);
+    REQUIRE_THROWS_WITH(fit_blend(entry.id, params, kSchema, {entry.batch}), ContainsSubstring(entry.refused));
+    params["handle_missing"] = "return_nan";
+    auto kernel = fit_blend(entry.id, params, kSchema, {entry.batch});
+    REQUIRE(kernel->state().at("null_values").at("c").is_null());
+    REQUIRE(std::holds_alternative<std::monostate>(
+        kernel->transform_row({{"c", fft::RowValue(std::monostate{})}})[0].second));
+  }
+}
+
 // REGRESSION: 'error' is the strict option, so it refuses a null at transform
 // as well as at fit.
 TEST_CASE("the target-mean family refuses a null at transform under handle_missing error") {
@@ -368,5 +424,100 @@ TEST_CASE("target-mean dictionary fits exclude null-target rows and preserve exa
       REQUIRE_THROWS_WITH(loaded->transform(make_batch({"c"}, {bad.encoded})),
                           ContainsSubstring("was not seen at fit"));
     }
+  }
+}
+
+// An f64 holds every second integer above 2^53 and every 1,024th above 2^62,
+// so these targets sum to small numbers only while every value is whole.
+TEST_CASE("every target encoder sums an integer target above 2^53 whole") {
+  const int64_t big = int64_t{1} << 62;
+  // a: 2 over four rows, or 0 once big + 1 is rounded to big. b: 4 over
+  // three rows, or 3. The fit: 6 over seven rows, or 3.
+  const fft::Batch first = make_batch(
+      {"c", "y"},
+      {utf8_column({"a", "a", "b", "a"}), numeric_column<arrow::Int64Type>({big + 1, -big, big + 1, big + 1})});
+  const fft::Batch second =
+      make_batch({"c", "y"}, {utf8_column({"a", "b", "b"}), numeric_column<arrow::Int64Type>({-big, -big, 3})});
+  // Under these params each kernel's value is the category's plain mean:
+  // target_encode's weight rounds to 1 once (n - min_samples_leaf) / smoothing
+  // passes 53 ln 2, about 36.7, and james_stein_encode keeps the mean of each
+  // of two categories.
+  const std::pair<const char*, nlohmann::json> cases[] = {
+      {"target_encode", {{"min_samples_leaf", -100}, {"smoothing", 1.0}}},
+      {"m_estimate_encode", {{"m", 0.0}}},
+      {"james_stein_encode", nlohmann::json::object()},
+      {"leave_one_out_encode", nlohmann::json::object()},
+      {"cat_boost_encode", {{"a", 0.0}}}};
+  for (const auto& [id, extra] : cases) {
+    CAPTURE(id);
+    nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+    params.update(extra);
+    auto kernel = fit_blend(id, params, kSchema, {first, second});
+    const nlohmann::json state = kernel->state();
+    REQUIRE(state.at("prior").get<double>() == 6.0 / 7.0);
+    REQUIRE(state.at("values").at("c").at("a").get<double>() == 0.5);
+    REQUIRE(state.at("values").at("c").at("b").get<double>() == 4.0 / 3.0);
+    REQUIRE(fit_blend(id, params, kSchema, {second, first})->state() == state);
+  }
+
+  // woe_encode needs a target of two values, one at most 0 and one at least
+  // 1. A category of as many rows of each sums to its count of the larger
+  // one: its odds are then the fit's, and its weight of evidence is 0.
+  const fft::Batch binary =
+      make_batch({"c", "y"}, {utf8_column({"a", "a", "b", "a", "b", "a"}),
+                              numeric_column<arrow::Int64Type>({big + 1, -big, big + 1, big + 1, -big, -big})});
+  auto woe = fit_blend("woe_encode", {{"columns", {"c"}}, {"target", "y"}}, kSchema, {binary});
+  REQUIRE(woe->state().at("prior").get<double>() == 0.5);
+  REQUIRE(woe->state().at("values").at("c") == nlohmann::json({{"a", 0.0}, {"b", 0.0}}));
+
+  // Three rows of the largest i64 sum past what 64 bits hold.
+  const int64_t most = std::numeric_limits<int64_t>::max();
+  const fft::Batch wide =
+      make_batch({"c", "y"}, {utf8_column({"a", "a", "a"}), numeric_column<arrow::Int64Type>({most, most, most})});
+  for (const char* id :
+       {"target_encode", "m_estimate_encode", "james_stein_encode", "leave_one_out_encode", "cat_boost_encode"}) {
+    CAPTURE(id);
+    auto kernel = fit_blend(id, {{"columns", {"c"}}, {"target", "y"}}, kSchema, {wide});
+    REQUIRE(kernel->state().at("prior").get<double>() == 0x1p63);
+  }
+}
+
+TEST_CASE("a float target fits below its kernel's magnitude bound and is refused from it") {
+  struct Bound {
+    const char* id;
+    double bound;
+    const char* refused;  // the bound as the message prints it, and the rest of the message
+  };
+  const char* sum =
+      "8.452712498170644e+270 is 2^900 or more in magnitude, more than a sum can hold (scale the target first)";
+  const char* squares =
+      "2.9073548971824276e+135 is 2^450 or more in magnitude, more than the squared sums can hold (scale the target "
+      "first)";
+  // james_stein_encode keeps the sum of the target's squares, so its bound is
+  // the square root of the others'.
+  const Bound bounds[] = {
+      {"target_encode", 0x1p900, sum},        {"m_estimate_encode", 0x1p900, sum},
+      {"woe_encode", 0x1p900, sum},           {"james_stein_encode", 0x1p450, squares},
+      {"leave_one_out_encode", 0x1p900, sum}, {"cat_boost_encode", 0x1p900, sum},
+  };
+  const fft::Schema schema{{{"c", "utf8"}, {"y", "f64"}}};
+  const nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+  // Two values, 0 and one that is at least 1 or refused, so that woe_encode
+  // reads the same batches as the others.
+  auto batch = [](double value) {
+    return make_batch({"c", "y"},
+                      {utf8_column({"a", "a", "b", "b"}), numeric_column<arrow::DoubleType>({value, 0.0, value, 0.0})});
+  };
+  for (const Bound& entry : bounds) {
+    CAPTURE(entry.id);
+    const double inside = std::nextafter(entry.bound, 0.0);
+    REQUIRE(fit_blend(entry.id, params, schema, {batch(inside)})->state().at("prior").get<double>() == inside / 2);
+    REQUIRE_THROWS_WITH(fit_blend(entry.id, params, schema, {batch(entry.bound)}),
+                        Equals(std::string("blend: target column 'y': value ") + entry.refused));
+    REQUIRE_THROWS_WITH(fit_blend(entry.id, params, schema, {batch(-entry.bound)}),
+                        Equals(std::string("blend: target column 'y': value -") + entry.refused));
+    // Nothing is refused between 2^450, where james_stein_encode stops, and
+    // 2^900.
+    if (entry.bound == 0x1p900) REQUIRE_NOTHROW(fit_blend(entry.id, params, schema, {batch(0x1p450)}));
   }
 }

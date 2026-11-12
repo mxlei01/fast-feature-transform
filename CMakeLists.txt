@@ -133,7 +133,6 @@ add_library(fftcore STATIC
   src/fastfeaturetransform/kernels/group_agg.cpp
   src/fastfeaturetransform/kernels/hash.cpp
   src/fastfeaturetransform/kernels/target.cpp
-  src/fastfeaturetransform/kernels/shrinkage.cpp
   src/fastfeaturetransform/kernels/quantile.cpp
   src/fastfeaturetransform/kernels/scale.cpp
   src/fastfeaturetransform/kernels/binning.cpp
