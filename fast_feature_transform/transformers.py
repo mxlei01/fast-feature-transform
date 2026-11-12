@@ -5,13 +5,14 @@ C++ core. After fit, fitted state lives in C++ and the properties here are
 read-only views of it.
 """
 
+import contextlib
 import itertools
 import json
 import math
 import operator
 import os
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Self, overload
 
@@ -91,6 +92,32 @@ def _source_paths(X: object) -> list[str]:
             raise TypeError(f"X must be a list of Parquet paths; element {item!r} is a {type(item).__name__}")
         paths.append(os.fspath(item))
     return paths
+
+
+@contextlib.contextmanager
+def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
+    """Give a batch call the directory it writes into.
+
+    Args:
+        output_dir: The caller's directory, or None for a new temporary one.
+
+    Yields:
+        The directory's path. A temporary directory made here is removed
+        again if the call raises.
+
+    """
+    if output_dir is not None:
+        yield str(output_dir)
+        return
+    created: str = tempfile.mkdtemp(prefix="fast_feature_transform_")
+    try:
+        yield created
+    except BaseException:
+        # A call that fails leaves no file behind, so the directory is empty,
+        # and rmdir removes nothing else.
+        with contextlib.suppress(OSError):
+            os.rmdir(created)
+        raise
 
 
 def _check_threads(threads: int) -> int:
@@ -280,9 +307,9 @@ class Transformer:
         Args:
             X: List of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted. Existing ``part-NNNNN.parquet`` files
-                in it are replaced once the run starts, and a run that fails
-                midway leaves none.
+                is created when omitted, and removed again if the run fails.
+                Existing ``part-NNNNN.parquet`` files in it are replaced once
+                the run starts, and a run that fails midway leaves none.
 
         Returns:
             The paths of the part files written, one per input row group, in
@@ -297,8 +324,8 @@ class Transformer:
 
         """
         handle: _core.FittedPipeline = self._standalone_handle()
-        out_dir: str = str(output_dir) if output_dir is not None else tempfile.mkdtemp(prefix="fast_feature_transform_")
-        return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
+        with _output_directory(output_dir) as out_dir:
+            return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
 
     def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
         """Transform Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
