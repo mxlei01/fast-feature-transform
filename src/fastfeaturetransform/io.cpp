@@ -39,6 +39,51 @@
 namespace fastfeaturetransform {
 namespace {
 
+std::shared_ptr<arrow::DataType> without_dictionaries(const std::shared_ptr<arrow::DataType>& type);
+
+arrow::FieldVector fields_without_dictionaries(const arrow::DataType& type) {
+  arrow::FieldVector fields;
+  for (const std::shared_ptr<arrow::Field>& field : type.fields()) {
+    fields.push_back(field->WithType(without_dictionaries(field->type())));
+  }
+  return fields;
+}
+
+// A list, struct or map type with every dictionary inside it replaced by the
+// type of its values; null for any other type. Whether a string is read as a
+// dictionary follows from how its file stored it (dictionary_readable below),
+// so a tag that kept the dictionary would name the storage.
+// REGRESSION: two files that hold the same list of strings, one in
+// dictionary pages and one in delta pages, have one tag and are read
+// together. The tag used to be the Arrow type's own name, dictionary and
+// all, and the second file was refused as holding another type.
+std::shared_ptr<arrow::DataType> nested_without_dictionaries(const arrow::DataType& type) {
+  switch (type.id()) {
+    case arrow::Type::LIST:
+      return arrow::list(fields_without_dictionaries(type).front());
+    case arrow::Type::LARGE_LIST:
+      return arrow::large_list(fields_without_dictionaries(type).front());
+    case arrow::Type::FIXED_SIZE_LIST:
+      return arrow::fixed_size_list(fields_without_dictionaries(type).front(),
+                                    static_cast<const arrow::FixedSizeListType&>(type).list_size());
+    case arrow::Type::STRUCT:
+      return arrow::struct_(fields_without_dictionaries(type));
+    case arrow::Type::MAP:
+      return std::make_shared<arrow::MapType>(fields_without_dictionaries(type).front(),
+                                              static_cast<const arrow::MapType&>(type).keys_sorted());
+    default:
+      return nullptr;
+  }
+}
+
+std::shared_ptr<arrow::DataType> without_dictionaries(const std::shared_ptr<arrow::DataType>& type) {
+  if (type->id() == arrow::Type::DICTIONARY) {
+    return without_dictionaries(static_cast<const arrow::DictionaryType&>(*type).value_type());
+  }
+  std::shared_ptr<arrow::DataType> nested = nested_without_dictionaries(*type);
+  return nested ? nested : type;
+}
+
 std::string type_tag(const arrow::DataType& type) {
   switch (type.id()) {
     case arrow::Type::DICTIONARY:
@@ -81,8 +126,10 @@ std::string type_tag(const arrow::DataType& type) {
       return (element.id() == arrow::Type::TIMESTAMP ? element.ToString() : type_tag(element)) + "[" +
              std::to_string(list.list_size()) + "]";
     }
-    default:
-      return type.ToString();
+    default: {
+      const std::shared_ptr<arrow::DataType> nested = nested_without_dictionaries(type);
+      return nested ? nested->ToString() : type.ToString();
+    }
   }
 }
 
