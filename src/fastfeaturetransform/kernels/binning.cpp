@@ -3,8 +3,9 @@
 // needs every value of a column, so all three sit in the buffered tier with
 // group_agg's median and quantile_encode: each worker keeps every value it
 // reads, spilling past the shared fit memory budget, until finalize merges
-// them and reads the order statistics it needs. That accumulator, the numpy
-// quantile methods and the inverse normal CDF they draw on live here too.
+// them and reads the order statistics it needs. That accumulator is
+// numeric.hpp's Values; the numpy quantile methods and the inverse normal CDF
+// they draw on live here.
 //
 // k_bins_discretize(strategy="uniform") is the one exception: its edges are
 // linspace(min, max, n_bins + 1), a plain min/max monoid, so it turns the
@@ -372,19 +373,6 @@ std::optional<double> row_number(const RowValue& value, const std::string& stage
   throw Error(stage + ": key '" + name + "' must be a number or null");
 }
 
-// NaN and infinity are refused wherever these kernels read a value, at fit
-// and at transform alike: a null is how a missing value is spelled here (it
-// is what upstream's NaN maps onto), a fitted table has to be finite to be
-// JSON, and the quantile interpolation has no answer for a value that
-// compares false against every bound it is given. Callers build `where` only
-// on this path, so the hot loop pays a single isfinite. Only a step that
-// passes a null through adds 'write a missing value as a null' to the
-// message; k_bins_discretize refuses a null too.
-[[noreturn]] void refuse_non_finite(double value, const std::string& where, bool null_passes = true) {
-  throw Error(where + ": value " + std::format("{}", value) +
-              (null_passes ? " is not finite; write a missing value as a null" : " is not finite"));
-}
-
 // A number the fit computed. Every input value is finite, but the midpoint or
 // the interpolation of two enormous ones can still overflow and come out
 // infinite or NaN, and an artifact must never carry either: state() would
@@ -394,89 +382,6 @@ double fitted_number(double value, const std::string& stage, const std::string& 
     throw Error(stage + ": column '" + name + "' fits a " + what + " that is not finite; its values are too large");
   }
   return value;
-}
-
-// One worker's view of the fit columns: every non-null value when the kernel
-// buffers, and the extremes and counts always. The buffers spill past the
-// fit memory budget; k_bins_discretize(strategy="uniform") leaves them empty.
-struct Values final : AccState {
-  std::unordered_map<std::string, SpillVector<double>> buffers;
-  std::unordered_map<std::string, double> low;
-  std::unordered_map<std::string, double> high;
-  std::unordered_map<std::string, int64_t> counts;  // non-null values
-  std::unordered_map<std::string, int64_t> nulls;
-  int64_t rows = 0;
-};
-
-void consume_values(const std::vector<std::string>& columns, const std::string& stage, bool buffering, bool null_passes,
-                    Values& state, const Batch& batch) {
-  state.rows += batch.rows;
-  for (const std::string& name : columns) {
-    SpillVector<double>& buffer = state.buffers[name];
-    auto low = state.low.find(name);
-    if (low == state.low.end()) low = state.low.emplace(name, std::numeric_limits<double>::infinity()).first;
-    auto high = state.high.find(name);
-    if (high == state.high.end()) high = state.high.emplace(name, -std::numeric_limits<double>::infinity()).first;
-    int64_t& counted = state.counts[name];
-    int64_t& nulls = state.nulls[name];
-    const arrow::Array& array = column_array(batch, stage, name);
-    for_each_numeric(array, stage, name, [&](int64_t, bool is_null, double value) {
-      if (is_null) {
-        ++nulls;
-        return;
-      }
-      if (!std::isfinite(value)) refuse_non_finite(value, stage + ": column '" + name + "'", null_passes);
-      if (value == 0.0) value = 0.0;  // one zero: -0.0 would make the sorted buffer depend on the split
-      ++counted;
-      low->second = std::min(low->second, value);
-      high->second = std::max(high->second, value);
-      if (buffering) buffer.push_back(value);
-    });
-  }
-}
-
-// Fold every worker into the first, freeing each as it is consumed, then sort
-// each buffer unless the caller selects its own ranks: a sorted concatenation
-// is the same sequence however the rows were split, so every quantile below
-// is split-independent.
-std::unique_ptr<Values> merge_values(std::vector<std::unique_ptr<AccState>>& states, bool sort = true) {
-  std::unique_ptr<Values> merged;
-  for (auto& raw : states) {
-    if (raw == nullptr) continue;
-    if (merged == nullptr) {
-      merged.reset(static_cast<Values*>(raw.release()));
-      continue;
-    }
-    auto& from = static_cast<Values&>(*raw);
-    merged->rows += from.rows;
-    for (auto& [name, buffer] : from.buffers) {
-      merged->buffers[name].append(std::move(buffer));
-    }
-    for (const auto& [name, value] : from.low) {
-      auto found = merged->low.find(name);
-      if (found == merged->low.end()) {
-        merged->low.emplace(name, value);
-      } else {
-        found->second = std::min(found->second, value);
-      }
-    }
-    for (const auto& [name, value] : from.high) {
-      auto found = merged->high.find(name);
-      if (found == merged->high.end()) {
-        merged->high.emplace(name, value);
-      } else {
-        found->second = std::max(found->second, value);
-      }
-    }
-    for (const auto& [name, count] : from.counts) merged->counts[name] += count;
-    for (const auto& [name, count] : from.nulls) merged->nulls[name] += count;
-    raw.reset();
-  }
-  if (merged == nullptr) merged = std::make_unique<Values>();
-  if (sort) {
-    for (auto& [name, buffer] : merged->buffers) buffer.sort();
-  }
-  return merged;
 }
 
 // The per-column list a state() object writes and load_state reads back.
@@ -606,7 +511,7 @@ class RobustScale final : public Kernel {
   std::unique_ptr<AccState> make_state() const override { return std::make_unique<Values>(); }
 
   void consume(AccState& raw, const Batch& batch) const override {
-    consume_values(columns_, stage, centering_ || scaling_, true, static_cast<Values&>(raw), batch);
+    consume_values(columns_, stage, centering_ || scaling_, true, false, static_cast<Values&>(raw), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
@@ -826,7 +731,7 @@ class QuantileTransform final : public Kernel {
   std::unique_ptr<AccState> make_state() const override { return std::make_unique<Values>(); }
 
   void consume(AccState& raw, const Batch& batch) const override {
-    consume_values(columns_, stage, true, true, static_cast<Values&>(raw), batch);
+    consume_values(columns_, stage, true, true, false, static_cast<Values&>(raw), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
@@ -1122,7 +1027,7 @@ class KBinsDiscretize final : public Kernel {
   std::unique_ptr<AccState> make_state() const override { return std::make_unique<Values>(); }
 
   void consume(AccState& raw, const Batch& batch) const override {
-    consume_values(columns_, stage, strategy_ != Strategy::Uniform, false, static_cast<Values&>(raw), batch);
+    consume_values(columns_, stage, strategy_ != Strategy::Uniform, false, false, static_cast<Values&>(raw), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
@@ -1575,7 +1480,10 @@ class KBinsDiscretize final : public Kernel {
       const std::size_t from = static_cast<std::size_t>(point.label);
       (void)sums[from].add(-point.value);
       --sizes[from];
-      sums[empty[slot]].clear();
+      // Upstream sets the empty cluster's sum to the point. Adding it does
+      // the same: that sum is still the zero it was cleared to, since
+      // assign() gave the cluster no point and a point leaves only the
+      // cluster assign() gave it.
       (void)sums[empty[slot]].add(point.value);
       sizes[empty[slot]] = 1;
     }

@@ -160,86 +160,25 @@ class CountEncode final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
-  struct State final : AccState {
-    std::unordered_map<std::string, StringCounts> counts;
-    std::unordered_map<std::string, int64_t> nulls;  // column -> null count
-    int64_t rows = 0;
-  };
-
-  std::unique_ptr<AccState> make_state() const override { return std::make_unique<State>(); }
+  std::unique_ptr<AccState> make_state() const override { return std::make_unique<SeenState>(); }
 
   void consume(AccState& raw, const Batch& batch) const override {
-    auto& state = static_cast<State&>(raw);
-    state.rows += batch.rows;
-    for (const std::string& name : columns_) {
-      const int idx = batch.find(name);
-      if (idx < 0) throw Error(stage + ": column '" + name + "' missing from batch");
-      auto& counts = state.counts[name];
-      int64_t& nulls = state.nulls[name];
-      const arrow::Array& array = *batch.cols[static_cast<std::size_t>(idx)];
-      if (array.type_id() != arrow::Type::DICTIONARY) {
-        for_each_utf8_value(array, stage, name, [&](int64_t, bool is_null, std::string_view value) {
-          if (is_null) {
-            ++nulls;
-            return;
-          }
-          auto found = counts.find(value);
-          if (found != counts.end()) {
-            ++found->second;
-          } else {
-            counts.emplace(std::string(value), 1);
-          }
-        });
-        continue;
-      }
-      // Pinned unordered_dense 4.5 appends values on insertion, so offsets
-      // survive growth. No erase/reorder is allowed while this cache exists;
-      // reacquire begin() rather than retaining an invalidatable iterator.
-      for_each_encoded_utf8(
-          array, stage, name,
-          [&](bool is_null, std::string_view value) -> std::optional<std::size_t> {
-            if (is_null) return std::nullopt;
-            auto found = counts.find(value);
-            if (found == counts.end()) found = counts.emplace(std::string(value), 0).first;
-            return static_cast<std::size_t>(found - counts.begin());
-          },
-          [&](int64_t, const std::optional<std::size_t>& slot) {
-            if (slot.has_value())
-              ++counts.begin()[static_cast<StringCounts::difference_type>(*slot)].second;
-            else
-              ++nulls;
-          });
-    }
+    consume_categories(columns_, stage, static_cast<SeenState&>(raw), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
     arrow::util::InitializeUTF8();  // idempotent; ValidateUTF8 needs its tables
-    std::unordered_map<std::string, StringCounts> merged;
-    std::unordered_map<std::string, int64_t> nulls;
-    rows_ = 0;
-    for (auto& raw : states) {
-      auto& state = static_cast<State&>(*raw);
-      rows_ += state.rows;
-      for (auto& [name, counts] : state.counts) {
-        auto& into = merged[name];
-        if (into.empty()) {
-          into = std::move(counts);
-          continue;
-        }
-        for (auto& [key, count] : counts) into.try_emplace(std::move(key), 0).first->second += count;
-      }
-      for (const auto& [name, count] : state.nulls) nulls[name] += count;
-      raw.reset();
-    }
-
+    const std::unique_ptr<SeenState> merged = merge_seen(states);
+    rows_ = merged->rows;
     tables_.clear();
     for (const std::string& name : columns_) {
-      if (missing_ == Missing::Error && nulls[name] > 0) {
+      const int64_t nulls = merged->nulls[name];
+      if (missing_ == Missing::Error && nulls > 0) {
         throw Error(stage + ": column '" + name + "' has nulls and handle_missing is 'error'");
       }
       // Sorted, so the fitted table is the same however the rows were split.
       std::vector<std::pair<std::string, int64_t>> tally;
-      auto& counts = merged[name];
+      auto& counts = merged->counts[name];
       tally.reserve(counts.size());
       for (auto& [key, count] : counts) {
         if (!arrow::util::ValidateUTF8(key)) {
@@ -248,14 +187,14 @@ class CountEncode final : public Kernel {
         }
         tally.emplace_back(key, count);
       }
-      merged.erase(name);
+      merged->counts.erase(name);
       std::sort(tally.begin(), tally.end());
       // What a null answers: its own count, or its group's once it joins one.
-      int64_t null_count = missing_ == Missing::Value ? nulls[name] : 0;
+      int64_t null_count = missing_ == Missing::Value ? nulls : 0;
       combine_small(name, tally, null_count);
       Table& table = tables_[name];
       table.null_count = null_count;
-      table.has_null_category = missing_ == Missing::Value && nulls[name] > 0;
+      table.has_null_category = missing_ == Missing::Value && nulls > 0;
       for (auto& [key, count] : tally) {
         // emplace() keeps the first of a duplicate pair and drops the second
         // silently, so a colliding group name would corrupt a whole category.

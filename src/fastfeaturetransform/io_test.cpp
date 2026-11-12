@@ -55,6 +55,7 @@ using fft::testing::f64_column;
 using fft::testing::indices_with_garbage;
 using fft::testing::make_batch;
 using fft::testing::numeric_column;
+using fft::testing::read_task;
 using fft::testing::TempDir;
 using fft::testing::utf8_column;
 
@@ -199,8 +200,8 @@ ChunkPages chunk_pages(const std::string& path, int column) {
 std::vector<std::optional<std::string>> read_strings(const std::string& path) {
   std::vector<std::optional<std::string>> out;
   auto source = fft::open_source({path});
-  for (const auto& task : source->plan_tasks()) {
-    const fft::Batch batch = source->read_task(task, nullptr);
+  for (std::size_t task = 0; task < source->plan_tasks().size(); ++task) {
+    const fft::Batch batch = read_task(*source, task);
     std::shared_ptr<arrow::Array> strings = batch.cols[0];
     if (strings->type_id() == arrow::Type::LIST) strings = static_cast<const arrow::ListArray&>(*strings).values();
     const auto& column = static_cast<const arrow::DictionaryArray&>(*strings);
@@ -243,7 +244,7 @@ TEST_CASE("write_part then ParquetSource round-trips schema, tasks, and rows") {
   REQUIRE(source->schema().cols == fft::Schema{{{"device", "utf8"}, {"price", "f64"}}}.cols);
   REQUIRE(source->plan_tasks().size() == 1);
 
-  fft::Batch batch = source->read_task(source->plan_tasks()[0], nullptr);
+  fft::Batch batch = read_task(*source, 0);
   REQUIRE(batch.rows == 2);
   // utf8 columns arrive dictionary-encoded: the reader requests Parquet's own
   // dictionaries so kernels can encode per entry instead of per row.
@@ -263,19 +264,18 @@ TEST_CASE("write_part then ParquetSource round-trips schema, tasks, and rows") {
   REQUIRE_FALSE(std::filesystem::exists(part(dir, 0) + ".tmp"));  // renamed into place
 }
 
-TEST_CASE("read_task decodes only the projected columns") {
+TEST_CASE("a reader decodes only the projected columns") {
   TempDir dir;
   fft::write_part(
       dir.path.string(), 0,
       make_batch({"device", "price", "extra"}, {utf8_column({"mob"}), f64_column({1.5}), utf8_column({"unused"})}));
   auto source = fft::open_source({part(dir, 0)});
   std::vector<std::string> columns{"price"};
-  fft::Batch batch = source->read_task(source->plan_tasks()[0], &columns);
+  fft::Batch batch = read_task(*source, 0, &columns);
   REQUIRE(batch.names == std::vector<std::string>{"price"});
   REQUIRE(batch.rows == 1);
   std::vector<std::string> missing{"nope"};
-  REQUIRE_THROWS_WITH(source->read_task(source->plan_tasks()[0], &missing),
-                      ContainsSubstring("column 'nope' not found"));
+  REQUIRE_THROWS_WITH(source->readers(1, &missing), ContainsSubstring("column 'nope' not found"));
 }
 
 TEST_CASE("fit readers stream projected row groups in bounded ordered batches") {
@@ -308,8 +308,6 @@ TEST_CASE("fit readers stream projected row groups in bounded ordered batches") 
   });
   REQUIRE(offset == numbers.size());
   REQUIRE(batches == 10);
-  // A reader can switch back to its ordinary whole-task mode safely.
-  REQUIRE(readers[0]->read(source->plan_tasks()[0]).rows == 103);
   REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], 0, [](fft::Batch) {}),
                       ContainsSubstring("batch_size"));
 }
@@ -343,12 +341,18 @@ TEST_CASE("worker readers retain their projection while switching files independ
   std::vector<std::string> projection{"y", "x", "y"};
   auto readers = source->readers(2, &projection);
   projection = {"unused"};  // a reader owns the compiled snapshot, not this caller's vector
-  fft::Batch retained = readers[0]->read(source->plan_tasks()[0]);
+  // Each task holds fewer than 8 rows, so it arrives as one batch.
+  const auto read = [&](std::size_t worker, std::size_t task) {
+    fft::Batch whole;
+    readers[worker]->read_batches(source->plan_tasks()[task], 8, [&](fft::Batch batch) { whole = std::move(batch); });
+    return whole;
+  };
+  fft::Batch retained = read(0, 0);
   REQUIRE(retained.names == std::vector<std::string>{"x", "y"});
   REQUIRE(retained.rows == 2);
   for (const std::size_t worker : {0U, 1U}) {
     for (const std::size_t task : {1U, 1U, 0U, 1U, 0U}) {
-      fft::Batch batch = readers[worker]->read(source->plan_tasks()[task]);
+      fft::Batch batch = read(worker, task);
       REQUIRE(batch.names == std::vector<std::string>{"x", "y"});
       REQUIRE(batch.rows == (task == 0 ? 2 : 1));
       REQUIRE(static_cast<const arrow::DoubleArray&>(*batch.cols[0]).Value(0) == (task == 0 ? 1.0 : 3.0));
@@ -363,7 +367,7 @@ TEST_CASE("a zero-row row group reads back as an empty batch") {
   fft::write_part(dir.path.string(), 0, make_batch({"device", "price"}, {utf8_column({}), f64_column({})}));
   auto source = fft::open_source({part(dir, 0)});
   REQUIRE(source->plan_tasks().size() == 1);
-  fft::Batch batch = source->read_task(source->plan_tasks()[0], nullptr);
+  fft::Batch batch = read_task(*source, 0);
   REQUIRE(batch.rows == 0);
   REQUIRE(batch.names == std::vector<std::string>{"device", "price"});
   REQUIRE(batch.cols[0]->length() == 0);
@@ -643,7 +647,7 @@ TEST_CASE("files must agree on whether a column holds integers, naive timestamps
   REQUIRE(fft::open_source({utc, york})->schema().cols == fft::Schema{{{"t", "i64"}}}.cols);
 }
 
-TEST_CASE("Parquet timestamp columns read as int64 microseconds in both reading paths") {
+TEST_CASE("Parquet timestamp columns read as int64 microseconds") {
   using arrow::TimeUnit;
   using fft::testing::timestamp_column;
   TempDir dir;
@@ -664,9 +668,6 @@ TEST_CASE("Parquet timestamp columns read as int64 microseconds in both reading 
   REQUIRE(source->schema().cols == fft::Schema{{{"ms", "i64"}, {"ns", "i64"}}}.cols);
   const std::vector<std::optional<int64_t>> ms{2'000, std::nullopt, -3'000};
   const std::vector<std::optional<int64_t>> ns{0, -1, 1};
-  const fft::Batch whole = source->read_task(source->plan_tasks()[0], nullptr);
-  REQUIRE(int64_values(*whole.cols[0]) == ms);
-  REQUIRE(int64_values(*whole.cols[1]) == ns);
   auto readers = source->readers(1, nullptr);
   std::vector<std::optional<int64_t>> streamed_ms;
   std::vector<std::optional<int64_t>> streamed_ns;
@@ -677,10 +678,9 @@ TEST_CASE("Parquet timestamp columns read as int64 microseconds in both reading 
   REQUIRE(streamed_ms == ms);
   REQUIRE(streamed_ns == ns);
 
-  // An empty row group reads back as an empty int64 column too, in both paths.
+  // An empty row group reads back as an empty int64 column too.
   fft::write_part(dir.path.string(), 0, make_batch({"t"}, {timestamp_column(TimeUnit::MICRO, {})}));
   auto empty = fft::open_source({part(dir, 0)});
-  REQUIRE(empty->read_task(empty->plan_tasks()[0], nullptr).cols[0]->type_id() == arrow::Type::INT64);
   unsigned calls = 0;
   empty->readers(1, nullptr)[0]->read_batches(empty->plan_tasks()[0], 2, [&](fft::Batch batch) {
     REQUIRE(batch.cols[0]->type_id() == arrow::Type::INT64);
@@ -689,11 +689,11 @@ TEST_CASE("Parquet timestamp columns read as int64 microseconds in both reading 
   REQUIRE(calls == 1);
 }
 
-TEST_CASE("dictionary indices outside their dictionary are refused in both reading paths") {
+TEST_CASE("dictionary indices outside their dictionary are refused") {
   TempDir dir;
   const std::string clean = dictionary_file(dir, "clean", "");
   auto source = fft::open_source({clean});
-  const fft::Batch read = source->read_task(source->plan_tasks()[0], nullptr);
+  const fft::Batch read = read_task(*source, 0);
   REQUIRE(read.cols[0]->type_id() == arrow::Type::DICTIONARY);
   const auto& column = static_cast<const arrow::DictionaryArray&>(*read.cols[0]);
   REQUIRE(column.dictionary()->length() == 3);
@@ -709,7 +709,6 @@ TEST_CASE("dictionary indices outside their dictionary are refused in both readi
     auto corrupt_source = fft::open_source({path});
     const fft::Task task = corrupt_source->plan_tasks()[0];
     const std::string message = path + ": failed to read row group 0: column 'c' has a dictionary index outside";
-    REQUIRE_THROWS_WITH(corrupt_source->read_task(task, nullptr), ContainsSubstring(message));
     auto readers = corrupt_source->readers(1, nullptr);
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(task, 8, [&](fft::Batch) { ++batches; }), ContainsSubstring(message));
@@ -1151,8 +1150,9 @@ TEST_CASE("each batch of a row group stored with plain pages carries the entries
   for (const std::string& path : {plain, fallen_back}) {
     CAPTURE(path);
     auto source = fft::open_source({path});
-    // Read whole, the row group has one dictionary of its 36 distinct values.
-    const fft::Batch whole = source->read_task(source->plan_tasks()[0], nullptr);
+    // Read as one batch, the row group has one dictionary of its 36 distinct
+    // values.
+    const fft::Batch whole = read_task(*source, 0);
     REQUIRE(entries_of(*whole.cols[0]).size() == 36);
     REQUIRE(row_values(*whole.cols[0]) == rows);
 
@@ -1205,8 +1205,8 @@ TEST_CASE("PartWriter writes its batches as one ordered part and keeps one only 
   REQUIRE(source->schema().cols == fft::Schema{{{"s", "utf8"}, {"x", "f64"}}}.cols);
   REQUIRE(source->task_rows() == std::vector<int64_t>{5});
   std::vector<double> actual;
-  for (const auto& task : source->plan_tasks()) {
-    auto batch = source->read_task(task, nullptr);
+  for (std::size_t task = 0; task < source->plan_tasks().size(); ++task) {
+    auto batch = read_task(*source, task);
     const auto& values = static_cast<const arrow::DoubleArray&>(*batch.cols[1]);
     for (int64_t row = 0; row < batch.rows; ++row) actual.push_back(values.Value(row));
   }
@@ -1230,7 +1230,7 @@ TEST_CASE("PartWriter creates one typed empty row group from empty batches") {
   const auto output = writer.finish();
   auto source = fft::open_source({output});
   REQUIRE(source->task_rows() == std::vector<int64_t>{0});
-  auto empty = source->read_task(source->plan_tasks().front(), nullptr);
+  auto empty = read_task(*source, 0);
   REQUIRE(empty.names == batch.names);
   REQUIRE(empty.rows == 0);
   REQUIRE(source->schema().cols == fft::Schema{{{"s", "utf8"}, {"x", "f64"}}}.cols);
@@ -1249,8 +1249,8 @@ TEST_CASE("PartWriter accepts changing dictionary contents while preserving the 
   auto source = fft::open_source({writer.finish()});
   REQUIRE(source->schema().cols == fft::Schema{{{"s", "utf8"}}}.cols);
   std::vector<std::string> actual;
-  for (const auto& task : source->plan_tasks()) {
-    auto batch = source->read_task(task, nullptr);
+  for (std::size_t task = 0; task < source->plan_tasks().size(); ++task) {
+    auto batch = read_task(*source, task);
     const auto& column = static_cast<const arrow::DictionaryArray&>(*batch.cols[0]);
     const auto& entries = static_cast<const arrow::StringArray&>(*column.dictionary());
     for (int64_t row = 0; row < column.length(); ++row) actual.push_back(entries.GetString(column.GetValueIndex(row)));
@@ -1297,7 +1297,7 @@ TEST_CASE("PartWriter rejects schema or row mismatches and removes incomplete ou
     REQUIRE_FALSE(std::filesystem::exists(previous + ".tmp"));
     REQUIRE(std::filesystem::file_size(previous) == previous_size);
     auto source = fft::open_source({previous});
-    auto original = source->read_task(source->plan_tasks().front(), nullptr);
+    auto original = read_task(*source, 0);
     REQUIRE(static_cast<const arrow::DoubleArray&>(*original.cols[0]).Value(0) == 7.0);
     REQUIRE_THROWS_WITH(writer.finish(), ContainsSubstring("no longer active"));
   }
@@ -1363,8 +1363,8 @@ TEST_CASE("PartWriter closes a row group once it holds 4,096 rows or six batches
     auto source = fft::open_source({writer.finish()});
     REQUIRE(source->task_rows() == layout.row_groups);
     double expected = 0.0;
-    for (const auto& task : source->plan_tasks()) {
-      const fft::Batch batch = source->read_task(task, nullptr);
+    for (std::size_t task = 0; task < source->plan_tasks().size(); ++task) {
+      const fft::Batch batch = read_task(*source, task);
       const auto& values = static_cast<const arrow::DoubleArray&>(*batch.cols[0]);
       for (int64_t row = 0; row < values.length(); ++row) REQUIRE(values.Value(row) == expected++);
     }
@@ -1435,7 +1435,7 @@ TEST_CASE("PartWriter gives the batches of a row group one dictionary") {
   REQUIRE(raw->metadata()->RowGroup(0)->ColumnChunk(0)->total_uncompressed_size() < 4000);
 
   auto source = fft::open_source({output});
-  const fft::Batch batch = source->read_task(source->plan_tasks().front(), nullptr);
+  const fft::Batch batch = read_task(*source, 0);
   const auto& column = static_cast<const arrow::DictionaryArray&>(*batch.cols[0]);
   const auto& words = static_cast<const arrow::StringArray&>(*column.dictionary());
   REQUIRE(column.length() == static_cast<int64_t>(expected.size()));
@@ -1568,8 +1568,8 @@ TEST_CASE("PartWriter holds at most 64 KiB of a part back from its file") {
   expected.insert(expected.end(), second.begin(), second.end());
   expected.insert(expected.end(), third.begin(), third.end());
   std::vector<double> actual;
-  for (const auto& task : source->plan_tasks()) {
-    const fft::Batch batch = source->read_task(task, nullptr);
+  for (std::size_t task = 0; task < source->plan_tasks().size(); ++task) {
+    const fft::Batch batch = read_task(*source, task);
     const auto& values = static_cast<const arrow::DoubleArray&>(*batch.cols[0]);
     actual.insert(actual.end(), values.raw_values(), values.raw_values() + values.length());
   }
@@ -1666,7 +1666,7 @@ TEST_CASE("a part of numbers ends a dictionary of 8-byte values at 248 KiB and w
   REQUIRE(pages.index_values == pages.dictionary_entries);  // each row until then added an entry
   REQUIRE(pages.plain_values == kRows - pages.dictionary_entries);
   auto source = fft::open_source({path});
-  const fft::Batch batch = source->read_task(source->plan_tasks().front(), nullptr);
+  const fft::Batch batch = read_task(*source, 0);
   REQUIRE(batch.rows == kRows);
   const auto& ids = static_cast<const arrow::Int64Array&>(*batch.cols[0]);
   for (int64_t row = 0; row < kRows; ++row) {
@@ -2112,7 +2112,7 @@ TEST_CASE("parallel metadata preparation retains ordered file tasks and row coun
       const auto& task = source->plan_tasks()[index];
       REQUIRE(task.file == index);
       REQUIRE(task.row_group == 0);
-      auto batch = source->read_task(task, nullptr);
+      auto batch = read_task(*source, index);
       REQUIRE(batch.rows == rows[index]);
       if (batch.rows > 0)
         REQUIRE(static_cast<const arrow::DoubleArray&>(*batch.cols[0]).Value(0) == static_cast<double>(index));

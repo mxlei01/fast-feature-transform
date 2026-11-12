@@ -333,42 +333,121 @@ struct Categories {
   }
 };
 
-// The fit state of ordinal, one-hot, rank-hot, the positional encoders
-// (base-N, binary and gray) and the contrast coders: which categories
-// appeared, and how many nulls.
+// The fit state of label_encode, count_encode and the kernels
+// merge_categories serves (ordinal, one-hot, rank-hot, the positional
+// encoders and the contrast coders): per column, how many rows held each
+// category and how many were null, and how many rows were read.
+// label_encode reads the counts, count_encode all three, and the others only
+// which categories appeared and whether a null did.
 struct SeenState final : AccState {
-  std::unordered_map<std::string, StringCounts> seen;
+  std::unordered_map<std::string, StringCounts> counts;
   std::unordered_map<std::string, int64_t> nulls;
+  int64_t rows = 0;
 };
 
-inline void consume_categories(const std::vector<std::string>& columns, const std::string& stage, SeenState& state,
-                               const Batch& batch) {
+// Add one batch to a worker's state. A dictionary column whose dictionary
+// holds no more entries than the batch has rows, and at most 2^20, is
+// tallied by index, and then each entry its rows use is hashed once. Any
+// other column is read row by row: a small batch can share a much larger
+// row-group dictionary, whose counts would cost more than its rows.
+//
+// static, so that each file including this compiles a copy of its own,
+// whose row loop has the lambda inlined and keeps the counts' map in a
+// register. One copy shared by every file is compiled apart from the
+// kernels, and its row loop reaches the map through the lambda on every
+// row: a fit of 1,000,000 plain strings of 1,000 categories, 30% of them
+// null, took 2% to 6% longer that way (one thread, Apple M4).
+static inline void consume_categories(const std::vector<std::string>& columns, const std::string& stage,
+                                      SeenState& state, const Batch& batch) {
+  state.rows += batch.rows;
   for (const std::string& name : columns) {
     const int idx = batch.find(name);
     if (idx < 0) throw Error(stage + ": column '" + name + "' missing from batch");
-    auto& seen = state.seen[name];
+    StringCounts& counts = state.counts[name];
     int64_t& nulls = state.nulls[name];
     const arrow::Array& array = *batch.cols[static_cast<std::size_t>(idx)];
-    if (array.type_id() != arrow::Type::DICTIONARY) {
-      for_each_utf8_value(array, stage, name, [&](int64_t, bool is_null, std::string_view value) {
+    constexpr std::size_t max_cache_bytes = 8 * 1024 * 1024;
+    const auto* dictionary =
+        array.type_id() == arrow::Type::DICTIONARY ? &static_cast<const arrow::DictionaryArray&>(array) : nullptr;
+    const int64_t entries = dictionary != nullptr ? dictionary->dictionary()->length() : 0;
+    if (entries > 0 && entries <= array.length() &&
+        static_cast<uint64_t>(entries) <= max_cache_bytes / sizeof(int64_t)) {
+      std::vector<int64_t> index_counts(static_cast<std::size_t>(entries), 0);
+      std::vector<int32_t> copied;
+      const int32_t* indices = int32_indices(*dictionary, copied);
+      const RowNulls null_at(*dictionary);
+      const int64_t length = dictionary->length();
+      for (int64_t row = 0; row < length; ++row) {
+        if (!null_at(row)) ++index_counts[static_cast<std::size_t>(indices[row])];
+      }
+      // The rows null_at skipped, which is what the array counts as null.
+      nulls += dictionary->null_count();
+      const arrow::Array& values = *dictionary->dictionary();
+      for_each_dictionary_entry(values, stage, name, [&](int64_t entry, bool is_null, std::string_view value) {
+        const int64_t count = index_counts[static_cast<std::size_t>(entry)];
+        if (count == 0) return;
         if (is_null) {
-          ++nulls;
-        } else if (seen.find(value) == seen.end()) {
-          seen.emplace(std::string(value), 1);
+          nulls += count;
+          return;
+        }
+        auto found = counts.find(value);
+        if (found != counts.end()) {
+          found->second += count;
+        } else {
+          counts.emplace(std::string(value), count);
         }
       });
+    } else {
+      // The null rows are counted before the loop, which then does nothing
+      // for them: a test per null row made a label_encode fit of 1,000,000
+      // plain strings, 95% of them null, about 3% slower (one thread, Apple
+      // M4). A dictionary column's rows are null too where they point at a
+      // null entry, which the column does not count.
+      nulls += array.null_count();
+      if (dictionary != nullptr && dictionary->dictionary()->null_count() != 0) {
+        const arrow::Array& values = *dictionary->dictionary();
+        for (int64_t row = 0; row < dictionary->length(); ++row) {
+          if (dictionary->IsValid(row) && values.IsNull(dictionary->GetValueIndex(row))) ++nulls;
+        }
+      }
+      const auto count_row = [&](int64_t, bool is_null, std::string_view value) {
+        if (is_null) return;
+        auto found = counts.find(value);
+        if (found != counts.end()) {
+          ++found->second;
+        } else {
+          counts.emplace(std::string(value), 1);
+        }
+      };
+      for_each_utf8_value(array, stage, name, count_row);
+    }
+  }
+}
+
+// Fold every worker into the first, freeing each as it is consumed, so the
+// peak stays near one copy of each column's categories.
+inline std::unique_ptr<SeenState> merge_seen(std::vector<std::unique_ptr<AccState>>& states) {
+  std::unique_ptr<SeenState> merged;
+  for (auto& raw : states) {
+    if (merged == nullptr) {
+      merged.reset(static_cast<SeenState*>(raw.release()));
       continue;
     }
-    for_each_encoded_utf8(
-        array, stage, name,
-        [&](bool is_null, std::string_view value) {
-          if (!is_null && seen.find(value) == seen.end()) seen.emplace(std::string(value), 1);
-          return is_null;
-        },
-        [&](int64_t, bool is_null) {
-          if (is_null) ++nulls;
-        });
+    auto& from = static_cast<SeenState&>(*raw);
+    merged->rows += from.rows;
+    for (auto& [name, counts] : from.counts) {
+      StringCounts& into = merged->counts[name];
+      if (into.empty()) {
+        into = std::move(counts);
+        continue;
+      }
+      for (auto& [key, count] : counts) into.try_emplace(std::move(key), 0).first->second += count;
+    }
+    for (const auto& [name, count] : from.nulls) merged->nulls[name] += count;
+    raw.reset();
   }
+  if (merged == nullptr) merged = std::make_unique<SeenState>();
+  return merged;
 }
 
 inline std::unordered_map<std::string, Categories> merge_categories(const std::vector<std::string>& columns,
@@ -376,39 +455,26 @@ inline std::unordered_map<std::string, Categories> merge_categories(const std::v
                                                                     std::vector<std::unique_ptr<AccState>>& states,
                                                                     Missing missing) {
   arrow::util::InitializeUTF8();  // idempotent; ValidateUTF8 needs its tables
-  std::unordered_map<std::string, StringCounts> merged;
-  std::unordered_map<std::string, int64_t> nulls;
-  for (auto& raw : states) {
-    auto& state = static_cast<SeenState&>(*raw);
-    for (auto& [name, seen] : state.seen) {
-      auto& into = merged[name];
-      if (into.empty()) {
-        into = std::move(seen);
-        continue;
-      }
-      for (auto& [key, count] : seen) into.try_emplace(std::move(key), 1);
-    }
-    for (const auto& [name, count] : state.nulls) nulls[name] += count;
-    raw.reset();
-  }
+  const std::unique_ptr<SeenState> merged = merge_seen(states);
 
   std::unordered_map<std::string, Categories> tables;
   for (const std::string& name : columns) {
-    if (missing == Missing::Error && nulls[name] > 0) {
+    const int64_t nulls = merged->nulls[name];
+    if (missing == Missing::Error && nulls > 0) {
       throw Error(stage + ": column '" + name + "' has nulls and handle_missing is 'error'");
     }
     Categories categories;
-    for (auto& [key, count] : merged[name]) {
+    for (auto& [key, count] : merged->counts[name]) {
       if (!arrow::util::ValidateUTF8(key)) {
         throw Error(stage + ": column '" + name +
                     "' has a category that is not valid UTF-8; category keys must be UTF-8 to serialize");
       }
       categories.sorted.push_back(key);
     }
-    merged.erase(name);
+    merged->counts.erase(name);
     std::sort(categories.sorted.begin(), categories.sorted.end());
     categories.index();
-    categories.has_null = missing == Missing::Value && nulls[name] > 0;
+    categories.has_null = missing == Missing::Value && nulls > 0;
     if (categories.sorted.empty() && !categories.has_null) {
       throw Error(stage + ": column '" + name + "' has no categories to encode");
     }

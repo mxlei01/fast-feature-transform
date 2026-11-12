@@ -62,7 +62,7 @@ double divided(const ExactSum& sum, double count, const std::string& what) {
 // spell it as a null, which does the same, and refuse the other spelling so a
 // column never carries two of them. An infinity sklearn refuses outright.
 //
-// The throw is a function of its own, as in expand.cpp, so the check stays
+// The throw is a function of its own, as in numeric.hpp, so the check stays
 // small enough to inline: normalize runs it once per value, and an
 // out-of-line check cost more than half of its transform. Only a step that
 // passes a null through adds 'write a missing value as a null' to the

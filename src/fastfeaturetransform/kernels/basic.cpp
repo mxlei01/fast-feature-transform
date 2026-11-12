@@ -128,87 +128,22 @@ class LabelEncode final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
-  struct State final : AccState {
-    // column -> category -> count
-    std::unordered_map<std::string, StringCounts> counts;
-  };
-
-  std::unique_ptr<AccState> make_state() const override { return std::make_unique<State>(); }
+  std::unique_ptr<AccState> make_state() const override { return std::make_unique<SeenState>(); }
 
   void consume(AccState& state, const Batch& batch) const override {
-    auto& counts = static_cast<State&>(state).counts;
-    for (const std::string& name : columns_) {
-      int idx = batch.find(name);
-      if (idx < 0) throw Error(stage + ": column '" + name + "' missing from batch");
-      auto& column_counts = counts[name];
-      const arrow::Array& array = *batch.cols[static_cast<std::size_t>(idx)];
-      const auto* dictionary =
-          array.type_id() == arrow::Type::DICTIONARY ? &static_cast<const arrow::DictionaryArray&>(array) : nullptr;
-      constexpr std::size_t max_cache_bytes = 8 * 1024 * 1024;
-      const auto entries = dictionary ? dictionary->dictionary()->length() : 0;
-      if (dictionary != nullptr && entries > 0 && entries <= array.length() &&
-          static_cast<uint64_t>(entries) <= max_cache_bytes / sizeof(int64_t)) {
-        // Fast path: tally integer indices per row, then hash each used
-        // dictionary entry once rather than every row.
-        const auto& dictionary_array = static_cast<const arrow::DictionaryArray&>(array);
-        const arrow::Array& values = *dictionary_array.dictionary();
-        std::vector<int64_t> index_counts(static_cast<std::size_t>(values.length()), 0);
-        std::vector<int32_t> copied;
-        const int32_t* indices = int32_indices(dictionary_array, copied);
-        const RowNulls null_at(dictionary_array);
-        const int64_t length = dictionary_array.length();
-        for (int64_t row = 0; row < length; ++row) {
-          if (!null_at(row)) ++index_counts[static_cast<std::size_t>(indices[row])];
-        }
-        for_each_dictionary_entry(values, stage, name, [&](int64_t entry, bool is_null, std::string_view value) {
-          int64_t count = index_counts[static_cast<std::size_t>(entry)];
-          if (is_null || count == 0) return;
-          auto found = column_counts.find(value);
-          if (found != column_counts.end()) {
-            found->second += count;
-          } else {
-            column_counts.emplace(std::string(value), count);
-          }
-        });
-      } else {
-        // A small batch can share a much larger row-group dictionary.
-        // Hash its rows directly instead of allocating counts for every entry.
-        for_each_utf8_value(array, stage, name, [&](int64_t, bool is_null, std::string_view value) {
-          if (is_null) return;
-          auto found = column_counts.find(value);
-          if (found != column_counts.end()) {
-            ++found->second;
-          } else {
-            column_counts.emplace(std::string(value), 1);
-          }
-        });
-      }
-    }
+    consume_categories(columns_, stage, static_cast<SeenState&>(state), batch);
   }
 
   void finalize(std::vector<std::unique_ptr<AccState>> states) override {
     arrow::util::InitializeUTF8();  // idempotent; ValidateUTF8 needs its tables
-    // Merge by moving keys out of the worker states (freed as they are
-    // consumed) so peak memory stays near one copy of the vocabulary.
-    std::unordered_map<std::string, StringCounts> merged;
-    for (auto& state : states) {
-      for (auto& [name, counts] : static_cast<State&>(*state).counts) {
-        auto& into = merged[name];
-        if (into.empty()) {
-          into = std::move(counts);
-          continue;
-        }
-        for (auto& [key, count] : counts) into.try_emplace(std::move(key), 0).first->second += count;
-      }
-      state.reset();
-    }
+    const std::unique_ptr<SeenState> merged = merge_seen(states);
     maps_.clear();
     for (const std::string& name : columns_) {
       std::vector<std::string> keys;
-      for (auto& [key, count] : merged[name]) {
+      for (auto& [key, count] : merged->counts[name]) {
         if (count >= min_count_) keys.push_back(std::move(key));
       }
-      merged.erase(name);
+      merged->counts.erase(name);
       std::sort(keys.begin(), keys.end());
       auto& map = maps_[name];
       map.reserve(keys.size());

@@ -95,6 +95,4 @@ class Kernel {
 // reported before an unknown name.
 std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json& params);
 
-std::vector<std::string> list_kernels();
-
 }  // namespace fastfeaturetransform

@@ -13,6 +13,7 @@
 
 #include "fastfeaturetransform/kernels/cast_table.hpp"
 #include "fastfeaturetransform/kernels/kernels.hpp"
+#include "fastfeaturetransform/kernels/output.hpp"
 #include "fastfeaturetransform/kernels/util.hpp"
 #include "fastfeaturetransform/spill.hpp"
 
@@ -495,26 +496,32 @@ class GroupAgg final : public Kernel {
           return found == int_index_.end() ? -1 : static_cast<int64_t>(found->second);
         });
     drop_replaced(batch);
-    const std::vector<bool> nulls(slots.size(), false);
+    const auto rows = static_cast<int64_t>(slots.size());
     for (const Feature& feature : features_) {
       const std::string where = stage + ": column '" + feature.name + "'";
+      // Gathered as i64 or f64, then cast to the feature's own type, which
+      // only the min or max of a narrower column changes. The cast cannot
+      // fail: the fit and load_state hold every value to that type.
       std::shared_ptr<arrow::Array> array;
       if (feature.floating) {
-        std::vector<double> values(slots.size(), 0.0);
-        for (std::size_t i = 0; i < slots.size(); ++i) {
-          if (slots[i] >= 0) values[i] = feature.doubles[static_cast<std::size_t>(slots[i])];
+        PrimitiveOutput<arrow::DoubleType> values(rows, where);
+        double* out = values.mutable_values();
+        for (int64_t row = 0; row < rows; ++row) {
+          const int64_t slot = slots[static_cast<std::size_t>(row)];
+          out[row] = slot < 0 ? 0.0 : feature.doubles[static_cast<std::size_t>(slot)];
         }
-        array = feature.tag == "f32" ? build_numeric<arrow::FloatType>(values, nulls, where)
-                                     : build_numeric<arrow::DoubleType>(values, nulls, where);
+        array = values.finish();
       } else {
-        std::vector<int64_t> values(slots.size(), 0);
-        for (std::size_t i = 0; i < slots.size(); ++i) {
-          if (slots[i] >= 0) values[i] = feature.ints[static_cast<std::size_t>(slots[i])];
+        PrimitiveOutput<arrow::Int64Type> values(rows, where);
+        int64_t* out = values.mutable_values();
+        for (int64_t row = 0; row < rows; ++row) {
+          const int64_t slot = slots[static_cast<std::size_t>(row)];
+          out[row] = slot < 0 ? 0 : feature.ints[static_cast<std::size_t>(slot)];
         }
-        array = build_integer(cast_target(feature.tag, where), values, nulls, where);
+        array = values.finish();
       }
       batch.names.push_back(feature.name);
-      batch.cols.push_back(std::move(array));
+      batch.cols.push_back(cast_array(array, cast_target(feature.tag, where), stage, feature.name));
     }
     return batch;
   }

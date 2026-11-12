@@ -43,11 +43,10 @@ struct ListShape {
 class TaskReader {
  public:
   virtual ~TaskReader() = default;
-  virtual Batch read(const Task& task) = 0;
   // Hand the task's rows to `consume` in order, at most `batch_size` at a time;
-  // an empty task gives one empty batch. ParquetSource's reader streams them
-  // instead of decoding the whole row group first.
-  virtual void read_batches(const Task& task, int64_t batch_size, const std::function<void(Batch)>& consume);
+  // an empty task gives one empty batch. ParquetSource's reader decodes one
+  // batch at a time instead of the whole row group first.
+  virtual void read_batches(const Task& task, int64_t batch_size, const std::function<void(Batch)>& consume) = 0;
 };
 
 class RecordBatchSource {
@@ -57,11 +56,10 @@ class RecordBatchSource {
   virtual const std::vector<Task>& plan_tasks() const = 0;
   // Rows in each task, known before any task runs (from the Parquet footers).
   virtual const std::vector<int64_t>& task_rows() const = 0;
-  // Decode one task. `columns` names the columns to decode (nullptr = every
-  // column); the batch carries them in source order.
-  virtual Batch read_task(const Task& task, const std::vector<std::string>* columns) const = 0;
+  // One reader for each worker. `columns` names the columns to decode
+  // (nullptr = every column); a batch carries them in source order.
   virtual std::vector<std::unique_ptr<TaskReader>> readers(unsigned workers,
-                                                           const std::vector<std::string>* columns) const;
+                                                           const std::vector<std::string>* columns) const = 0;
   // The footer shape of a list column of numbers or bools, or nullptr when
   // there is none (any other column, unusable counts, or no footers).
   virtual const ListShape* list_shape(const std::string& /*column*/) const { return nullptr; }
@@ -78,7 +76,6 @@ class ParquetSource final : public RecordBatchSource {
   const Schema& schema() const override { return schema_; }
   const std::vector<Task>& plan_tasks() const override { return tasks_; }
   const std::vector<int64_t>& task_rows() const override { return task_rows_; }
-  Batch read_task(const Task& task, const std::vector<std::string>* columns) const override;
   std::vector<std::unique_ptr<TaskReader>> readers(unsigned workers,
                                                    const std::vector<std::string>* columns) const override;
   const ListShape* list_shape(const std::string& column) const override;

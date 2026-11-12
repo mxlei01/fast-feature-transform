@@ -15,6 +15,7 @@
 #include "fastfeaturetransform/kernels/cast_table.hpp"
 #include "fastfeaturetransform/kernels/categories.hpp"
 #include "fastfeaturetransform/kernels/kernels.hpp"
+#include "fastfeaturetransform/kernels/numeric.hpp"
 #include "fastfeaturetransform/kernels/output.hpp"
 #include "fastfeaturetransform/kernels/util.hpp"
 #include "fastfeaturetransform/spill.hpp"
@@ -36,28 +37,11 @@ std::string percentile_name(double quantile) {
   return std::to_string(static_cast<int64_t>(std::nearbyint(quantile * 100.0)));
 }
 
-// numpy's default method="linear", which is what upstream calls: with the
-// values sorted ascending and h = quantile*(n-1), the answer interpolates
-// between v[floor(h)] and v[floor(h)+1]. numpy lerps from whichever end is
-// nearer (its _lerp), reproduced here so the last bit agrees too.
-double quantile_of(const SpillVector<double>& sorted, double quantile) {
-  if (sorted.empty()) return 0.0;
-  const auto last = static_cast<double>(sorted.size() - 1);
-  const double index = quantile * last;
-  if (index <= 0.0) return sorted.front();
-  if (index >= last) return sorted.back();
-  const auto lower = static_cast<std::size_t>(index);  // index is positive and finite, so this floors
-  const double weight = index - static_cast<double>(lower);
-  const double left = sorted[lower];
-  const double right = sorted[lower + 1];
-  const double span = right - left;
-  return weight >= 0.5 ? right - span * (1.0 - weight) : left + span * weight;
-}
-
 // Only the two neighbors of each requested quantile need their sorted
-// positions, so select those ranks recursively: quantile_of reads the same
-// values there as after a full sort. A spilled, tiny or densely requested
-// buffer is sorted whole.
+// positions, so select those ranks recursively: linear_quantile, numpy's
+// default method and the one upstream calls, reads the same values there as
+// after a full sort. A spilled, tiny or densely requested buffer is sorted
+// whole.
 void prepare_quantiles(SpillVector<double>& values, const std::vector<double>& quantiles) {
   if (values.empty()) return;
   if (values.spilled()) {
@@ -613,7 +597,7 @@ class QuantileEncode final : public Kernel {
   // f64's largest apart overflows, and upstream carries that into the
   // encoding; the fit refuses it here and names the target.
   double target_quantile(const SpillVector<double>& sorted, double quantile) const {
-    const double value = quantile_of(sorted, quantile);
+    const double value = linear_quantile(sorted, quantile);
     if (!std::isfinite(value)) throw Error(stage + ": target column '" + target_ + "' spans past the range of f64");
     return value;
   }
