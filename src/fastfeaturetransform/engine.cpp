@@ -58,7 +58,9 @@ unsigned effective_threads(unsigned requested, std::size_t n_tasks) {
 
 // Leave room for decoded input, output and common kernel scratch. This is an
 // automatic sizing heuristic: variable-length values, dictionaries, Parquet
-// pages and fitted tables are additional, so it is not a process memory cap.
+// pages, the batches of fewer than 4,096 rows that a Parquet part holds until
+// their row group is written (up to five more) and fitted tables are
+// additional, so it is not a process memory cap.
 constexpr std::size_t kBatchRowBytes = (std::size_t{16} << 20) / 3;
 constexpr int64_t kBatchRows = 65536;
 

@@ -101,32 +101,32 @@ def as_table(output: Any) -> pa.Table:
     return pa.Table.from_pandas(output, preserve_index=False).replace_schema_metadata(None)
 
 
-def sink_layout(parts: Iterable[str | Path]) -> list[tuple[int, int]]:
+def sink_layout(parts: Iterable[str | Path]) -> list[list[int]]:
     """Read back how our sink split a transform's output into parts and row groups.
 
-    The sink writes one part per input row group and each part as one row
-    group per batch, and the batch shrinks as the pipeline's rows widen, so the
-    layout depends on the transformer. Reading it from the files ours wrote
-    keeps the write-back matched when that rule changes; a copy of the rule
-    here would drift from the sink's.
+    The sink writes one part per input row group. A batch of 4,096 rows or
+    more is a row group of its own, smaller batches are gathered until their
+    row group holds 4,096 rows or six batches, and the batch shrinks as the
+    pipeline's rows widen, so the layout depends on the transformer. Reading
+    every row group's size from the files ours wrote keeps the write-back
+    matched when that rule changes; a copy of the rule here would drift from
+    the sink's.
 
     Args:
         parts: The part files a ``transform_parquet`` call returned, in order.
 
     Returns:
-        Each part's row count and the size of its largest row group, which is
-        the batch size: every row group but a part's last is a full batch.
+        The row count of every row group of each part, in order.
 
     """
-    layout: list[tuple[int, int]] = []
+    layout: list[list[int]] = []
     for part in parts:
         metadata = pq.ParquetFile(part).metadata
-        largest: int = max((metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)), default=0)
-        layout.append((metadata.num_rows, max(largest, 1)))
+        layout.append([metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)])
     return layout
 
 
-def write_parts(table: pa.Table, directory: Path, layout: Sequence[tuple[int, int]]) -> None:
+def write_parts(table: pa.Table, directory: Path, layout: Sequence[Sequence[int]]) -> None:
     """Write an Arrow table the way our C++ sink wrote the same transform's output.
 
     It writes the parts and row groups ``layout`` describes (see
@@ -142,41 +142,46 @@ def write_parts(table: pa.Table, directory: Path, layout: Sequence[tuple[int, in
     Args:
         table: The values to write.
         directory: Directory to write the part files into.
-        layout: Each part's row count and row-group size, from ``sink_layout``.
+        layout: The row count of every row group of each part, from ``sink_layout``.
 
     Raises:
-        ValueError: If the layout's parts do not add up to the table's rows.
+        ValueError: If the layout's row groups do not add up to the table's rows.
 
     """
-    covered: int = sum(rows for rows, _ in layout)
+    covered: int = sum(sum(row_groups) for row_groups in layout)
     if covered != table.num_rows:
         raise ValueError(f"the layout covers {covered:,} rows, the table has {table.num_rows:,}")
     directory.mkdir(parents=True, exist_ok=True)
     dictionary: list[str] = dictionary_columns(table.schema)
     limit: int | None = dictionary_page_limit(table.schema)
     start: int = 0
-    for index, (rows, row_group_rows) in enumerate(layout):
-        with pa.output_stream(directory / f"part-{index:05d}.parquet", buffer_size=PART_BUFFER_BYTES) as part:
-            pq.write_table(
-                table.slice(start, rows),
+    for index, row_groups in enumerate(layout):
+        with (
+            pa.output_stream(directory / f"part-{index:05d}.parquet", buffer_size=PART_BUFFER_BYTES) as part,
+            pq.ParquetWriter(
                 part,
-                row_group_size=row_group_rows,
+                table.schema,
                 compression="snappy",
                 use_dictionary=dictionary,
                 dictionary_pagesize_limit=limit,
                 version="2.6",
                 store_schema=False,
-            )
-        start += rows
+            ) as writer,
+        ):
+            for rows in row_groups:
+                # A part without rows is one row group without rows, as the
+                # sink writes it.
+                writer.write_table(table.slice(start, rows), row_group_size=max(rows, 1))
+                start += rows
 
 
-def write_back(output: Any, directory: Path, layout: Sequence[tuple[int, int]]) -> None:
+def write_back(output: Any, directory: Path, layout: Sequence[Sequence[int]]) -> None:
     """Write an upstream transform's output the way our sink wrote ours.
 
     Args:
         output: A pandas frame, or a NumPy array of one or two dimensions.
         directory: Directory to write the part files into.
-        layout: Each part's row count and row-group size, from ``sink_layout``.
+        layout: The row count of every row group of each part, from ``sink_layout``.
 
     """
     write_parts(as_table(output), directory, layout)

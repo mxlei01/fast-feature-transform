@@ -22,9 +22,11 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -40,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
 #include "fastfeaturetransform/test_support.hpp"
 
 namespace fft = fastfeaturetransform;
@@ -47,6 +50,7 @@ using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::StartsWith;
 using fft::testing::bool_column;
 using fft::testing::f64_column;
+using fft::testing::indices_with_garbage;
 using fft::testing::make_batch;
 using fft::testing::numeric_column;
 using fft::testing::TempDir;
@@ -182,6 +186,28 @@ ChunkPages chunk_pages(const std::string& path, int column) {
       } else if (data.encoding() == parquet::Encoding::RLE_DICTIONARY ||
                  data.encoding() == parquet::Encoding::PLAIN_DICTIONARY) {
         out.index_values += data.num_values();
+      }
+    }
+  }
+  return out;
+}
+
+// The strings of a part's first column, or of the lists that column holds, in
+// order; nullopt for a null.
+std::vector<std::optional<std::string>> read_strings(const std::string& path) {
+  std::vector<std::optional<std::string>> out;
+  auto source = fft::open_source({path});
+  for (const auto& task : source->plan_tasks()) {
+    const fft::Batch batch = source->read_task(task, nullptr);
+    std::shared_ptr<arrow::Array> strings = batch.cols[0];
+    if (strings->type_id() == arrow::Type::LIST) strings = static_cast<const arrow::ListArray&>(*strings).values();
+    const auto& column = static_cast<const arrow::DictionaryArray&>(*strings);
+    const auto& words = static_cast<const arrow::StringArray&>(*column.dictionary());
+    for (int64_t row = 0; row < column.length(); ++row) {
+      if (column.IsNull(row)) {
+        out.emplace_back(std::nullopt);
+      } else {
+        out.emplace_back(words.GetString(column.GetValueIndex(row)));
       }
     }
   }
@@ -696,7 +722,7 @@ TEST_CASE("write_part refuses rows without columns") {
   REQUIRE_THROWS_WITH(fft::write_part(dir.path.string(), 0, batch), ContainsSubstring("no columns"));
 }
 
-TEST_CASE("PartWriter streams multiple batches into one ordered part without retaining input arrays") {
+TEST_CASE("PartWriter writes its batches as one ordered part and keeps one only until its row group is written") {
   TempDir dir;
   fft::PartWriter writer(dir.path.string(), 7, 5);
   const auto output = (dir.path / "part-00007.parquet").string();
@@ -706,17 +732,18 @@ TEST_CASE("PartWriter streams multiple batches into one ordered part without ret
     released = values;
     writer.append(make_batch({"s", "x"}, {utf8_column({"a", "b"}), values}));
   }
-  REQUIRE(released.expired());
+  REQUIRE_FALSE(released.expired());  // the batch waits for the rest of its row group
   REQUIRE_FALSE(std::filesystem::exists(output));
   REQUIRE(std::filesystem::exists(output + ".tmp"));
   writer.append(make_batch({"s", "x"}, {utf8_column({}), f64_column({})}));
   writer.append(make_batch({"s", "x"}, {utf8_column({"c", std::nullopt, "e"}), f64_column({3.0, 4.0, 5.0})}));
   REQUIRE(writer.finish() == output);
+  REQUIRE(released.expired());
   REQUIRE(writer.finish() == output);
   REQUIRE_FALSE(std::filesystem::exists(output + ".tmp"));
   auto source = fft::open_source({output});
   REQUIRE(source->schema().cols == fft::Schema{{{"s", "utf8"}, {"x", "f64"}}}.cols);
-  REQUIRE(source->task_rows() == std::vector<int64_t>{2, 3});
+  REQUIRE(source->task_rows() == std::vector<int64_t>{5});
   std::vector<double> actual;
   for (const auto& task : source->plan_tasks()) {
     auto batch = source->read_task(task, nullptr);
@@ -837,29 +864,246 @@ TEST_CASE("PartWriter removes temporary output when publication or initializatio
   REQUIRE_FALSE(std::filesystem::exists(part(dir, 1) + ".tmp"));
 }
 
+TEST_CASE("PartWriter closes a row group once it holds 4,096 rows or six batches") {
+  // Each layout is the rows of the batches appended and the row groups the
+  // part must hold. The values count up, so a batch out of order or written
+  // twice shows.
+  struct Layout {
+    std::vector<int64_t> batches, row_groups;
+  };
+  const std::vector<Layout> layouts{
+      {{3, 3, 3, 3, 3}, {15}},           // fewer than six: one row group at finish
+      {{3, 3, 3, 3, 3, 3}, {18}},        // six
+      {{3, 3, 3, 3, 3, 3, 3}, {18, 3}},  // the seventh starts the next
+      {{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, {21, 57, 13}},
+      {{3, 0, 3, 0, 3, 3, 3, 3, 3}, {18, 3}},  // a batch without rows is no batch of a row group
+      {{4096, 4096, 5}, {4096, 4096, 5}},      // a batch of 4,096 rows is a row group of its own
+      {{4095, 1, 7}, {4096, 7}},               // the batch that brings the 4,096th row closes it
+      {{4095, 4095, 2}, {8190, 2}},
+      {{2000, 2000, 2000, 2000}, {6000, 2000}},
+      {{682, 682, 682, 682, 682, 682, 682}, {4092, 682}},  // six batches close it short of 4,096 rows
+      {{65536, 65536}, {65536, 65536}},                    // a narrow output: a row group per batch
+      {{40000, 40000, 20000}, {40000, 40000, 20000}},
+      {{65536, 1, 1, 1, 1, 1, 1, 1}, {65536, 6, 1}},
+      {{4000, 65536, 3}, {4000, 65536, 3}},  // 69,536 rows would pass 65,536, so the waiting batch goes first
+      {{3, 70000, 3}, {3, 70000, 3}},        // a batch of more than 65,536 rows is a row group by itself
+  };
+  for (const Layout& layout : layouts) {
+    CAPTURE(layout.batches);
+    TempDir dir;
+    int64_t total = 0;
+    for (const int64_t rows : layout.batches) total += rows;
+    fft::PartWriter writer(dir.path.string(), 0, total);
+    double next = 0.0;
+    for (const int64_t rows : layout.batches) {
+      std::vector<double> values(static_cast<std::size_t>(rows));
+      for (double& value : values) value = next++;
+      writer.append(make_batch({"x"}, {f64_column(values)}));
+    }
+    auto source = fft::open_source({writer.finish()});
+    REQUIRE(source->task_rows() == layout.row_groups);
+    double expected = 0.0;
+    for (const auto& task : source->plan_tasks()) {
+      const fft::Batch batch = source->read_task(task, nullptr);
+      const auto& values = static_cast<const arrow::DoubleArray&>(*batch.cols[0]);
+      for (int64_t row = 0; row < values.length(); ++row) REQUIRE(values.Value(row) == expected++);
+    }
+    REQUIRE(expected == static_cast<double>(total));
+  }
+}
+
+TEST_CASE("PartWriter holds no more than the batches of one row group") {
+  // The sixth batch writes the row group, which releases all six. Until then
+  // each is held, and the seventh waits in turn.
+  TempDir dir;
+  fft::PartWriter writer(dir.path.string(), 0, 14);
+  std::vector<std::weak_ptr<arrow::Array>> appended;
+  const auto held = [&] {
+    return std::count_if(appended.begin(), appended.end(),
+                         [](const std::weak_ptr<arrow::Array>& batch) { return !batch.expired(); });
+  };
+  for (int batch = 0; batch < 7; ++batch) {
+    {
+      auto values = f64_column({1.0, 2.0});
+      appended.emplace_back(values);
+      writer.append(make_batch({"x"}, {values}));
+    }
+    REQUIRE(held() == (batch < 5 ? batch + 1 : batch == 5 ? 0 : 1));
+  }
+  writer.abandon();
+  REQUIRE(held() == 0);
+
+  // A batch of 4,096 rows is a row group, so its own append writes it: an
+  // output whose batches are that large holds none between appends.
+  TempDir narrow;
+  fft::PartWriter full(narrow.path.string(), 0, 2 * 4096);
+  std::weak_ptr<arrow::Array> filled;
+  {
+    auto values = f64_column(std::vector<double>(4096, 1.0));
+    filled = values;
+    full.append(make_batch({"x"}, {values}));
+  }
+  REQUIRE(filled.expired());
+}
+
+TEST_CASE("PartWriter gives the batches of a row group one dictionary") {
+  // A column read from plain pages comes with a dictionary that grows from
+  // batch to batch. Arrow's writer keeps a row group's dictionary only while
+  // every batch brings an equal one, and writes the later values plain, which
+  // for 3,600 rows of five repeated words would be 3,000 words and not five.
+  TempDir dir;
+  const int64_t rows_each = 600;
+  fft::PartWriter writer(dir.path.string(), 0, 6 * rows_each);
+  std::vector<std::string> expected;
+  for (int batch = 0; batch < 6; ++batch) {
+    std::vector<std::optional<std::string>> entries;
+    for (int word = 0; word <= batch % 5; ++word) entries.emplace_back("word-" + std::to_string(word));
+    std::vector<std::optional<int32_t>> picks;
+    for (int64_t row = 0; row < rows_each; ++row) {
+      picks.emplace_back(static_cast<int32_t>(row % static_cast<int64_t>(entries.size())));
+      expected.push_back(*entries[static_cast<std::size_t>(*picks.back())]);
+    }
+    auto column = *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::utf8()),
+                                                      numeric_column<arrow::Int32Type>(picks), utf8_column(entries));
+    writer.append(make_batch({"s"}, {column}));
+  }
+  const std::string output = writer.finish();
+  auto raw = parquet::ParquetFileReader::OpenFile(output);
+  REQUIRE(raw->metadata()->num_row_groups() == 1);
+  // Five words and an index per row are 1,003 bytes before compression. With
+  // the 3,000 rows after the first batch written plain they are 30,081.
+  REQUIRE(raw->metadata()->RowGroup(0)->ColumnChunk(0)->total_uncompressed_size() < 4000);
+
+  auto source = fft::open_source({output});
+  const fft::Batch batch = source->read_task(source->plan_tasks().front(), nullptr);
+  const auto& column = static_cast<const arrow::DictionaryArray&>(*batch.cols[0]);
+  const auto& words = static_cast<const arrow::StringArray&>(*column.dictionary());
+  REQUIRE(column.length() == static_cast<int64_t>(expected.size()));
+  for (int64_t row = 0; row < column.length(); ++row) {
+    REQUIRE(words.GetString(column.GetValueIndex(row)) == expected[static_cast<std::size_t>(row)]);
+  }
+}
+
+TEST_CASE("PartWriter writes a dictionary column that cannot share one dictionary as it came") {
+  // int8 indices count 127 entries, and the six batches bring 600 between
+  // them, so Arrow's unifier refuses the column. The Parquet writer then
+  // keeps the first batch's dictionary and writes the other five plain.
+  TempDir dir;
+  fft::PartWriter writer(dir.path.string(), 0, 600);
+  std::vector<std::optional<std::string>> expected;
+  for (int batch = 0; batch < 6; ++batch) {
+    std::vector<std::optional<std::string>> entries;
+    std::vector<std::optional<int8_t>> picks;
+    for (int word = 0; word < 100; ++word) {
+      entries.emplace_back("batch-" + std::to_string(batch) + "-word-" + std::to_string(word));
+      picks.emplace_back(static_cast<int8_t>(word));
+    }
+    expected.insert(expected.end(), entries.begin(), entries.end());
+    auto column = *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int8(), arrow::utf8()),
+                                                      numeric_column<arrow::Int8Type>(picks), utf8_column(entries));
+    writer.append(make_batch({"s"}, {column}));
+  }
+  const std::string output = writer.finish();
+  const ChunkPages pages = chunk_pages(output, 0);
+  REQUIRE(pages.dictionary_entries == 100);
+  REQUIRE(pages.index_values == 100);
+  REQUIRE(pages.plain_values == 500);
+  REQUIRE(read_strings(output) == expected);
+
+  // A dictionary that holds a null is refused by the unifier and then by the
+  // Parquet writer, which refuses it in a row group of one batch too.
+  for (const int batches : {1, 6}) {
+    CAPTURE(batches);
+    TempDir refused;
+    fft::PartWriter null_entry(refused.path.string(), 0, 3 * batches);
+    const auto append_and_finish = [&] {
+      for (int batch = 0; batch < batches; ++batch) {
+        auto column = *arrow::DictionaryArray::FromArrays(
+            arrow::dictionary(arrow::int32(), arrow::utf8()), numeric_column<arrow::Int32Type>({0, 1, 2}),
+            utf8_column({"a", std::nullopt, "batch-" + std::to_string(batch)}));
+        null_entry.append(make_batch({"s"}, {column}));
+      }
+      null_entry.finish();
+    };
+    REQUIRE_THROWS_WITH(append_and_finish(), ContainsSubstring("null encoded in dictionary"));
+    REQUIRE(std::filesystem::is_empty(refused.path));
+  }
+}
+
+TEST_CASE("PartWriter does not read the dictionary index of a null row") {
+  // A null row's index is whatever its producer left there: here the largest
+  // int32, far outside the dictionary. Arrow's unifier maps every index
+  // through a table as long as the dictionary, null rows included, so a
+  // column with such a row is not unified: the first batch's dictionary
+  // stays and the second batch, which brings another, is written plain.
+  using Strings = std::vector<std::optional<std::string>>;
+  const auto strings = [](const Strings& entries, const std::vector<std::optional<int64_t>>& rows) {
+    return *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::utf8()),
+                                               indices_with_garbage<arrow::Int32Type>(rows), utf8_column(entries));
+  };
+  TempDir dir;
+  fft::PartWriter writer(dir.path.string(), 0, 6);
+  writer.append(make_batch({"s"}, {strings({"a", "b"}, {0, std::nullopt, 1})}));
+  writer.append(make_batch({"s"}, {strings({"c", "a"}, {1, std::nullopt, 0})}));
+  std::string output = writer.finish();
+  const Strings expected{"a", std::nullopt, "b", "a", std::nullopt, "c"};
+  REQUIRE(read_strings(output) == expected);
+  ChunkPages pages = chunk_pages(output, 0);
+  REQUIRE(pages.dictionary_entries == 2);
+  REQUIRE(pages.plain_values == 3);  // the second batch's rows, its null among them
+
+  // The strings of a list hold such rows one level down. Each batch here is
+  // one list of the same three strings.
+  const auto list_of = [](const std::shared_ptr<arrow::Array>& values) {
+    const auto offsets = numeric_column<arrow::Int32Type>({0, static_cast<int32_t>(values->length())});
+    return *arrow::ListArray::FromArrays(*offsets, *values);
+  };
+  TempDir nested;
+  fft::PartWriter lists(nested.path.string(), 0, 2);
+  lists.append(make_batch({"s"}, {list_of(strings({"a", "b"}, {0, std::nullopt, 1}))}));
+  lists.append(make_batch({"s"}, {list_of(strings({"c", "a"}, {1, std::nullopt, 0}))}));
+  REQUIRE(read_strings(lists.finish()) == expected);
+
+  // A batch of nulls alone can bring an empty dictionary. It has no index to
+  // map, so the rows hold whatever they hold and the column is unified: the
+  // row group keeps one dictionary.
+  TempDir nulls_first;
+  fft::PartWriter after_nulls(nulls_first.path.string(), 0, 4);
+  after_nulls.append(make_batch({"s"}, {strings({}, {std::nullopt, std::nullopt})}));
+  after_nulls.append(make_batch({"s"}, {strings({"a", "b"}, {1, 0})}));
+  output = after_nulls.finish();
+  const Strings expected_after_nulls{std::nullopt, std::nullopt, "b", "a"};
+  REQUIRE(read_strings(output) == expected_after_nulls);
+  pages = chunk_pages(output, 0);
+  REQUIRE(pages.dictionary_entries == 2);
+  REQUIRE(pages.plain_values == 0);
+}
+
 TEST_CASE("PartWriter holds at most 64 KiB of a part back from its file") {
   TempDir dir;
   const std::string output = part(dir, 0);
-  // 7,500 doubles are 60,000 bytes of page, which the buffer holds. The
-  // 8,000 bytes of 1,000 more do not fit beside them, so they push the
-  // first batch out. 20,000 doubles are 160,000 bytes.
+  // Each batch holds 4,096 rows or more, so each is a row group that its own
+  // append hands to the Parquet writer. 7,500 doubles are 60,000 bytes of
+  // page, which the buffer holds. The 32,768 bytes of 4,096 more do not fit
+  // beside them, so they push the first row group out. 20,000 doubles are
+  // 160,000 bytes.
   const std::vector<double> first = incompressible_doubles(7500, 1);
-  const std::vector<double> second = incompressible_doubles(1000, 2);
+  const std::vector<double> second = incompressible_doubles(4096, 2);
   const std::vector<double> third = incompressible_doubles(20000, 3);
-  fft::PartWriter writer(dir.path.string(), 0, 28500);
+  fft::PartWriter writer(dir.path.string(), 0, 31596);
   writer.append(make_batch({"x"}, {f64_column(first)}));
   REQUIRE(std::filesystem::file_size(output + ".tmp") == 0u);
   writer.append(make_batch({"x"}, {f64_column(second)}));
   const auto after_second = std::filesystem::file_size(output + ".tmp");
-  REQUIRE(after_second >= 60000u);  // the first batch, which the second pushed out
-  REQUIRE(after_second < 68000u);   // the second batch is still held back
+  REQUIRE(after_second >= 60000u);  // the first row group, which the second pushed out
+  REQUIRE(after_second < 68000u);   // the second row group is still held back
   writer.append(make_batch({"x"}, {f64_column(third)}));
-  REQUIRE(std::filesystem::file_size(output + ".tmp") >= 228000u - 65536u);
+  REQUIRE(std::filesystem::file_size(output + ".tmp") >= 252768u - 65536u);
   REQUIRE(writer.finish() == output);
-  REQUIRE(std::filesystem::file_size(output) >= 228000u);
+  REQUIRE(std::filesystem::file_size(output) >= 252768u);
 
   auto source = fft::open_source({output});
-  REQUIRE(source->task_rows() == std::vector<int64_t>{7500, 1000, 20000});
+  REQUIRE(source->task_rows() == std::vector<int64_t>{7500, 4096, 20000});
   std::vector<double> expected = first;
   expected.insert(expected.end(), second.begin(), second.end());
   expected.insert(expected.end(), third.begin(), third.end());
@@ -883,17 +1127,40 @@ TEST_CASE("PartWriter fails a part whose write the disk refuses, whichever call 
     REQUIRE(file_contents(previous) == published);
   };
 
-  // A batch larger than the buffer reaches the file while it is appended, so
-  // append meets the refusal.
+  // A row group larger than the buffer reaches the file when the batch that
+  // completes it is appended, so that append meets the refusal and the one
+  // before it does not. A batch of 4,000 doubles waits, and the 5,000 that
+  // follow make a row group of 72,000 bytes of page.
+  const auto waiting = make_batch({"x"}, {f64_column(incompressible_doubles(4000, 5))});
   std::string immediate;
   {
-    fft::PartWriter writer(dir.path.string(), 0, 20000);
-    immediate = error_under_file_size_limit(16, [&] { writer.append(large); });
+    const auto completing = make_batch({"x"}, {f64_column(incompressible_doubles(5000, 6))});
+    fft::PartWriter writer(dir.path.string(), 0, 9000);
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.append(waiting); }).empty());
+    immediate = error_under_file_size_limit(16, [&] { writer.append(completing); });
     nothing_left();
     REQUIRE_THROWS_WITH(writer.finish(), ContainsSubstring("no longer active"));
   }
   REQUIRE_THAT(immediate, StartsWith(previous + ": "));
   REQUIRE_THAT(immediate, ContainsSubstring("File too large"));
+
+  // A batch of 4,096 rows or more is a row group, so its own append meets
+  // the refusal.
+  {
+    fft::PartWriter writer(dir.path.string(), 0, 20000);
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.append(large); }) == immediate);
+    nothing_left();
+  }
+
+  // A batch that waits for its row group is written by finish, which meets
+  // the same refusal.
+  {
+    fft::PartWriter writer(dir.path.string(), 0, 4000);
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.append(waiting); }).empty());
+    REQUIRE(error_under_file_size_limit(16, [&] { writer.finish(); }) == immediate);
+    nothing_left();
+    REQUIRE_THROWS_WITH(writer.finish(), ContainsSubstring("no longer active"));
+  }
 
   // A part smaller than the buffer reaches the file only when finish closes
   // it: append succeeds, and finish reports the same error and publishes

@@ -107,8 +107,10 @@ def test_vector_elements_count_like_scalars_and_binary_values_by_their_bytes(tmp
     # A vector's element counts 8 bytes like a scalar column, however narrow,
     # so 768 of them batch like 768 float64 columns or a 6,144-byte binary
     # value, whether they arrive as a fixed-size list or as the plain list
-    # Parquet stores, whose length comes from the footers.
-    rows, dim = 2000, 768
+    # Parquet stores, whose length comes from the footers. Such a batch holds
+    # 910 rows, and a row group takes batches until it holds 4,096 rows, five
+    # of these, so 5,000 rows are two row groups.
+    rows, dim = 5000, 768
     values = np.random.default_rng(0).standard_normal((rows, dim), dtype=np.float32)
     flat = pa.array(values.reshape(-1))
     offsets = pa.array(np.arange(0, rows * dim + 1, dim, dtype=np.int32))
@@ -147,8 +149,10 @@ def test_vector_elements_count_like_scalars_and_binary_values_by_their_bytes(tmp
 
 def test_a_plain_list_keeps_its_footer_width_through_later_stages(tmp_path: Path) -> None:
     # Hashing a key widens the batch while the vector passes through: the
-    # plain list counts as wide there as the fixed-size list's tag does.
-    rows, dim = 2000, 768
+    # plain list counts as wide there as the fixed-size list's tag does. A
+    # batch holds 682 rows and a row group six batches, so 4,500 rows are two
+    # row groups.
+    rows, dim = 4500, 768
     flat = pa.array(np.random.default_rng(0).standard_normal(rows * dim, dtype=np.float32))
     vectors = {
         "fixed": pa.FixedSizeListArray.from_arrays(flat, dim),

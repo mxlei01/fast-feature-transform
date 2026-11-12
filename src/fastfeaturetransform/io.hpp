@@ -1,7 +1,8 @@
 // Data in and out. ParquetSource plans one task per row group (the
 // parallelism unit) and decodes tasks independently; PartWriter writes one
-// task's output as an ordered part file, a row group per batch; MemmapSink
-// writes every task's rows at fixed offsets into one preallocated data.mmap.
+// task's output as an ordered part file, its batches gathered into row
+// groups; MemmapSink writes every task's rows at fixed offsets into one
+// preallocated data.mmap.
 // open_source sniffs content (PAR1 magic bytes), never just the extension.
 #pragma once
 
@@ -101,11 +102,17 @@ class ParquetSource final : public RecordBatchSource {
 
 // One ordered part per source task, written a batch at a time. The first
 // batch establishes the physical Arrow schema; even an empty task must append
-// one typed empty batch. Nonempty batches become separate output row groups,
-// so the writer never retains all rows of the source row group. Publication
-// occurs only after schema/total-row validation and successful writer close.
-// The file is written through a buffer, so a write the disk refuses fails a
-// later append() or finish(), not always the append() that produced the bytes.
+// one typed empty batch. A nonempty batch of 4,096 rows or more is a row
+// group of its own. Smaller batches are gathered until their row group holds
+// 4,096 rows or six batches, so the writer holds no more than six batches at
+// a time, and no row group passes 65,536 rows unless one batch does.
+// Publication occurs only after schema/total-row validation and successful
+// writer close.
+// A batch reaches the Parquet writer with its row group, so a batch that
+// writer refuses fails the append() that completes the row group, or
+// finish(). The file is written through a buffer, so a write the disk refuses
+// fails a later append() or finish(), not always the one that produced the
+// bytes.
 class PartWriter {
  public:
   PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows);

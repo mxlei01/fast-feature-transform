@@ -1,8 +1,10 @@
 #include "fastfeaturetransform/io.hpp"
 
 #include <arrow/api.h>
+#include <arrow/array/array_dict.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
+#include <arrow/chunked_array.h>
 #include <arrow/io/buffered.h>
 #include <arrow/io/file.h>
 #include <arrow/io/interfaces.h>
@@ -731,7 +733,49 @@ bool suits_low_dictionary_limit(const arrow::DataType& type) {
          id == arrow::Type::TIME64 || id == arrow::Type::DURATION;
 }
 
+// Whether every dictionary index in `data` lies inside its dictionary, the
+// index of a null row too, for a dictionary column and for one nested in a
+// list or a struct. Arrow's dictionary unifier maps every index of a chunk
+// through a table as long as the chunk's dictionary without looking at
+// validity, and a null row's index is whatever its producer left there. A
+// chunk whose dictionary is empty has no index to map, and the unifier
+// leaves its indices as they are.
+bool indices_inside_dictionaries(const arrow::ArrayData& data) {
+  if (data.type->id() == arrow::Type::DICTIONARY && data.dictionary->length > 0) {
+    // The same index buffer as an array without validity, so that Arrow's
+    // check reads every row.
+    const auto& type = static_cast<const arrow::DictionaryType&>(*data.type);
+    const arrow::ArrayData every_row(type.index_type(), data.length, arrow::BufferVector{nullptr, data.buffers[1]},
+                                     int64_t{0}, data.offset);
+    const auto entries = static_cast<uint64_t>(data.dictionary->length);
+    if (!arrow::internal::CheckIndexBounds(arrow::ArraySpan(every_row), entries).ok()) return false;
+  }
+  return std::all_of(
+      data.child_data.begin(), data.child_data.end(),
+      [](const std::shared_ptr<arrow::ArrayData>& child) { return indices_inside_dictionaries(*child); });
+}
+
 }  // namespace
+
+// A batch of fewer than 4,096 rows waits for the ones after it: its row group
+// closes once it holds 4,096 rows or six batches. A batch holds fewer rows
+// the wider the output is, and every row group repeats each column's page
+// header, statistics and footer entry, so a row group per batch gives a very
+// wide output hundreds of row groups that are mostly those. A batch of 4,096
+// rows or more, which an output of up to 170 numeric columns has, is a row
+// group of its own, and no row group passes 65,536 rows unless one batch does.
+// Six bounds what a writer holds while the batches wait.
+//
+// Gathering the larger batches too, up to 65,536 rows a row group, was
+// measured and dropped: a worker then held five more batches for every
+// output wider than about ten columns, and at eight threads one-hot outputs
+// of 100 and 300 columns took 158 -> 379 and 200 -> 522 MiB of peak memory
+// (524,288 rows, Apple M4). Under this rule the same outputs take 150 and
+// 225 MiB, and a one-hot output of 1,000 columns has the layout either rule
+// gives it: 0.59 of the time and 0.20 of the bytes of a row group per batch.
+constexpr int64_t kRowGroupMinRows = 4096;
+constexpr int64_t kRowGroupRows = 65536;
+constexpr std::size_t kRowGroupBatches = 6;
 
 struct PartWriter::Impl {
   std::string path, temp;
@@ -739,7 +783,47 @@ struct PartWriter::Impl {
   std::shared_ptr<arrow::Schema> schema;
   std::shared_ptr<arrow::io::OutputStream> output;  // the part file behind its write buffer
   std::unique_ptr<parquet::arrow::FileWriter> writer;
+  std::vector<std::shared_ptr<arrow::Table>> pending;  // the batches of the row group being collected
+  int64_t pending_rows = 0;
   bool finished = false, abandoned = false, owns_temp = false;
+
+  // Write the collected batches as one row group.
+  void write_pending() {
+    if (pending.empty()) return;
+    std::shared_ptr<arrow::Table> group = pending.front();
+    if (pending.size() > 1) {
+      auto combined = arrow::ConcatenateTables(pending);
+      if (!combined.ok()) throw Error(path + ": " + combined.status().ToString());
+      group = *combined;
+      // The Parquet writer keeps a column's dictionary through a row group
+      // only while every batch brings an equal one. When a batch brings
+      // another, it writes the rest of the row group's values plain, and
+      // batches do differ: a column read from plain pages comes with a
+      // dictionary that grows from batch to batch. So the batches of a row
+      // group are given one dictionary first. A column goes to the writer as
+      // it came in three cases: a null row of it holds an index outside its
+      // dictionary, which the unifier would follow; its index type is too
+      // narrow to count the entries of the one dictionary; or its dictionary
+      // holds a null, which the Parquet writer then refuses, as it does in a
+      // row group of one batch.
+      arrow::ChunkedArrayVector columns = group->columns();
+      for (std::shared_ptr<arrow::ChunkedArray>& column : columns) {
+        const arrow::ArrayVector& chunks = column->chunks();
+        if (!std::all_of(chunks.begin(), chunks.end(), [](const std::shared_ptr<arrow::Array>& chunk) {
+              return indices_inside_dictionaries(*chunk->data());
+            })) {
+          continue;
+        }
+        auto unified = arrow::DictionaryUnifier::UnifyChunkedArray(column);
+        if (unified.ok()) column = *unified;
+      }
+      group = arrow::Table::Make(group->schema(), std::move(columns), pending_rows);
+    }
+    const auto status = writer->WriteTable(*group, pending_rows);
+    if (!status.ok()) throw Error(path + ": " + status.ToString());
+    pending.clear();
+    pending_rows = 0;
+  }
 };
 
 PartWriter::PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows)
@@ -820,10 +904,10 @@ void PartWriter::append(const Batch& batch) {
       state.writer = std::move(*writer);
     }
     if (batch.rows > 0) {
-      // WriteTable flushes a complete row group, unlike WriteRecordBatch's
-      // buffered-row-group mode. Only this callback's batch stays resident.
-      status = state.writer->WriteTable(*table, batch.rows);
-      if (!status.ok()) throw Error(state.path + ": " + status.ToString());
+      if (state.pending_rows + batch.rows > kRowGroupRows) state.write_pending();
+      state.pending.push_back(std::move(table));
+      state.pending_rows += batch.rows;
+      if (state.pending.size() == kRowGroupBatches || state.pending_rows >= kRowGroupMinRows) state.write_pending();
     }
     state.rows += batch.rows;
   } catch (...) {
@@ -854,6 +938,7 @@ std::string PartWriter::finish() {
       const auto status = state.writer->WriteTable(*table, 1);
       if (!status.ok()) throw Error(state.path + ": " + status.ToString());
     }
+    state.write_pending();
     auto status = state.writer->Close();
     if (!status.ok()) throw Error(state.path + ": " + status.ToString());
     state.writer.reset();
@@ -879,6 +964,7 @@ void PartWriter::abandon() noexcept {
   auto& state = *impl_;
   if (state.finished || state.abandoned) return;
   state.abandoned = true;
+  state.pending.clear();
   if (state.writer) {
     try {
       (void)state.writer->Close();
