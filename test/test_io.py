@@ -299,6 +299,62 @@ def test_a_write_the_disk_refuses_fails_the_transform_and_leaves_no_part(tmp_pat
     assert pq.read_table(parts[0]).num_rows == 3
 
 
+@pytest.mark.parametrize("order", [(0, 1), (1, 0), (0, 1, 2)], ids=["dictionary first", "delta first", "three"])
+def test_files_that_store_one_nested_string_column_differently_are_read_together(
+    tmp_path: Path, order: tuple[int, ...]
+) -> None:
+    # REGRESSION: a list of strings is one column however a file's writer
+    # encoded it. Its type used to record whether the strings were read as a
+    # dictionary, which follows from the encoding, so a file with dictionary
+    # pages and one with delta pages were refused as holding different types.
+    tags: list[list[str] | None] = [["a", "b"], ["c"], [], ["a"], None] * 40
+    table: pa.Table = pa.table(
+        {
+            "tags": pa.array(tags, pa.list_(pa.string())),
+            "pair": pa.array([{"name": "n1", "v": 1}, {"name": "n2", "v": 2}] * 100),
+            "word": ["x", "y", "z", "x", "y"] * 40,
+            "x": np.arange(200, dtype=np.float64),
+        }
+    )
+    delta: dict[str, str] = {
+        "tags.list.element": "DELTA_BYTE_ARRAY",
+        "pair.name": "DELTA_BYTE_ARRAY",
+        "pair.v": "PLAIN",
+        "word": "DELTA_BYTE_ARRAY",
+        "x": "PLAIN",
+    }
+    files: list[str] = [
+        _write(tmp_path / "dictionary.parquet", table, use_dictionary=True),
+        _write(tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding=delta),
+        # Dictionary pages that give way to plain ones partway.
+        _write(tmp_path / "fallback.parquet", table, use_dictionary=True, dictionary_pagesize_limit=4),
+    ]
+    sources: list[str] = [files[i] for i in order]
+    pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["x"], with_mean=False, with_std=False))])
+    parts: list[Path] = pipeline.fit(sources).transform_parquet(sources, output_dir=tmp_path / "out")
+    assert len(parts) == len(sources)
+    # pyarrow reads the parts back as one table, each column of one type.
+    assert pq.read_table(tmp_path / "out").equals(pa.concat_tables([table] * len(sources)))
+
+
+def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: Path) -> None:
+    strings: str = _write(tmp_path / "strings.parquet", pa.table({"tags": pa.array([["a"], ["b"]])}))
+    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"tags": pa.array([[1], [2]])}))
+    large: str = _write(
+        tmp_path / "large.parquet", pa.table({"tags": pa.array([["a"], ["b"]], pa.large_list(pa.string()))})
+    )
+    # The message names the type, without the dictionary the strings are read as.
+    message: str = (
+        r"numbers\.parquet: column 'tags' is list<element: int64> but .*strings\.parquet has list<element: string>$"
+    )
+    with pytest.raises(EngineError, match=message):
+        Select(columns=["tags"]).fit([strings, numbers])
+    with pytest.raises(
+        EngineError, match=r"column 'tags' is large_list<element: string> but .* has list<element: string>$"
+    ):
+        Select(columns=["tags"]).fit([strings, large])
+
+
 def test_schema_mismatch_messages_name_the_column(tmp_path: Path) -> None:
     first: str = _write(tmp_path / "a.parquet", pa.table({"device": ["a"], "price": [1.0]}))
     fewer: str = _write(tmp_path / "b.parquet", pa.table({"device": ["a"]}))

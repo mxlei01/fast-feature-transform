@@ -542,6 +542,50 @@ TEST_CASE("timestamp columns enter the engine as int64 epoch microseconds") {
   }
 }
 
+TEST_CASE("a nested column's tag names its type and not the dictionaries its strings were read as") {
+  // Whether a string comes as a dictionary follows from how its file stored
+  // it, so the same column has both forms across files and one tag.
+  const auto words = arrow::dictionary(arrow::int32(), arrow::utf8());
+  const auto element = [](const std::shared_ptr<arrow::DataType>& type) { return arrow::field("element", type); };
+  struct Case {
+    std::shared_ptr<arrow::DataType> stored, plain;
+    std::string tag;
+  };
+  const std::vector<Case> cases{
+      {arrow::list(element(words)), arrow::list(element(arrow::utf8())), "list<element: string>"},
+      {arrow::large_list(element(words)), arrow::large_list(element(arrow::utf8())), "large_list<element: string>"},
+      {arrow::struct_({arrow::field("name", words), arrow::field("n", arrow::int64())}),
+       arrow::struct_({arrow::field("name", arrow::utf8()), arrow::field("n", arrow::int64())}),
+       "struct<name: string, n: int64>"},
+      {arrow::list(element(arrow::struct_({arrow::field("tags", arrow::list(element(words)))}))),
+       arrow::list(element(arrow::struct_({arrow::field("tags", arrow::list(element(arrow::utf8())))}))),
+       "list<element: struct<tags: list<element: string>>>"},
+      {arrow::map(arrow::utf8(), words), arrow::map(arrow::utf8(), arrow::utf8()), "map<string, string>"},
+      {arrow::struct_({arrow::field("v", arrow::fixed_size_list(element(words), 2))}),
+       arrow::struct_({arrow::field("v", arrow::fixed_size_list(element(arrow::utf8()), 2))}),
+       "struct<v: fixed_size_list<element: string>[2]>"},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.tag);
+    const auto stored = fft::schema_from_arrow(*arrow::schema({arrow::field("c", c.stored)}), "test");
+    const auto plain = fft::schema_from_arrow(*arrow::schema({arrow::field("c", c.plain)}), "test");
+    REQUIRE(stored.cols == fft::Schema{{{"c", c.tag}}}.cols);
+    REQUIRE(plain.cols == stored.cols);
+  }
+  // Types that differ still have different tags: a list of numbers, a large
+  // list, another field name.
+  const auto tag = [](const std::shared_ptr<arrow::DataType>& type) {
+    return fft::schema_from_arrow(*arrow::schema({arrow::field("c", type)}), "test").cols.front().second;
+  };
+  REQUIRE(tag(arrow::list(element(arrow::int64()))) == "list<element: int64>");
+  REQUIRE(tag(arrow::large_list(element(words))) != tag(arrow::list(element(words))));
+  REQUIRE(tag(arrow::list(arrow::field("item", words))) == "list<item: string>");
+  // A column that is a dictionary itself, and a vector of them, were already
+  // named by their values.
+  REQUIRE(tag(words) == "utf8");
+  REQUIRE(tag(arrow::fixed_size_list(element(words), 3)) == "utf8[3]");
+}
+
 TEST_CASE("files must agree on whether a column holds integers, naive timestamps or zoned ones") {
   using arrow::TimeUnit;
   using fft::testing::timestamp_column;
