@@ -14,35 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import CountEncoder, EngineError, Pipeline, _core
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
+from helpers import read_rows, write_parquet
 
 
 @pytest.fixture
@@ -57,7 +29,7 @@ def events(tmp_path: Path) -> list[str]:
 
     """
     table: pa.Table = pa.table({"device": ["ios", "web", "ios", None, "tv", "ios"], "price": [1.0] * 6})
-    return [_write(tmp_path / "events.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "events.parquet", table, row_group_size=2)]
 
 
 def test_count_encode_tallies_categories_and_keeps_the_column_type_explicit(events: list[str], tmp_path: Path) -> None:
@@ -73,7 +45,7 @@ def test_count_encode_tallies_categories_and_keeps_the_column_type_explicit(even
     assert encoder.transform_dict({"device": "nobody"}) == {"device": 0}
 
     ratios: CountEncoder = CountEncoder(columns=["device"], normalize=True).fit(events)
-    rows: list[dict[str, Any]] = _rows(ratios.transform_parquet(events, output_dir=tmp_path / "ratio"))
+    rows: list[dict[str, Any]] = read_rows(ratios.transform_parquet(events, output_dir=tmp_path / "ratio"))
     assert rows[0]["device"] == pytest.approx(0.5)
     assert ratios.transform_dict({"device": "nobody"}) == {"device": 0.0}
 
@@ -88,20 +60,20 @@ def test_count_encode_null_and_unknown_options(events: list[str], tmp_path: Path
 
     as_null: CountEncoder = CountEncoder(columns=["device"], handle_unknown="return_nan").fit(events)
     assert as_null.transform_dict({"device": "nobody"}) == {"device": None}
-    assert _rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == 3
+    assert read_rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == 3
 
     strict: CountEncoder = CountEncoder(columns=["device"], handle_unknown="error").fit(events)
     with pytest.raises(EngineError, match="category that was not seen at fit"):
         strict.transform_dict({"device": "nobody"})
 
-    nulls: str = _write(tmp_path / "nulls.parquet", pa.table({"device": ["ios", None]}))
+    nulls: str = write_parquet(tmp_path / "nulls.parquet", pa.table({"device": ["ios", None]}))
     with pytest.raises(EngineError, match="has nulls and handle_missing is 'error'"):
         CountEncoder(columns=["device"], handle_missing="error").fit([nulls])
 
 
 def test_count_encode_folds_small_groups(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"device": ["ios"] * 6 + ["web", "tv", "mob", "mob"]})
-    path: str = _write(tmp_path / "rare.parquet", table)
+    path: str = write_parquet(tmp_path / "rare.parquet", table)
     folded: CountEncoder = CountEncoder(columns=["device"], min_group_size=3).fit([path])
     assert folded.counts_ == {"device": {"ios": 6, "mob_tv_web": 4}}
     assert folded.transform_dict({"device": "web"}) == {"device": 4}
@@ -121,7 +93,7 @@ def test_count_encode_folds_small_groups(tmp_path: Path) -> None:
 # survived save and load. category_encoders overwrites in the same situation
 # and loses the real count instead; we refuse rather than pick a winner.
 def test_count_encode_refuses_a_group_named_like_a_surviving_category(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "collide.parquet",
         pa.table({"device": ["x", "x", "y", "y"] + ["x_y"] * 3 + ["keep"] * 10}),
     )
@@ -138,16 +110,18 @@ def test_count_encode_refuses_a_group_named_like_a_surviving_category(tmp_path: 
 # named like the shortened name was refused where category_encoders fits it:
 # "" and the null folded into "nan" beside a literal "nan".
 def test_count_encode_keeps_the_separator_after_an_empty_member(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "empty.parquet", pa.table({"device": ["", "x"] + ["keep"] * 3}))
+    path: str = write_parquet(tmp_path / "empty.parquet", pa.table({"device": ["", "x"] + ["keep"] * 3}))
     folded: CountEncoder = CountEncoder(columns=["device"], min_group_size=2).fit([path])
     assert folded.counts_ == {"device": {"_x": 2, "keep": 3}}
     assert folded.transform_dict({"device": ""}) == {"device": 2}
 
-    collide: str = _write(tmp_path / "collide.parquet", pa.table({"device": ["", "x"] + ["_x"] * 2 + ["keep"] * 3}))
+    collide: str = write_parquet(
+        tmp_path / "collide.parquet", pa.table({"device": ["", "x"] + ["_x"] * 2 + ["keep"] * 3})
+    )
     with pytest.raises(EngineError, match="the folded group is named '_x', which is already a category"):
         CountEncoder(columns=["device"], min_group_size=2).fit([collide])
 
-    text: str = _write(tmp_path / "text.parquet", pa.table({"device": ["", None] + ["nan"] * 3 + ["keep"] * 3}))
+    text: str = write_parquet(tmp_path / "text.parquet", pa.table({"device": ["", None] + ["nan"] * 3 + ["keep"] * 3}))
     beside: CountEncoder = CountEncoder(columns=["device"], min_group_size=2).fit([text])
     assert beside.counts_ == {"device": {"_nan": 2, "keep": 3, "nan": 3}}
     assert beside.transform_dict({"device": None}) == {"device": 2}
@@ -161,11 +135,11 @@ def test_count_encode_keeps_the_separator_after_an_empty_member(tmp_path: Path) 
 # lookup, so the batch and record answers agreed with each other and were both
 # wrong; the parity fixture had no case combining the three.
 def test_count_encode_does_not_normalize_an_integer_unknown_fill(tmp_path: Path) -> None:
-    train: str = _write(tmp_path / "train.parquet", pa.table({"device": ["ios", "ios", "web", "web"]}))
-    serve: str = _write(tmp_path / "serve.parquet", pa.table({"device": ["ios", "nobody", None]}))
+    train: str = write_parquet(tmp_path / "train.parquet", pa.table({"device": ["ios", "ios", "web", "web"]}))
+    serve: str = write_parquet(tmp_path / "serve.parquet", pa.table({"device": ["ios", "nobody", None]}))
     encoder: CountEncoder = CountEncoder(columns=["device"], normalize=True, handle_unknown=7).fit([train])
     values: list[Any] = [
-        row["device"] for row in _rows(encoder.transform_parquet([serve], output_dir=tmp_path / "out"))
+        row["device"] for row in read_rows(encoder.transform_parquet([serve], output_dir=tmp_path / "out"))
     ]
     assert values == [0.5, 7.0, 7.0]
     assert values == [encoder.transform_dict({"device": value})["device"] for value in ["ios", "nobody", None]]
@@ -223,7 +197,7 @@ def test_count_encode_validates_its_arguments(events: list[str]) -> None:
         CountEncoder(columns=["device"], normalize=text)
     numbers: pa.Table = pa.table({"n": [1, 2]})
     with pytest.raises(EngineError, match="no utf8 columns to count-encode"):
-        CountEncoder().fit([_write(Path(events[0]).parent / "numbers.parquet", numbers)])
+        CountEncoder().fit([write_parquet(Path(events[0]).parent / "numbers.parquet", numbers)])
 
 
 # The fit data of the folding tests below. With a threshold of 3 the one null
@@ -316,8 +290,8 @@ def _fold_files(tmp_path: Path) -> tuple[str, str]:
         The path of the fit data, in three row groups, and the path of the probes.
 
     """
-    train: str = _write(tmp_path / "train.parquet", pa.table(_FOLD_DATA), row_group_size=4)
-    return train, _write(tmp_path / "probes.parquet", pa.table(_FOLD_PROBES))
+    train: str = write_parquet(tmp_path / "train.parquet", pa.table(_FOLD_DATA), row_group_size=4)
+    return train, write_parquet(tmp_path / "probes.parquet", pa.table(_FOLD_PROBES))
 
 
 def _fold_state(fold: _Fold, groups: dict[str, Any]) -> dict[str, Any]:
@@ -347,7 +321,7 @@ def _assert_fold_answers(fitted: Pipeline | CountEncoder, fold: _Fold, probes: s
     expected: list[dict[str, Any]] = [{"c": c, "d": d} for c, d in zip(fold.c, fold.d, strict=True)]
     if fold.options.get("normalize"):  # divides a count by the 9 fitted rows
         expected = [{"c": row["c"] / 9, "d": row["d"] / 9} for row in expected]
-    assert _rows(fitted.transform_parquet([probes], output_dir=output_dir)) == expected
+    assert read_rows(fitted.transform_parquet([probes], output_dir=output_dir)) == expected
     records: list[dict[str, Any]] = [
         fitted.transform_dict({"c": c, "d": d}) for c, d in zip(_FOLD_PROBES["c"], _FOLD_PROBES["d"], strict=True)
     ]
@@ -429,7 +403,7 @@ def test_count_encode_saved_pipeline_grows_linearly_with_the_folded_categories(t
     sizes: dict[int, int] = {}
     for rare in (1000, 2000, 4000):
         table: pa.Table = pa.table({"c": [f"cat{index:05d}" for index in range(rare)] + ["big"] * 5000})
-        path: str = _write(tmp_path / f"{rare}.parquet", table)
+        path: str = write_parquet(tmp_path / f"{rare}.parquet", table)
         pipeline: Pipeline = Pipeline([("count", CountEncoder(columns=["c"], min_group_size=2))]).fit([path])
         assert pipeline.transform_dict({"c": "cat00999"}) == {"c": rare}
         pipeline.save(tmp_path / str(rare))
@@ -453,7 +427,7 @@ def test_count_encode_saved_pipeline_grows_linearly_with_the_folded_categories(t
 def test_count_encode_loads_a_large_group_in_time_linear_in_its_members(tmp_path: Path) -> None:
     members: int = 128_000
     table: pa.Table = pa.table({"c": [f"cat{index:06d}" for index in range(members)] + ["big"] * 5})
-    path: str = _write(tmp_path / "train.parquet", table)
+    path: str = write_parquet(tmp_path / "train.parquet", table)
     Pipeline([("count", CountEncoder(columns=["c"], min_group_size=2))]).fit([path]).save(tmp_path / "saved")
     start: float = time.process_time()
     loaded: Pipeline = Pipeline.load(tmp_path / "saved")
@@ -519,8 +493,10 @@ def test_count_encode_loads_several_groups_with_members_in_any_order(tmp_path: P
     values: list[str] = ["a", "b", "", "l", "m", "keep", "rare", "low", "unseen"]
     counts: list[int] = [3, 3, 3, 7, 7, 5, 3, 7, 0]
     assert [loaded.transform_dict({"c": value})["c"] for value in values] == counts
-    probes: str = _write(tmp_path / "probes.parquet", pa.table({"c": values}))
-    assert _rows(loaded.transform_parquet([probes], output_dir=tmp_path / "out")) == [{"c": count} for count in counts]
+    probes: str = write_parquet(tmp_path / "probes.parquet", pa.table({"c": values}))
+    assert read_rows(loaded.transform_parquet([probes], output_dir=tmp_path / "out")) == [
+        {"c": count} for count in counts
+    ]
     state["groups"] = {"c": {"low": ["l", "m"], "rare": ["", "a", "b"]}}
     assert json.loads(loaded.stages_state()) == {"count": state}
 
@@ -530,7 +506,7 @@ def test_count_encode_groups_do_not_depend_on_the_split_or_the_row_order(tmp_pat
     states: set[str] = set()
     for name, rows in (("forward", table), ("backward", table.take(list(range(table.num_rows - 1, -1, -1))))):
         for row_group_size in (2, 4, 9):
-            path: str = _write(tmp_path / f"{name}{row_group_size}.parquet", rows, row_group_size=row_group_size)
+            path: str = write_parquet(tmp_path / f"{name}{row_group_size}.parquet", rows, row_group_size=row_group_size)
             for threads in (1, 4):
                 encoder: CountEncoder = CountEncoder(columns=["c", "d"], min_group_size=3).fit([path], threads=threads)
                 states.add(encoder._require_handle().stage_state("countencoder"))

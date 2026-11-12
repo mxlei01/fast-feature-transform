@@ -22,37 +22,9 @@ from fast_feature_transform import (
     Transformer,
     _core,
 )
+from helpers import read_rows, write_parquet
 
 ROWS: int = 8
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
 
 
 def _records(table: pa.Table) -> list[dict[str, Any]]:
@@ -86,7 +58,7 @@ def prices(tmp_path: Path) -> tuple[str, pa.Table]:
             "flat": [3.0] * ROWS,
         }
     )
-    return _write(tmp_path / "prices.parquet", table, row_group_size=2), table
+    return write_parquet(tmp_path / "prices.parquet", table, row_group_size=2), table
 
 
 def _agrees(transformer: Transformer, table: pa.Table, parts: list[Path]) -> None:
@@ -98,7 +70,7 @@ def _agrees(transformer: Transformer, table: pa.Table, parts: list[Path]) -> Non
         parts: The part files it wrote.
 
     """
-    for record, row in zip(_records(table), _rows(parts), strict=True):
+    for record, row in zip(_records(table), read_rows(parts), strict=True):
         assert transformer.transform_dict(record) == row
 
 
@@ -116,7 +88,7 @@ def test_standard_scaler_fits_population_statistics_and_passes_nulls_through(
     assert scaler.scale_["flat"] == 1.0
 
     parts: list[Path] = scaler.transform_parquet([path], output_dir=tmp_path / "out")
-    rows: list[dict[str, Any]] = _rows(parts)
+    rows: list[dict[str, Any]] = read_rows(parts)
     assert [row["flat"] for row in rows] == [0.0] * ROWS
     assert rows[0]["price"] == (1.0 - 4.5) / math.sqrt(5.25)
     assert rows[1]["gap"] is None  # a null teaches nothing and comes out a null
@@ -148,7 +120,7 @@ def test_min_max_scaler_maps_the_fitted_range_and_clips_on_request(
     assert scaler.n_samples_seen_ == ROWS  # rows, nulls included
 
     parts: list[Path] = scaler.transform_parquet([path], output_dir=tmp_path / "out")
-    rows: list[dict[str, Any]] = _rows(parts)
+    rows: list[dict[str, Any]] = read_rows(parts)
     # x * scale + min lands on the ends of the range up to one rounding, which
     # is exactly where scikit-learn's own two operations land.
     assert rows[0]["price"] == pytest.approx(-1.0)
@@ -171,7 +143,7 @@ def test_max_abs_scaler_divides_by_the_largest_magnitude(prices: tuple[str, pa.T
     assert scaler.n_samples_seen_ == ROWS
 
     parts: list[Path] = scaler.transform_parquet([path], output_dir=tmp_path / "out")
-    rows: list[dict[str, Any]] = _rows(parts)
+    rows: list[dict[str, Any]] = read_rows(parts)
     assert rows[0]["price"] == 0.125
     assert rows[0]["gap"] == -0.4
     _agrees(scaler, table, parts)
@@ -188,10 +160,10 @@ def test_min_max_scaler_refuses_a_scale_of_zero(tmp_path: Path) -> None:
     0, mapping every value to the low end, and its saved pipeline then failed
     to load.
     """
-    wide: str = _write(tmp_path / "wide.parquet", pa.table({"a": [-1e308, 0.0, 1e308]}))
+    wide: str = write_parquet(tmp_path / "wide.parquet", pa.table({"a": [-1e308, 0.0, 1e308]}))
     with pytest.raises(EngineError, match=r"^minmaxscaler: column 'a' spans past the range of f64$"):
         MinMaxScaler(columns=["a"]).fit([wide])
-    tall: str = _write(tmp_path / "tall.parquet", pa.table({"a": [0.0, 1e308]}))
+    tall: str = write_parquet(tmp_path / "tall.parquet", pa.table({"a": [0.0, 1e308]}))
     narrow: MinMaxScaler = MinMaxScaler(columns=["a"], feature_range=(1.0, 1.0 + 2.0**-52))
     with pytest.raises(EngineError, match=r"fits a scale that rounds to 0; widen 'feature_range'$"):
         narrow.fit([tall])
@@ -203,7 +175,7 @@ def test_standard_scaler_fits_a_tiny_constant_column_that_saves_and_loads(tmp_pa
     REGRESSION: below about 1e-146 the exact sums round their residuals, and
     1e-158 used to fit a variance of -5e-324, which a saved pipeline refuses.
     """
-    path: str = _write(tmp_path / "tiny.parquet", pa.table({"x": [1e-158] * 4}))
+    path: str = write_parquet(tmp_path / "tiny.parquet", pa.table({"x": [1e-158] * 4}))
     pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["x"]))]).fit([path])
     scaler = pipeline["scale"]
     assert isinstance(scaler, StandardScaler)
@@ -213,7 +185,7 @@ def test_standard_scaler_fits_a_tiny_constant_column_that_saves_and_loads(tmp_pa
 
 
 def test_max_abs_scaler_leaves_an_all_zero_column_alone(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "zeros.parquet", pa.table({"a": [0.0, 0.0, 0.0]}))
+    path: str = write_parquet(tmp_path / "zeros.parquet", pa.table({"a": [0.0, 0.0, 0.0]}))
     scaler: MaxAbsScaler = MaxAbsScaler(columns=["a"]).fit([path])
     assert scaler.max_abs_["a"] == 0.0
     assert scaler.scale_["a"] == 1.0  # the near-constant rule, so 0 / 1 rather than 0 / 0
@@ -221,7 +193,7 @@ def test_max_abs_scaler_leaves_an_all_zero_column_alone(tmp_path: Path) -> None:
 
 
 def test_scalers_take_every_numeric_column_when_columns_is_none(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "mixed.parquet", pa.table({"a": [1.0, 3.0], "n": [2, 6], "c": ["x", "y"]}))
+    path: str = write_parquet(tmp_path / "mixed.parquet", pa.table({"a": [1.0, 3.0], "n": [2, 6], "c": ["x", "y"]}))
     scaler: MinMaxScaler = MinMaxScaler().fit([path])
     assert set(scaler.data_min_) == {"a", "n"}  # the utf8 column is not a numeric one
     assert scaler.transform_dict({"a": 1.0, "n": 6, "c": "x"}) == {"a": 0.0, "n": 1.0, "c": "x"}
@@ -232,11 +204,11 @@ def test_scalers_take_every_numeric_column_when_columns_is_none(tmp_path: Path) 
 
 def test_binarizer_is_strictly_above_the_threshold_and_emits_i64(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"score": [-1.0, -0.5, 0.0, 0.5, 1.0], "keep": [1.0] * 5})
-    path: str = _write(tmp_path / "scores.parquet", table)
+    path: str = write_parquet(tmp_path / "scores.parquet", table)
     binarizer: Binarizer = Binarizer(columns=["score"], threshold=0.5).fit([path])
     parts: list[Path] = binarizer.transform_parquet([path], output_dir=tmp_path / "out")
     assert pq.read_table(parts[0]).schema.field("score").type == pa.int64()
-    assert [row["score"] for row in _rows(parts)] == [0, 0, 0, 0, 1]  # exactly on the threshold is a 0
+    assert [row["score"] for row in read_rows(parts)] == [0, 0, 0, 0, 1]  # exactly on the threshold is a 0
     _agrees(binarizer, table, parts)
     assert Binarizer(columns=["score"]).fit([path]).transform_dict({"score": 0.0, "keep": 1.0}) == {
         "score": 0,
@@ -246,10 +218,10 @@ def test_binarizer_is_strictly_above_the_threshold_and_emits_i64(tmp_path: Path)
 
 def test_normalizer_divides_each_row_by_its_own_norm(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"x": [3.0, 0.0, 1.0], "y": [4.0, 0.0, -1.0], "z": [9.0, 9.0, 9.0]})
-    path: str = _write(tmp_path / "vectors.parquet", table, row_group_size=2)
+    path: str = write_parquet(tmp_path / "vectors.parquet", table, row_group_size=2)
     l2: Normalizer = Normalizer(columns=["x", "y"]).fit([path])
     parts: list[Path] = l2.transform_parquet([path], output_dir=tmp_path / "out")
-    rows: list[dict[str, Any]] = _rows(parts)
+    rows: list[dict[str, Any]] = read_rows(parts)
     assert rows[0] == {"x": 0.6, "y": 0.8, "z": 9.0}  # z is not listed, so it is not touched
     assert rows[1] == {"x": 0.0, "y": 0.0, "z": 9.0}  # a zero row is left alone, not divided
     assert rows[2]["x"] == pytest.approx(1 / math.sqrt(2))
@@ -282,7 +254,7 @@ def test_the_fitted_table_never_depends_on_the_thread_count(
     for threads in (1, 4):
         scaler: Transformer = factory().fit([path], threads=threads)
         states.add(scaler._require_handle().stage_state(stage))
-        outputs.add(json.dumps(_rows(scaler.transform_parquet([path], output_dir=tmp_path / f"out{threads}"))))
+        outputs.add(json.dumps(read_rows(scaler.transform_parquet([path], output_dir=tmp_path / f"out{threads}"))))
     assert len(states) == 1  # byte-identical, not merely close
     assert len(outputs) == 1
 
@@ -346,7 +318,7 @@ def test_scalers_survive_the_artifact_and_the_pickle(prices: tuple[str, pa.Table
 
 def test_scalers_refuse_columns_they_cannot_read(prices: tuple[str, pa.Table], tmp_path: Path) -> None:
     path, _ = prices
-    text: str = _write(tmp_path / "text.parquet", pa.table({"c": ["x", "y"]}))
+    text: str = write_parquet(tmp_path / "text.parquet", pa.table({"c": ["x", "y"]}))
     with pytest.raises(EngineError, match="column 'c' is utf8, expected an integer or float column"):
         StandardScaler(columns=["c"]).fit([text])
     with pytest.raises(EngineError, match="no integer or float columns to scale"):
@@ -355,10 +327,10 @@ def test_scalers_refuse_columns_they_cannot_read(prices: tuple[str, pa.Table], t
         MinMaxScaler(columns=["nobody"]).fit([path])
     # Cast makes the column readable; no other step parses strings as numbers.
     pipeline: Pipeline = Pipeline([("cast", Cast({"c": "f64"})), ("scale", MinMaxScaler(columns=["c"]))])
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"c": ["1", "3"]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"c": ["1", "3"]}))
     assert pipeline.fit([numbers]).transform_dict({"c": "3"}) == {"c": 1.0}
 
-    empty: str = _write(tmp_path / "empty.parquet", pa.table({"a": pa.array([None, None], pa.float64())}))
+    empty: str = write_parquet(tmp_path / "empty.parquet", pa.table({"a": pa.array([None, None], pa.float64())}))
     with pytest.raises(EngineError, match="column 'a' has no non-null values to learn from"):
         StandardScaler(columns=["a"]).fit([empty])
 
@@ -366,13 +338,13 @@ def test_scalers_refuse_columns_they_cannot_read(prices: tuple[str, pa.Table], t
 def test_scalers_refuse_a_nan_or_an_infinity_in_the_data(tmp_path: Path) -> None:
     # A missing number has one spelling here — a null — so the other one is an
     # error rather than a second, silently different, kind of missing.
-    nans: str = _write(tmp_path / "nan.parquet", pa.table({"a": [1.0, float("nan")]}))
+    nans: str = write_parquet(tmp_path / "nan.parquet", pa.table({"a": [1.0, float("nan")]}))
     with pytest.raises(EngineError, match="is not finite; write a missing value as a null"):
         StandardScaler(columns=["a"]).fit([nans])
-    infinities: str = _write(tmp_path / "inf.parquet", pa.table({"a": [1.0, float("inf")]}))
+    infinities: str = write_parquet(tmp_path / "inf.parquet", pa.table({"a": [1.0, float("inf")]}))
     with pytest.raises(EngineError, match="is not finite; write a missing value as a null"):
         MinMaxScaler(columns=["a"]).fit([infinities])
-    good: str = _write(tmp_path / "good.parquet", pa.table({"a": [1.0, 2.0]}))
+    good: str = write_parquet(tmp_path / "good.parquet", pa.table({"a": [1.0, 2.0]}))
     scaler: MaxAbsScaler = MaxAbsScaler(columns=["a"]).fit([good])
     with pytest.raises(EngineError, match="is not finite"):
         scaler.transform_dict({"a": float("nan")})
@@ -384,8 +356,8 @@ def test_scalers_refuse_a_nan_or_an_infinity_at_transform_through_both_paths(tmp
     # transform reaches finite_number from inside the batch visitor and from
     # the record path, and a scaler that refused only what it was fitted on
     # would let a NaN through on the data that actually matters.
-    good: str = _write(tmp_path / "good.parquet", pa.table({"a": [1.0, 2.0, 3.0, 4.0]}))
-    hostile: str = _write(tmp_path / "hostile.parquet", pa.table({"a": [1.0, value, 2.0]}))
+    good: str = write_parquet(tmp_path / "good.parquet", pa.table({"a": [1.0, 2.0, 3.0, 4.0]}))
+    hostile: str = write_parquet(tmp_path / "hostile.parquet", pa.table({"a": [1.0, value, 2.0]}))
     message: str = "is not finite; write a missing value as a null"
     for scaler in (
         StandardScaler(columns=["a"]).fit([good]),
@@ -406,7 +378,7 @@ def test_standard_scaler_treats_a_near_constant_column_as_constant(tmp_path: Pat
     # (variance > 0, therefore divide by its root) is the wrong one and would
     # diverge from scikit-learn on exactly this shape of data.
     values: list[float] = [1e8, 1e8 + 1e-7, 1e8, 1e8 + 1e-7]
-    path: str = _write(tmp_path / "near.parquet", pa.table({"a": values}))
+    path: str = write_parquet(tmp_path / "near.parquet", pa.table({"a": values}))
     scaler: StandardScaler = StandardScaler(columns=["a"]).fit([path])
     assert scaler.var_["a"] > 0.0
     assert scaler.scale_["a"] == 1.0
@@ -415,13 +387,13 @@ def test_standard_scaler_treats_a_near_constant_column_as_constant(tmp_path: Pat
     # The values scikit-learn 1.9 produces for this column, exactly.
     expected: list[float] = [-5.960464477539063e-08, 4.470348358154297e-08] * 2
     parts: list[Path] = scaler.transform_parquet([path], output_dir=tmp_path / "out")
-    assert [row["a"] for row in _rows(parts)] == expected
+    assert [row["a"] for row in read_rows(parts)] == expected
     for value, row in zip(expected, values, strict=True):
         assert scaler.transform_dict({"a": row})["a"] == value
 
 
 def test_binarizer_and_normalizer_refuse_a_null(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "gaps.parquet", pa.table({"a": [1.0, None], "b": [2.0, 3.0]}))
+    path: str = write_parquet(tmp_path / "gaps.parquet", pa.table({"a": [1.0, None], "b": [2.0, 3.0]}))
     binarizer: Binarizer = Binarizer(columns=["a"]).fit([path])
     with pytest.raises(EngineError, match="column 'a' has a null, which binarize has no answer for"):
         binarizer.transform_parquet([path], output_dir=tmp_path / "out")
@@ -498,11 +470,11 @@ def test_standard_scaler_centres_on_the_exactly_rounded_mean(tmp_path: Path) -> 
 
     """
     values: list[float] = [1e16, 1.0000000000000004e16, 1e16, 1e16, 1.0000000000000004e16]
-    source: str = _write(tmp_path / "large.parquet", pa.table({"price": values}))
+    source: str = write_parquet(tmp_path / "large.parquet", pa.table({"price": values}))
     scaler: StandardScaler = StandardScaler(columns=["price"], with_mean=True, with_std=False).fit([source])
     assert scaler.mean_ == {"price": 1.0000000000000002e16}
     assert scaler.mean_["price"] == math.fsum(values) / len(values)
-    rows: list[dict[str, Any]] = _rows(scaler.transform_parquet([source], output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(scaler.transform_parquet([source], output_dir=tmp_path / "out"))
     assert [row["price"] for row in rows] == [-2.0, 2.0, -2.0, -2.0, 2.0]
     for value, row in zip(values, rows, strict=True):
         assert scaler.transform_dict({"price": value}) == row
@@ -537,7 +509,7 @@ def test_standard_scaler_fits_values_near_1e_155_alike_for_every_split_and_threa
     table: pa.Table = pa.table({"x": values})
     states: set[str] = set()
     for rows_per_group in (1, 2, 4, 8):
-        path: str = _write(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
+        path: str = write_parquet(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
         for threads in (1, 2, 4):
             for _ in range(3):  # which worker takes which row group varies from run to run
                 scaler: StandardScaler = StandardScaler(columns=["x"]).fit([path], threads=threads)
@@ -569,7 +541,7 @@ def test_normalizer_refuses_a_row_whose_norm_leaves_the_range_through_both_paths
     """
     names: list[str] = ["a", "b", "c", "d"]
     table: pa.Table = pa.table({name: [1.0, value] for name, value in zip(names, row, strict=True)})
-    path: str = _write(tmp_path / "top.parquet", table)
+    path: str = write_parquet(tmp_path / "top.parquet", table)
     normalizer: Normalizer = Normalizer(columns=names, norm=norm).fit([path])
     message: str = rf"a row's {norm} norm leaves the range of f64$"
     with pytest.raises(EngineError, match=message):
@@ -587,8 +559,8 @@ def test_normalizer_divides_a_row_whose_norm_is_the_largest_f64(tmp_path: Path) 
         "c": 2.0**1023 - 2.0**972 + 2.0**970,
     }
     assert math.fsum(row.values()) == largest
-    path: str = _write(tmp_path / "top.parquet", pa.table({name: [value] for name, value in row.items()}))
+    path: str = write_parquet(tmp_path / "top.parquet", pa.table({name: [value] for name, value in row.items()}))
     normalizer: Normalizer = Normalizer(columns=list(row), norm="l1").fit([path])
     expected: dict[str, float] = {name: value / largest for name, value in row.items()}
     assert normalizer.transform_dict(row) == expected
-    assert _rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == [expected]
+    assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == [expected]

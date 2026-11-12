@@ -28,16 +28,7 @@ namespace {
 // Fit one of the target-mean kernels with one worker state per batch.
 std::unique_ptr<fft::Kernel> fit_blend(const std::string& id, const nlohmann::json& params, fft::Schema schema,
                                        const std::vector<fft::Batch>& batches) {
-  auto kernel = fft::make_kernel(id, params);
-  kernel->stage = "blend";
-  kernel->resolve(schema);
-  std::vector<std::unique_ptr<fft::AccState>> states;
-  for (const fft::Batch& batch : batches) {
-    states.push_back(kernel->make_state());
-    kernel->consume(*states.back(), batch);
-  }
-  kernel->finalize(std::move(states));
-  return kernel;
+  return fft::testing::fit_kernel_per_batch(id, params, std::move(schema), batches, "blend");
 }
 
 // c: a a b b b c, with a 0/1 target — the shared fixture of these tests.

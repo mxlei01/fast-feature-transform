@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from fast_feature_transform import (
@@ -18,6 +17,7 @@ from fast_feature_transform import (
     Select,
     _core,
 )
+from helpers import read_rows, write_parquet
 
 # device = ios web ios · tv ios ·, clicks = 1 4 3 6 5 2 7:
 # ios sums to 6 over 3 rows, web and tv have one row each, the null category
@@ -26,35 +26,6 @@ PRIOR: float = 4.0
 IOS_MEAN: float = 2.0
 NULL_MEAN: float = 6.5
 GLOBAL_VAR: float = 28 / 6  # var(clicks), ddof=1
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
 
 
 @pytest.fixture
@@ -74,7 +45,7 @@ def events(tmp_path: Path) -> list[str]:
             "clicks": [1.0, 4.0, 3.0, 6.0, 5.0, 2.0, 7.0],
         }
     )
-    return [_write(tmp_path / "events.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "events.parquet", table, row_group_size=2)]
 
 
 def test_leave_one_out_takes_the_category_mean_and_collapses_a_singleton(events: list[str], tmp_path: Path) -> None:
@@ -83,7 +54,7 @@ def test_leave_one_out_takes_the_category_mean_and_collapses_a_singleton(events:
     # web and tv have one row each, so they collapse to the prior rather than
     # leak that row's own target.
     assert encoder.values_ == {"device": {"ios": IOS_MEAN, "tv": PRIOR, "web": PRIOR}}
-    rows: list[dict[str, Any]] = _rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
     assert rows[0] == {"device": pytest.approx(IOS_MEAN), "clicks": 1.0}  # the target passes through
     assert rows[3]["device"] == pytest.approx(NULL_MEAN)
     assert encoder.transform_dict({"device": "ios"}) == {"device": pytest.approx(IOS_MEAN)}
@@ -121,7 +92,7 @@ def test_james_stein_shrinks_by_the_model(events: list[str]) -> None:
 
     # As many categories as rows means the column identifies the row.
     identifiers: pa.Table = pa.table({"device": ["a", "b", "c", "d"], "clicks": [1.0, 2.0, 3.0, 6.0]})
-    path: str = _write(Path(events[0]).parent / "ids.parquet", identifiers)
+    path: str = write_parquet(Path(events[0]).parent / "ids.parquet", identifiers)
     id_like: JamesSteinEncoder = JamesSteinEncoder(columns=["device"], target="clicks").fit([path])
     assert id_like.values_["device"] == {"a": 3.0, "b": 3.0, "c": 3.0, "d": 3.0}
 
@@ -138,7 +109,9 @@ def test_shrinkage_null_and_unknown_options(events: list[str], tmp_path: Path) -
         columns=["device"], target="clicks", handle_unknown="return_nan"
     ).fit(events)
     assert as_null.transform_dict({"device": "nobody"}) == {"device": None}
-    assert _rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == pytest.approx(IOS_MEAN)
+    assert read_rows(as_null.transform_parquet(events, output_dir=tmp_path / "out"))[0]["device"] == pytest.approx(
+        IOS_MEAN
+    )
 
     strict: CatBoostEncoder = CatBoostEncoder(columns=["device"], target="clicks", handle_unknown="error").fit(events)
     with pytest.raises(EngineError, match="category that was not seen at fit"):
@@ -149,7 +122,7 @@ def test_shrinkage_null_and_unknown_options(events: list[str], tmp_path: Path) -
 
     # A row whose target is null is not there at all, so its category is unknown.
     partial: pa.Table = pa.table({"device": ["ios", "ios", "tv"], "clicks": [1.0, 3.0, None]})
-    path: str = _write(tmp_path / "partial.parquet", partial)
+    path: str = write_parquet(tmp_path / "partial.parquet", partial)
     sparse: LeaveOneOutEncoder = LeaveOneOutEncoder(columns=["device"], target="clicks").fit([path])
     assert sparse.values_ == {"device": {"ios": 2.0}}
     assert sparse.prior_ == pytest.approx(2.0)
@@ -162,7 +135,7 @@ def test_shrinkage_null_and_unknown_options(events: list[str], tmp_path: Path) -
 # unseen, pointing the operator at the wrong thing. target_encode always had
 # this guard; the shrinkage and quantile families did not.
 def test_shrinkage_refuses_a_target_with_no_non_null_values(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "unlabelled.parquet",
         pa.table({"device": ["ios", "web"], "clicks": pa.array([None, None], pa.float64())}),
     )
@@ -185,7 +158,7 @@ def test_james_stein_values_move_with_the_target(tmp_path: Path, model: str, ste
     fitted: dict[float, dict[str, float]] = {}
     for offset in (0.0, 1e9):
         values: list[float] = [value + offset + step * (row + 1) for row, value in enumerate(clicks)]
-        path: str = _write(tmp_path / f"offset-{offset:g}.parquet", pa.table({"color": color, "clicks": values}))
+        path: str = write_parquet(tmp_path / f"offset-{offset:g}.parquet", pa.table({"color": color, "clicks": values}))
         fitted[offset] = JamesSteinEncoder(columns=["color"], target="clicks", model=model).fit([path]).values_["color"]
     raw_amber: float = (clicks[0] + step + clicks[1] + 2 * step) / 2
     assert fitted[0.0]["amber"] != pytest.approx(raw_amber)  # shrunk toward the prior, not the raw mean
@@ -205,9 +178,9 @@ def test_shrinkage_binds_the_target_and_lets_serving_drop_it(events: list[str], 
     assert pipeline.transform_dict({"device": "ios", "clicks": 1.0}) == {"device": pytest.approx(2.5)}
 
     # A fitted encoder reads only its columns, so a file without the label transforms.
-    unlabelled: str = _write(tmp_path / "serve.parquet", pa.table({"device": ["ios", "web"]}))
+    unlabelled: str = write_parquet(tmp_path / "serve.parquet", pa.table({"device": ["ios", "web"]}))
     encoder: LeaveOneOutEncoder = LeaveOneOutEncoder(columns=["device"], target="clicks").fit(events)
-    served: list[dict[str, Any]] = _rows(encoder.transform_parquet([unlabelled], output_dir=tmp_path / "served"))
+    served: list[dict[str, Any]] = read_rows(encoder.transform_parquet([unlabelled], output_dir=tmp_path / "served"))
     assert served == [{"device": pytest.approx(IOS_MEAN)}, {"device": pytest.approx(PRIOR)}]
 
 
@@ -244,11 +217,11 @@ def test_shrinkage_is_independent_of_the_split_and_survives_the_artifact(events:
 def test_shrinkage_refuses_a_target_it_cannot_read(events: list[str], tmp_path: Path) -> None:
     with pytest.raises(EngineError, match="target column 'missing' not found in input"):
         LeaveOneOutEncoder(columns=["device"], target="missing").fit(events)
-    labels: str = _write(tmp_path / "labels.parquet", pa.table({"device": ["ios"], "label": ["yes"]}))
+    labels: str = write_parquet(tmp_path / "labels.parquet", pa.table({"device": ["ios"], "label": ["yes"]}))
     with pytest.raises(EngineError, match="target column 'label' is utf8, expected an integer or float column"):
         LeaveOneOutEncoder(columns=["device"], target="label").fit([labels])
 
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"n": [1, 2], "clicks": [1.0, 2.0]}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"n": [1, 2], "clicks": [1.0, 2.0]}))
     with pytest.raises(EngineError, match="no utf8 columns to encode"):
         JamesSteinEncoder(target="clicks").fit([numbers])
 
@@ -349,7 +322,7 @@ def test_james_stein_fits_targets_near_1e_155_alike_for_every_split_and_thread_c
     table: pa.Table = pa.table({"device": devices, "clicks": [float.fromhex(text) for text in targets]})
     states: set[str] = set()
     for rows_per_group in (2, 4, 6, 12):
-        path: str = _write(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
+        path: str = write_parquet(tmp_path / f"groups{rows_per_group}.parquet", table, row_group_size=rows_per_group)
         for threads in (1, 2, 4):
             for _ in range(3):  # which worker takes which row group varies from run to run
                 encoder: JamesSteinEncoder = JamesSteinEncoder(columns=["device"], target="clicks")

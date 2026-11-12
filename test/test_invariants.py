@@ -39,25 +39,10 @@ from fast_feature_transform import (
     SumEncoder,
     TargetEncoder,
 )
+from helpers import write_parquet
 
 THREADS: int = 16
 CALLS_PER_THREAD: int = 2_000
-
-
-def _write(path: Path, table: pa.Table, **kwargs: object) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
 
 
 def _encoded(parts: list[Path], column: str) -> list[int]:
@@ -75,7 +60,7 @@ def _encoded(parts: list[Path], column: str) -> list[int]:
 
 
 def test_multi_pass_fit_schedules_a_dependent_encoder_in_a_later_pass(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "t.parquet",
         pa.table({"a": ["x", "y", "x", None], "b": ["p", "q", "r", "p"], "c": ["ignored"] * 4}),
         row_group_size=2,
@@ -95,8 +80,8 @@ def test_multi_pass_fit_schedules_a_dependent_encoder_in_a_later_pass(tmp_path: 
 
 
 def test_unknown_and_null_categories_encode_to_zero_in_batch_mode(tmp_path: Path) -> None:
-    train: str = _write(tmp_path / "train.parquet", pa.table({"device": ["a", "b", "a"]}))
-    serve: str = _write(tmp_path / "serve.parquet", pa.table({"device": ["zzz", "a", None, "b", "qq"]}))
+    train: str = write_parquet(tmp_path / "train.parquet", pa.table({"device": ["a", "b", "a"]}))
+    serve: str = write_parquet(tmp_path / "serve.parquet", pa.table({"device": ["zzz", "a", None, "b", "qq"]}))
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([train])
     parts: list[Path] = encoder.transform_parquet([serve], output_dir=tmp_path / "out")
     batch: list[int] = _encoded(parts, "device")
@@ -147,10 +132,10 @@ _SUPERVISED: frozenset[str] = frozenset(
 
 @pytest.mark.parametrize("name", _HANDLE_MISSING_ENCODERS)
 def test_handle_missing_error_refuses_a_null_at_transform_in_every_encoder(name: str, tmp_path: Path) -> None:
-    train: str = _write(
+    train: str = write_parquet(
         tmp_path / "train.parquet", pa.table({"device": ["a", "a", "b", "b"], "label": [1.0, 0.0, 1.0, 0.0]})
     )
-    serve: str = _write(tmp_path / "serve.parquet", pa.table({"device": ["a", None], "label": [1.0, 0.0]}))
+    serve: str = write_parquet(tmp_path / "serve.parquet", pa.table({"device": ["a", None], "label": [1.0, 0.0]}))
     extra: dict[str, object] = {"target": "label"} if name in _SUPERVISED else {}
     encoder = getattr(fast_feature_transform, name)(columns=["device"], handle_missing="error", **extra)
     encoder.fit([train])
@@ -175,7 +160,7 @@ def test_handle_missing_error_refuses_a_null_at_transform_in_every_encoder(name:
 def test_handle_missing_error_refuses_at_fit_a_null_whose_target_is_null(
     name: str, row_group_size: int | None, tmp_path: Path
 ) -> None:
-    train: str = _write(
+    train: str = write_parquet(
         tmp_path / "train.parquet",
         pa.table({"device": ["a", "a", "b", "b", None], "label": [1.0, 0.0, 1.0, 0.0, None]}),
         row_group_size=row_group_size,
@@ -187,7 +172,7 @@ def test_handle_missing_error_refuses_at_fit_a_null_whose_target_is_null(
 
 def test_large_string_nulls_and_empty_strings(tmp_path: Path) -> None:
     values: list[str | None] = ["q", None, "", "p", "q", None]
-    path: str = _write(tmp_path / "large.parquet", pa.table({"c": pa.array(values, type=pa.large_string())}))
+    path: str = write_parquet(tmp_path / "large.parquet", pa.table({"c": pa.array(values, type=pa.large_string())}))
     encoder: LabelEncoder = LabelEncoder(columns=["c"]).fit([path])
     assert encoder.label_maps_["c"] == {"": 1, "p": 2, "q": 3}
     parts: list[Path] = encoder.transform_parquet([path], output_dir=tmp_path / "out")
@@ -196,7 +181,9 @@ def test_large_string_nulls_and_empty_strings(tmp_path: Path) -> None:
 
 
 def test_all_null_column_yields_an_empty_map_that_round_trips(tmp_path: Path) -> None:
-    path: str = _write(tmp_path / "nulls.parquet", pa.table({"c": pa.array([None, None, None], type=pa.string())}))
+    path: str = write_parquet(
+        tmp_path / "nulls.parquet", pa.table({"c": pa.array([None, None, None], type=pa.string())})
+    )
     encoder: LabelEncoder = LabelEncoder().fit([path])
     assert encoder.label_maps_ == {"c": {}}
     assert encoder.vocab_size("c") == 1
@@ -212,7 +199,7 @@ def test_single_threaded_and_parallel_fits_agree_across_worker_boundaries(tmp_pa
     # so applying min_count=2 per worker, before the merge, would drop every category whose
     # two rows went to different workers.
     values: list[str] = [f"cat_{i:04d}" for i in range(1000)] * 2
-    path: str = _write(tmp_path / "straddle.parquet", pa.table({"c": values}), row_group_size=50)
+    path: str = write_parquet(tmp_path / "straddle.parquet", pa.table({"c": values}), row_group_size=50)
     serial: LabelEncoder = LabelEncoder(columns=["c"], min_count=2).fit([path], threads=1)
     parallel: LabelEncoder = LabelEncoder(columns=["c"], min_count=2).fit([path], threads=8)
     assert len(serial.label_maps_["c"]) == 1000
@@ -220,7 +207,7 @@ def test_single_threaded_and_parallel_fits_agree_across_worker_boundaries(tmp_pa
 
 
 def test_transform_dict_is_safe_under_free_threaded_concurrency(tmp_path: Path) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "t.parquet", pa.table({"device": ["a", "b", "c", "a"], "price": [1.0, 2.0, 3.0, 4.0]})
     )
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device"])), ("e", LabelEncoder())]).fit([path])
@@ -260,7 +247,7 @@ def test_label_encoder_properties(
     tmp_path_factory: pytest.TempPathFactory, values: list[str | None], row_group_size: int, min_count: int
 ) -> None:
     tmp_path: Path = tmp_path_factory.mktemp("prop")
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "p.parquet", pa.table({"c": pa.array(values, type=pa.string())}), row_group_size=row_group_size
     )
     serial: LabelEncoder = LabelEncoder(columns=["c"], min_count=min_count).fit([path], threads=1)
@@ -323,7 +310,7 @@ def wide(tmp_path: Path) -> tuple[list[str], dict[str, object]]:
             "y": [1.0, 2.0, 3.0, 4.0],
         }
     )
-    return [_write(tmp_path / "wide.parquet", table)], {"pre": "p", "x": "a", "post": "s", "n": 1.0, "y": 1.0}
+    return [write_parquet(tmp_path / "wide.parquet", table)], {"pre": "p", "x": "a", "post": "s", "n": 1.0, "y": 1.0}
 
 
 # category_encoders puts an expanding encoder's generated columns in the
@@ -416,7 +403,7 @@ def test_a_record_gives_its_batch_row_whatever_order_its_keys_are_in(tmp_path: P
             columns[f"t{index:02d}"] = rng.choice(["a", "b", "c", "d"], size=rows)
     columns["y"] = rng.normal(size=rows)
     table: pa.Table = pa.table(columns)
-    path: str = _write(tmp_path / "wide.parquet", table)
+    path: str = write_parquet(tmp_path / "wide.parquet", table)
     pipeline: Pipeline = Pipeline(
         [
             ("cast", Cast({"n00": "f32", "n01": "f64"})),
@@ -460,7 +447,7 @@ def test_a_record_of_128_fields_or_more_gives_its_batch_row_whatever_order_its_k
     rng: np.random.Generator = np.random.default_rng(21)
     names: list[str] = [f"w{index:03d}" for index in range(140)]
     table: pa.Table = pa.table({name: rng.normal(size=8) for name in names})
-    path: str = _write(tmp_path / "wider.parquet", table)
+    path: str = write_parquet(tmp_path / "wider.parquet", table)
     pipeline: Pipeline = Pipeline(
         [
             ("indexed", StandardScaler(columns=names[100:120])),

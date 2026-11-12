@@ -20,6 +20,7 @@
 
 #include "fastfeaturetransform/core.hpp"
 #include "fastfeaturetransform/io.hpp"
+#include "fastfeaturetransform/kernel.hpp"
 
 namespace fastfeaturetransform::testing {
 
@@ -126,6 +127,23 @@ inline std::shared_ptr<arrow::Array> bool_column(const std::vector<std::optional
   std::shared_ptr<arrow::Array> array;
   (void)builder.Finish(&array);
   return array;
+}
+
+// A kernel fitted as the engine fits it: made from `id` and `params`, named
+// `stage`, resolved against a copy of `schema`, given a state of its own for
+// each batch, and finalized.
+inline std::unique_ptr<Kernel> fit_kernel_per_batch(const std::string& id, const nlohmann::json& params, Schema schema,
+                                                    const std::vector<Batch>& batches, const std::string& stage) {
+  auto kernel = make_kernel(id, params);
+  kernel->stage = stage;
+  kernel->resolve(schema);
+  std::vector<std::unique_ptr<AccState>> states;
+  for (const Batch& batch : batches) {
+    states.push_back(kernel->make_state());
+    kernel->consume(*states.back(), batch);
+  }
+  kernel->finalize(std::move(states));
+  return kernel;
 }
 
 inline Batch make_batch(std::vector<std::string> names, std::vector<std::shared_ptr<arrow::Array>> cols) {

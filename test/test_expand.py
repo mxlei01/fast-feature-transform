@@ -21,35 +21,7 @@ from fast_feature_transform import (
     StandardScaler,
     _core,
 )
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
-
-def _rows(parts: list[Path]) -> list[dict[str, Any]]:
-    """Read output parts back as records.
-
-    Args:
-        parts: Part files in order.
-
-    Returns:
-        The rows as dicts.
-
-    """
-    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
+from helpers import read_rows, write_parquet
 
 
 @pytest.fixture
@@ -70,14 +42,14 @@ def numbers(tmp_path: Path) -> list[str]:
             "device": ["ios", "web", "ios", "tv", "web", "ios"],
         }
     )
-    return [_write(tmp_path / "numbers.parquet", table, row_group_size=2)]
+    return [write_parquet(tmp_path / "numbers.parquet", table, row_group_size=2)]
 
 
 def test_polynomial_features_expands_across_columns(numbers: list[str], tmp_path: Path) -> None:
     expand: PolynomialFeatures = PolynomialFeatures(columns=["price", "height"])
     assert expand.output_columns == ["1", "price", "height", "price^2", "price*height", "height^2"]
     expand.fit(numbers)
-    rows: list[dict[str, Any]] = _rows(expand.transform_parquet(numbers, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(expand.transform_parquet(numbers, output_dir=tmp_path / "out"))
     # The source columns leave; the passthrough stays and the monomials follow.
     assert list(rows[0]) == ["device", *expand.output_columns]
     assert rows[0] == {
@@ -94,7 +66,7 @@ def test_polynomial_features_expands_across_columns(numbers: list[str], tmp_path
         assert expand.transform_dict(record) == row, row_index
 
     # An integer column is read exactly, and the outputs are f64 either way.
-    integers: str = _write(tmp_path / "ints.parquet", pa.table({"price": [2, 3], "height": [5, 7]}))
+    integers: str = write_parquet(tmp_path / "ints.parquet", pa.table({"price": [2, 3], "height": [5, 7]}))
     both: PolynomialFeatures = PolynomialFeatures(columns=["price", "height"]).fit([integers])
     table: pa.Table = pa.concat_tables(
         [pq.read_table(part) for part in both.transform_parquet([integers], output_dir=tmp_path / "ints-out")]
@@ -139,9 +111,9 @@ def test_polynomial_features_honours_degree_interaction_and_bias(numbers: list[s
     }
 
     # A null factor makes its monomials null; the bias uses no factor at all.
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"price": [None, 2.0], "height": [3.0, None]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [None, 2.0], "height": [3.0, None]}))
     nulls: PolynomialFeatures = PolynomialFeatures(columns=["price", "height"]).fit([holes])
-    assert _rows(nulls.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[0] == {
+    assert read_rows(nulls.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[0] == {
         "1": 1.0,
         "price": None,
         "height": 3.0,
@@ -197,7 +169,7 @@ def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_pat
         PolynomialFeatures(columns=["device"]).fit(numbers)
     with pytest.raises(EngineError, match="column 'nope' not found in input"):
         PolynomialFeatures(columns=["nope"]).fit(numbers)
-    clash: str = _write(tmp_path / "clash.parquet", pa.table({"price": [1.0], "price^2": [1.0]}))
+    clash: str = write_parquet(tmp_path / "clash.parquet", pa.table({"price": [1.0], "price^2": [1.0]}))
     with pytest.raises(EngineError, match="output column 'price\\^2' already exists in input"):
         PolynomialFeatures(columns=["price"]).fit([clash])
     expand: PolynomialFeatures = PolynomialFeatures(columns=["price", "height"]).fit(numbers)
@@ -205,7 +177,7 @@ def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_pat
         expand.transform_dict({"price": 1.0, "height": 2.0, "price*height": 3.0})
     with pytest.raises(EngineError, match="must be a number or null"):
         expand.transform_dict({"price": "cheap", "height": 2.0})
-    infinite: str = _write(tmp_path / "inf.parquet", pa.table({"price": [math.inf], "height": [1.0]}))
+    infinite: str = write_parquet(tmp_path / "inf.parquet", pa.table({"price": [math.inf], "height": [1.0]}))
     with pytest.raises(EngineError, match="is not finite"):
         expand.transform_parquet([infinite], output_dir=tmp_path / "inf-out")
 
@@ -217,7 +189,7 @@ def test_spline_transform_fits_knots_and_evaluates_the_basis(numbers: list[str],
     spline.fit(numbers)
     # price runs 1..8, so the uniform knots are 1, 4.5 and 8.
     assert spline.knots_ == {"price": [1.0, 4.5, 8.0]}
-    rows: list[dict[str, Any]] = _rows(spline.transform_parquet(numbers, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(spline.transform_parquet(numbers, output_dir=tmp_path / "out"))
     assert list(rows[0]) == ["height", "device", "price_sp_0", "price_sp_1", "price_sp_2"]
     assert rows[0]["price_sp_0"] == pytest.approx(1.0)  # the first knot lights the first basis alone
     assert rows[2]["price_sp_1"] == pytest.approx((4.0 - 1.0) / 3.5)  # 4.0 is 6/7 of the way to the middle knot
@@ -266,27 +238,27 @@ def test_spline_transform_extrapolation_modes(numbers: list[str], tmp_path: Path
     strict: SplineTransformer = SplineTransformer(columns=["price"], n_knots=3, extrapolation="error").fit(numbers)
     with pytest.raises(EngineError, match="beyond the limits of the knots and extrapolation is 'error'"):
         strict.transform_dict({"price": 9.0, "height": 1.0, "device": "ios"})
-    outside: str = _write(tmp_path / "outside.parquet", pa.table({"price": [9.0], "height": [1.0]}))
+    outside: str = write_parquet(tmp_path / "outside.parquet", pa.table({"price": [9.0], "height": [1.0]}))
     with pytest.raises(EngineError, match="beyond the limits of the knots"):
         strict.transform_parquet([outside], output_dir=tmp_path / "outside-out")
 
 
 def test_spline_transform_missing_and_fit_refusals(numbers: list[str], tmp_path: Path) -> None:
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 8.0]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 8.0]}))
     with pytest.raises(EngineError, match="has nulls and handle_missing is 'error'"):
         SplineTransformer(columns=["price"], n_knots=3).fit([holes])
     zeros: SplineTransformer = SplineTransformer(columns=["price"], n_knots=3, handle_missing="zeros").fit([holes])
     assert zeros.knots_ == {"price": [1.0, 4.5, 8.0]}  # the null teaches nothing
     row: dict[str, Any] = zeros.transform_dict({"price": None})
     assert list(row.values()) == [0.0] * zeros.splines
-    assert _rows(zeros.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[1] == row
+    assert read_rows(zeros.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[1] == row
 
-    single: str = _write(tmp_path / "single.parquet", pa.table({"price": [3.0]}))
+    single: str = write_parquet(tmp_path / "single.parquet", pa.table({"price": [3.0]}))
     with pytest.raises(EngineError, match="fewer than two non-null values"):
         SplineTransformer(columns=["price"], n_knots=3).fit([single])
     with pytest.raises(EngineError, match="is utf8, expected an integer or float column"):
         SplineTransformer(columns=["device"]).fit(numbers)
-    clash: str = _write(tmp_path / "clash.parquet", pa.table({"price": [1.0, 2.0], "price_sp_0": [1.0, 2.0]}))
+    clash: str = write_parquet(tmp_path / "clash.parquet", pa.table({"price": [1.0, 2.0], "price_sp_0": [1.0, 2.0]}))
     with pytest.raises(EngineError, match="output column 'price_sp_0' already exists in input"):
         SplineTransformer(columns=["price"], n_knots=3).fit([clash])
     spline: SplineTransformer = SplineTransformer(columns=["price"], n_knots=3).fit(numbers)
@@ -322,7 +294,7 @@ def test_power_transform_fits_one_lambda_per_column(numbers: list[str], tmp_path
     assert 0.0 < lambda_ < 1.0  # price is right-skewed, so the fitted power pulls the tail in
     assert power.means_ is None
     assert power.scales_ is None
-    rows: list[dict[str, Any]] = _rows(power.transform_parquet(numbers, output_dir=tmp_path / "out"))
+    rows: list[dict[str, Any]] = read_rows(power.transform_parquet(numbers, output_dir=tmp_path / "out"))
     assert list(rows[0]) == ["price", "height", "device"]  # rewritten in place
     assert rows[0]["price"] == pytest.approx(0.0, abs=1e-12)  # box-cox(1) is 0 for every lambda
     # Any other value is scipy's boxcox of it at the fitted lambda.
@@ -339,25 +311,27 @@ def test_power_transform_fits_one_lambda_per_column(numbers: list[str], tmp_path
     scaled: PowerTransformer = PowerTransformer(columns=["price"], method="box-cox").fit(numbers)
     assert scaled.means_ is not None
     assert scaled.scales_ is not None
-    values: list[float] = [row["price"] for row in _rows(scaled.transform_parquet(numbers, output_dir=tmp_path / "s"))]
+    values: list[float] = [
+        row["price"] for row in read_rows(scaled.transform_parquet(numbers, output_dir=tmp_path / "s"))
+    ]
     assert sum(values) / len(values) == pytest.approx(0.0, abs=1e-12)
 
     # A null teaches nothing and passes through as a null.
-    holes: str = _write(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 4.0, 8.0]}))
+    holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 4.0, 8.0]}))
     sparse: PowerTransformer = PowerTransformer(columns=["price"], standardize=False).fit([holes])
     assert sparse.transform_dict({"price": None}) == {"price": None}
-    assert _rows(sparse.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[1] == {"price": None}
+    assert read_rows(sparse.transform_parquet([holes], output_dir=tmp_path / "holes-out"))[1] == {"price": None}
 
 
 def test_power_transform_method_rules(numbers: list[str], tmp_path: Path) -> None:
-    signed: str = _write(tmp_path / "signed.parquet", pa.table({"price": [-2.0, 0.0, 1.5, 4.0]}))
+    signed: str = write_parquet(tmp_path / "signed.parquet", pa.table({"price": [-2.0, 0.0, 1.5, 4.0]}))
     with pytest.raises(EngineError, match="is not strictly positive, which box-cox requires"):
         PowerTransformer(columns=["price"], method="box-cox").fit([signed])
     # Yeo-Johnson takes any value.
     yeo: PowerTransformer = PowerTransformer(columns=["price"], standardize=False).fit([signed])
     assert yeo.transform_dict({"price": -2.0})["price"] < 0.0
 
-    flat: str = _write(tmp_path / "flat.parquet", pa.table({"price": [2.5, 2.5, 2.5]}))
+    flat: str = write_parquet(tmp_path / "flat.parquet", pa.table({"price": [2.5, 2.5, 2.5]}))
     with pytest.raises(EngineError, match="is constant, which box-cox cannot fit a lambda for"):
         PowerTransformer(columns=["price"], method="box-cox").fit([flat])
     constant: PowerTransformer = PowerTransformer(columns=["price"], standardize=False).fit([flat])
@@ -366,11 +340,11 @@ def test_power_transform_method_rules(numbers: list[str], tmp_path: Path) -> Non
     positive: PowerTransformer = PowerTransformer(columns=["price"], method="box-cox", standardize=False).fit(numbers)
     with pytest.raises(EngineError, match="is not strictly positive, which box-cox requires"):
         positive.transform_dict({"price": 0.0, "height": 1.0, "device": "ios"})
-    nonpositive: str = _write(tmp_path / "zero.parquet", pa.table({"price": [0.0], "height": [1.0]}))
+    nonpositive: str = write_parquet(tmp_path / "zero.parquet", pa.table({"price": [0.0], "height": [1.0]}))
     with pytest.raises(EngineError, match="is not strictly positive"):
         positive.transform_parquet([nonpositive], output_dir=tmp_path / "zero-out")
 
-    short: str = _write(tmp_path / "short.parquet", pa.table({"price": [3.0]}))
+    short: str = write_parquet(tmp_path / "short.parquet", pa.table({"price": [3.0]}))
     with pytest.raises(EngineError, match="fewer than two non-null values"):
         PowerTransformer(columns=["price"]).fit([short])
     with pytest.raises(EngineError, match="is utf8, expected an integer or float column"):
@@ -444,7 +418,7 @@ def test_the_expanders_never_hand_a_non_finite_value_downstream(tmp_path: Path) 
         tmp_path: pytest temporary directory.
 
     """
-    wide: str = _write(tmp_path / "wide.parquet", pa.table({"a": [1e200, 2.0]}))
+    wide: str = write_parquet(tmp_path / "wide.parquet", pa.table({"a": [1e200, 2.0]}))
     poly: PolynomialFeatures = PolynomialFeatures(columns=["a"], degree=2).fit([wide])
     with pytest.raises(EngineError, match=r"column 'a\^2' generates the value inf, which is not finite"):
         poly.transform_parquet([wide], output_dir=tmp_path / "poly")
@@ -456,8 +430,8 @@ def test_the_expanders_never_hand_a_non_finite_value_downstream(tmp_path: Path) 
             [wide]
         )
 
-    small: str = _write(tmp_path / "small.parquet", pa.table({"a": [0.0, 1.0, 2.0, 3.0]}))
-    far: str = _write(tmp_path / "far.parquet", pa.table({"a": [1e300]}))
+    small: str = write_parquet(tmp_path / "small.parquet", pa.table({"a": [0.0, 1.0, 2.0, 3.0]}))
+    far: str = write_parquet(tmp_path / "far.parquet", pa.table({"a": [1e300]}))
     spline: SplineTransformer = SplineTransformer(columns=["a"], n_knots=3, degree=2, extrapolation="continue").fit(
         [small]
     )
@@ -466,7 +440,7 @@ def test_the_expanders_never_hand_a_non_finite_value_downstream(tmp_path: Path) 
     with pytest.raises(EngineError, match="generates the value"):
         spline.transform_dict({"a": 1e300})
     # Values inside the fitted range transform without error, all finite.
-    rows: list[dict[str, Any]] = _rows(spline.transform_parquet([small], output_dir=tmp_path / "ok"))
+    rows: list[dict[str, Any]] = read_rows(spline.transform_parquet([small], output_dir=tmp_path / "ok"))
     assert all(math.isfinite(value) for row in rows for value in row.values())
 
 
@@ -500,7 +474,7 @@ def test_spline_knots_do_not_depend_on_the_row_group_split(tmp_path: Path) -> No
     values: list[float] = [-0.0, 0.0, -0.0, 1.0, 0.0, 2.0, -0.0, 3.0]
     states: set[str] = set()
     for row_group_size in (1, 2, 3, 8):
-        source: str = _write(
+        source: str = write_parquet(
             tmp_path / f"zeros-{row_group_size}.parquet",
             pa.table({"a": values}),
             row_group_size=row_group_size,

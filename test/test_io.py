@@ -24,23 +24,7 @@ from fast_feature_transform.transformers import (
     Select,
     StandardScaler,
 )
-
-
-def _write(path: Path, table: pa.Table, **kwargs: Any) -> str:
-    """Write a Parquet file and return its path as a string.
-
-    Args:
-        path: Destination file.
-        table: Table to write.
-        **kwargs: Passed through to pyarrow's writer.
-
-    Returns:
-        The file path.
-
-    """
-    pq.write_table(table, path, **kwargs)
-    return str(path)
-
+from helpers import write_parquet
 
 # A full batch of a narrow output, which the sink writes as one row group.
 _BATCH_ROWS: int = 65_536
@@ -103,7 +87,7 @@ def _write_strings(path: Path, table: pa.Table, column: str, storage: str) -> st
         "dictionary given up": {"dictionary_pagesize_limit": 4 * 1024, "write_batch_size": 64},
         "dictionary": {"dictionary_pagesize_limit": 64 * 1024 * 1024},
     }[storage]
-    source: str = _write(path, table, row_group_size=table.num_rows, **options)
+    source: str = write_parquet(path, table, row_group_size=table.num_rows, **options)
     assert pq.ParquetFile(source).metadata.num_row_groups == 1
     chunk = _first_chunk(Path(source), column)
     dictionary, data = _stored_bytes(chunk)
@@ -153,7 +137,7 @@ def test_empty_row_groups_and_empty_files_are_tolerated(tmp_path: Path) -> None:
         writer.write_table(pa.table({"device": ["a", "b"], "price": [1.0, 2.0]}, schema=schema))
         writer.write_table(schema.empty_table())
         writer.write_table(pa.table({"device": ["c", "a"], "price": [3.0, 4.0]}, schema=schema))
-    empty: str = _write(tmp_path / "empty.parquet", schema.empty_table())
+    empty: str = write_parquet(tmp_path / "empty.parquet", schema.empty_table())
     row_groups: int = pq.ParquetFile(holes).num_row_groups + pq.ParquetFile(empty).num_row_groups
 
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([str(holes), empty])
@@ -166,7 +150,7 @@ def test_empty_row_groups_and_empty_files_are_tolerated(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY", "PLAIN"])
 def test_string_page_encodings_are_all_readable(tmp_path: Path, encoding: str) -> None:
-    path: str = _write(
+    path: str = write_parquet(
         tmp_path / "encoded.parquet",
         pa.table({"device": ["a", "b", "a"]}),
         use_dictionary=False,
@@ -184,7 +168,9 @@ def test_delta_encoded_strings_take_the_plain_paths_and_match_records(tmp_path: 
     # distinct values in 1,000 rows exceed, and GroupAgg looks plain keys up directly. Both must answer as records do.
     values = [None if row % 17 == 0 else f"v{row * 7 % 300}" for row in range(1000)]
     table = pa.table({"key": values, "amount": [float(row % 23) for row in range(1000)]})
-    path = _write(tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding={"key": "DELTA_BYTE_ARRAY"})
+    path = write_parquet(
+        tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding={"key": "DELTA_BYTE_ARRAY"}
+    )
     assert "DELTA_BYTE_ARRAY" in pq.ParquetFile(path).metadata.row_group(0).column(0).encodings
     for step in (
         HashingEncoder(columns=["key"], n_components=16),
@@ -197,8 +183,8 @@ def test_delta_encoded_strings_take_the_plain_paths_and_match_records(tmp_path: 
 
 
 def test_transform_parquet_replaces_stale_parts(tmp_path: Path) -> None:
-    big: str = _write(tmp_path / "big.parquet", pa.table({"device": ["a", "b", "a", "b"]}), row_group_size=2)
-    small: str = _write(tmp_path / "small.parquet", pa.table({"device": ["a"]}))
+    big: str = write_parquet(tmp_path / "big.parquet", pa.table({"device": ["a", "b", "a", "b"]}), row_group_size=2)
+    small: str = write_parquet(tmp_path / "small.parquet", pa.table({"device": ["a"]}))
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([big])
     out: Path = tmp_path / "out"
     assert len(encoder.transform_parquet([big], output_dir=out)) == 2
@@ -208,7 +194,7 @@ def test_transform_parquet_replaces_stale_parts(tmp_path: Path) -> None:
 
 
 def test_transform_parquet_refuses_a_source_inside_the_output_dir(tmp_path: Path) -> None:
-    source: str = _write(tmp_path / "part-00000.parquet", pa.table({"device": ["a", "b"]}))
+    source: str = write_parquet(tmp_path / "part-00000.parquet", pa.table({"device": ["a", "b"]}))
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([source])
     with pytest.raises(Exception, match="inside the output directory"):
         encoder.transform_parquet([source], output_dir=tmp_path)
@@ -216,8 +202,8 @@ def test_transform_parquet_refuses_a_source_inside_the_output_dir(tmp_path: Path
 
 
 def test_schema_mismatch_at_transform_fails_before_touching_the_output_dir(tmp_path: Path) -> None:
-    good: str = _write(tmp_path / "good.parquet", pa.table({"device": ["a", "b"]}))
-    bad: str = _write(tmp_path / "bad.parquet", pa.table({"device": [1, 2]}))
+    good: str = write_parquet(tmp_path / "good.parquet", pa.table({"device": ["a", "b"]}))
+    bad: str = write_parquet(tmp_path / "bad.parquet", pa.table({"device": [1, 2]}))
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([good])
     out: Path = tmp_path / "out"
     with pytest.raises(Exception, match="expected utf8"):
@@ -240,7 +226,7 @@ def test_output_parts_are_compressed_and_floats_skip_dictionary_encoding(tmp_pat
             "half": pa.array([[1.0], [2.0]], pa.list_(pa.float16(), 1)),
         }
     )
-    source: str = _write(tmp_path / "src.parquet", table)
+    source: str = write_parquet(tmp_path / "src.parquet", table)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -287,7 +273,7 @@ def test_a_wide_output_gathers_its_small_batches_into_row_groups(
     # was hundreds of row groups that held little but their own headers.
     values: np.ndarray = np.arange(rows * columns, dtype=np.float64).reshape(rows, columns)
     table: pa.Table = pa.table({f"x{i}": values[:, i] for i in range(columns)})
-    source: str = _write(tmp_path / "wide.parquet", table, row_group_size=rows)
+    source: str = write_parquet(tmp_path / "wide.parquet", table, row_group_size=rows)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "wide")
     )
@@ -310,7 +296,7 @@ def test_strings_read_from_plain_pages_share_one_dictionary_in_a_row_group(tmp_p
     table: pa.Table = pa.table(
         {"s": words[np.arange(rows) // 1_000], **{f"x{i}": numbers[:, i] for i in range(columns)}}
     )
-    source: str = _write(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
+    source: str = write_parquet(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -333,7 +319,7 @@ def test_strings_in_a_list_read_from_plain_pages_share_one_dictionary_in_a_row_g
         pa.array(np.arange(0, 2 * rows + 1, 2, dtype=np.int32)), pa.array(words[np.arange(2 * rows) // 2_000])
     )
     table: pa.Table = pa.table({"tags": tags, **{f"x{i}": numbers[:, i] for i in range(columns)}})
-    source: str = _write(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
+    source: str = write_parquet(tmp_path / "plain.parquet", table, row_group_size=rows, use_dictionary=False)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -355,7 +341,7 @@ def test_a_batch_of_4096_rows_or_more_is_a_row_group_of_its_own(
 ) -> None:
     rows: int = 150_000
     table: pa.Table = pa.table({f"x{i}": np.arange(rows, dtype=np.float64) + i for i in range(columns)})
-    source: str = _write(tmp_path / "source.parquet", table, row_group_size=rows)
+    source: str = write_parquet(tmp_path / "source.parquet", table, row_group_size=rows)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -376,7 +362,7 @@ def test_a_numbers_only_output_ends_a_dictionary_of_distinct_integers_at_248_kib
     table: pa.Table = pa.table(
         {"id": _distinct_integers(_BATCH_ROWS, 1), "key": keys, "x": rng.normal(size=_BATCH_ROWS)}
     )
-    source: str = _write(tmp_path / "numbers.parquet", table)
+    source: str = write_parquet(tmp_path / "numbers.parquet", table)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -409,7 +395,7 @@ def test_an_output_with_a_plain_string_decimal_or_list_column_keeps_arrows_dicti
     else:
         other = pa.ListArray.from_arrays(np.arange(_BATCH_ROWS + 1, dtype=np.int32), pa.array(small))
     table: pa.Table = pa.table({"id": _distinct_integers(_BATCH_ROWS, 3), "other": other})
-    source: str = _write(tmp_path / "mixed.parquet", table, **options)
+    source: str = write_parquet(tmp_path / "mixed.parquet", table, **options)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -434,7 +420,7 @@ def test_strings_read_as_a_dictionary_keep_it_past_the_lowered_limit(tmp_path: P
             "word": pa.array(words).take(pa.array(np.arange(_BATCH_ROWS) % 20_000)),
         }
     )
-    source: str = _write(tmp_path / "words.parquet", table)
+    source: str = write_parquet(tmp_path / "words.parquet", table)
     parts: list[Path] = (
         Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
     )
@@ -486,7 +472,7 @@ def test_ordinal_and_label_codes_do_not_depend_on_how_a_row_group_stores_its_str
         storage: _write_strings(tmp_path / f"{index}.parquet", table, "label", storage)
         for index, storage in enumerate(("no dictionary", "dictionary given up", "dictionary"))
     }
-    sources["a dictionary per batch"] = _write(tmp_path / "small.parquet", table, row_group_size=20_000)
+    sources["a dictionary per batch"] = write_parquet(tmp_path / "small.parquet", table, row_group_size=20_000)
 
     # The categories are the words some row holds, in byte order, which is the order of `words`. OrdinalEncoder
     # counts them from 1 and gives a null seen at fit the code after the last; LabelEncoder counts them from 1 and
@@ -548,7 +534,7 @@ def test_a_write_the_disk_refuses_fails_the_transform_and_leaves_no_part(tmp_pat
     # closed. A file size limit of 16 bytes stages a disk that refuses the write: the transform raises, naming the
     # part, and the output directory holds neither the part nor its temporary file. Python ignores the signal that
     # comes with the refusal.
-    source: str = _write(tmp_path / "in.parquet", pa.table({"x": [1.0, 2.0, 3.0]}))
+    source: str = write_parquet(tmp_path / "in.parquet", pa.table({"x": [1.0, 2.0, 3.0]}))
     scaler: StandardScaler = StandardScaler(columns=["x"]).fit([source])
     out: Path = tmp_path / "out"
     soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
@@ -589,10 +575,10 @@ def test_files_that_store_one_nested_string_column_differently_are_read_together
         "x": "PLAIN",
     }
     files: list[str] = [
-        _write(tmp_path / "dictionary.parquet", table, use_dictionary=True),
-        _write(tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding=delta),
+        write_parquet(tmp_path / "dictionary.parquet", table, use_dictionary=True),
+        write_parquet(tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding=delta),
         # Dictionary pages that give way to plain ones partway.
-        _write(tmp_path / "fallback.parquet", table, use_dictionary=True, dictionary_pagesize_limit=4),
+        write_parquet(tmp_path / "fallback.parquet", table, use_dictionary=True, dictionary_pagesize_limit=4),
     ]
     sources: list[str] = [files[i] for i in order]
     pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["x"], with_mean=False, with_std=False))])
@@ -603,9 +589,9 @@ def test_files_that_store_one_nested_string_column_differently_are_read_together
 
 
 def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: Path) -> None:
-    strings: str = _write(tmp_path / "strings.parquet", pa.table({"tags": pa.array([["a"], ["b"]])}))
-    numbers: str = _write(tmp_path / "numbers.parquet", pa.table({"tags": pa.array([[1], [2]])}))
-    large: str = _write(
+    strings: str = write_parquet(tmp_path / "strings.parquet", pa.table({"tags": pa.array([["a"], ["b"]])}))
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"tags": pa.array([[1], [2]])}))
+    large: str = write_parquet(
         tmp_path / "large.parquet", pa.table({"tags": pa.array([["a"], ["b"]], pa.large_list(pa.string()))})
     )
     # The message names the type, without the dictionary the strings are read as.
@@ -621,9 +607,9 @@ def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: P
 
 
 def test_schema_mismatch_messages_name_the_column(tmp_path: Path) -> None:
-    first: str = _write(tmp_path / "a.parquet", pa.table({"device": ["a"], "price": [1.0]}))
-    fewer: str = _write(tmp_path / "b.parquet", pa.table({"device": ["a"]}))
-    reordered: str = _write(tmp_path / "c.parquet", pa.table({"price": [1.0], "device": ["a"]}))
+    first: str = write_parquet(tmp_path / "a.parquet", pa.table({"device": ["a"], "price": [1.0]}))
+    fewer: str = write_parquet(tmp_path / "b.parquet", pa.table({"device": ["a"]}))
+    reordered: str = write_parquet(tmp_path / "c.parquet", pa.table({"price": [1.0], "device": ["a"]}))
     with pytest.raises(Exception, match="'price' is missing"):
         Select(columns=["device"]).fit([first, fewer])
     with pytest.raises(Exception, match="same order"):
@@ -632,7 +618,7 @@ def test_schema_mismatch_messages_name_the_column(tmp_path: Path) -> None:
 
 def test_duplicate_column_names_are_rejected(tmp_path: Path) -> None:
     table: pa.Table = pa.Table.from_arrays([pa.array(["a"]), pa.array(["b"])], names=["device", "device"])
-    path: str = _write(tmp_path / "dup.parquet", table)
+    path: str = write_parquet(tmp_path / "dup.parquet", table)
     with pytest.raises(Exception, match="duplicate column name 'device'"):
         Select(columns=["device"]).fit([path])
 
@@ -692,7 +678,7 @@ def test_encrypted_files_are_refused_with_the_file_named(tmp_path: Path) -> None
 
 def test_untouched_columns_pass_through_and_selected_columns_are_projected(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"device": ["a"], "tags": pa.array([[1, 2]], pa.list_(pa.int64())), "price": [1.0]})
-    path: str = _write(tmp_path / "wide.parquet", table)
+    path: str = write_parquet(tmp_path / "wide.parquet", table)
     encoded: list[Path] = (
         LabelEncoder(columns=["device"]).fit([path]).transform_parquet([path], output_dir=tmp_path / "all")
     )
