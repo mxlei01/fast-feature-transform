@@ -140,8 +140,6 @@ make cpp-sanitize  # the C++ tests under AddressSanitizer and UndefinedBehaviorS
 | `cpp-flags` | checks the C++ core and its tests compile with `-ffp-contract=off` (run by the `cpp-*` test targets) |
 | `parity-fixtures`, `sklearn-fixtures` | regenerate the expected values from category_encoders and scikit-learn (needs the network) |
 | `release-requirements` | the hashed lists `release.yaml` installs from (needs the network) |
-| `transformer-benchmark` | five transformers against category_encoders and scikit-learn (needs the network) |
-| `label-encoder-benchmark` | `LabelEncoder` against scikit-learn |
 
 CI runs the same checks without formatting, plus `cpp-sanitize` and the standard-CPython tests. ThreadSanitizer runs
 weekly and on demand: `gh workflow run build.yaml --ref <branch>` runs every job on a branch.
@@ -230,8 +228,8 @@ any upload, so try a release that way first.
 - `fast_feature_transform/`: the Python classes, `Pipeline` and every transformer.
 - `test/`: the pytest suite. `src/**/*_test.cpp`: the Catch2 suite.
 - `triplets/`: the vcpkg triplets (see [Setup](#setup)).
-- `benchmark/`: the `LabelEncoder` and five-transformer comparisons, and the native kernel and scaler benchmarks
-  (see [Profiling](#profiling)).
+- `benchmark/`: the native kernel and scaler benchmarks (see [Profiling](#profiling)), and `measure.py`, which writes
+  another library's output with this package's Parquet settings.
 
 ## License
 

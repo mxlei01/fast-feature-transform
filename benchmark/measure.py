@@ -1,14 +1,13 @@
-"""How both benchmark scripts measure, so that the two cannot report different methodologies.
+"""Write another library's output to Parquet the way this package's sink writes its own.
 
-The scripts are ``label_encoder.py`` and ``transformers.py``. Each batch
-timing is the median of ``REPEATS`` runs with the interquartile range beside
-it, and upstream's output is written to Parquet the way our sink writes ours.
+A timing comparison that ends in Parquet has to charge the other library for
+the same file: the same compression, encodings, dictionary limit, write buffer,
+parts and row groups. ``write_back`` writes a transform's output that way, and
+``sink_layout`` reads the parts and row groups to copy from files the sink
+wrote.
 """
 
-import statistics
-import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,116 +15,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-REPEATS: int = 7
-ROW_GROUP_SIZE: int = 500_000
 LOW_DICTIONARY_LIMIT: int = 248 * 1024
 # The sink writes each part through a buffer of this size (``kPartBufferBytes``
 # in ``src/fastfeaturetransform/io.cpp``). pyarrow opens a path without one
 # and hands the file every page header and every page body in a write call of
 # its own, so the write-back opens its parts through the same buffer.
 PART_BUFFER_BYTES: int = 64 * 1024
-
-
-@dataclass(frozen=True)
-class Stat:
-    """One measurement repeated REPEATS times, summarized by its middle rather than its best.
-
-    Attributes:
-        samples: Every wall time collected, in seconds, sorted.
-        median: The middle sample.
-        q1: First quartile.
-        q3: Third quartile.
-        low: Fastest sample.
-        high: Slowest sample.
-
-    """
-
-    samples: tuple[float, ...]
-    median: float
-    q1: float
-    q3: float
-    low: float
-    high: float
-
-    @property
-    def iqr(self) -> float:
-        """Return the interquartile range, the spread the tables print.
-
-        Returns:
-            ``q3 - q1`` in seconds.
-
-        """
-        return self.q3 - self.q1
-
-
-def summarise(samples: Iterable[float]) -> Stat:
-    """Summarize repeated wall times by their median and interquartile range.
-
-    Args:
-        samples: The collected times, in seconds.
-
-    Returns:
-        The summary the tables print.
-
-    """
-    values: list[float] = sorted(samples)
-    quartiles: list[float] = statistics.quantiles(values, n=4, method="inclusive")
-    return Stat(
-        samples=tuple(values),
-        median=statistics.median(values),
-        q1=quartiles[0],
-        q3=quartiles[2],
-        low=values[0],
-        high=values[-1],
-    )
-
-
-def repeat(fn: Callable[[], object]) -> Stat:
-    """Run fn REPEATS times and summarize the wall times.
-
-    The median, not the minimum: the fastest of a few warm runs reads as a
-    tighter number than the workload delivers, and it hides the occasional
-    outlier that a serving or batch schedule pays.
-
-    Args:
-        fn: Zero-argument callable to time.
-
-    Returns:
-        The summary across repeats.
-
-    """
-    samples: list[float] = []
-    for _ in range(REPEATS):
-        start: float = time.perf_counter()
-        fn()
-        samples.append(time.perf_counter() - start)
-    return summarise(samples)
-
-
-def p99(latencies: list[float]) -> float:
-    """Return the 99th percentile of the given samples.
-
-    Args:
-        latencies: Sample values.
-
-    Returns:
-        The value below which 99% of samples fall.
-
-    """
-    return sorted(latencies)[int(0.99 * (len(latencies) - 1))]
-
-
-def milliseconds(stat: Stat) -> str:
-    """Format a stat as ``median (IQR)`` in milliseconds.
-
-    Args:
-        stat: The summary to format.
-
-    Returns:
-        The two numbers, comma-grouped, one decimal each.
-
-    """
-    return f"{stat.median * 1e3:,.1f} ({stat.iqr * 1e3:,.1f})"
 
 
 def dictionary_columns(schema: pa.Schema) -> list[str]:
