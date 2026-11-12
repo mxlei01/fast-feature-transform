@@ -76,25 +76,56 @@ using StringValues = ankerl::unordered_dense::map<std::string, double, Transpare
 // positions must remain fixed. Under 128 fields or 16 lookups, the record
 // keeps its allocation-free linear lookup; the index is call-local and never
 // retained by fitted state.
+//
+// The linear lookup keeps a cursor on the field after its previous hit and
+// tries that field before it scans from the first one. A step usually lists
+// its columns in the record's own order, and a column whose field follows
+// the previous column's then costs one comparison instead of one per field
+// up to its own. Any other lookup costs at most one comparison more than the
+// scan. find() moves the cursor, so a lookup belongs to one transform_row
+// call on one thread, like the record it reads.
+//
+// A record that holds one name twice answers with one of the two fields: the
+// index and the scan with the first, the cursor with the one it stands on.
 template <typename Record>
 class RecordLookup {
  public:
   using Pointer = std::conditional_t<std::is_const_v<Record>, const RowValue*, RowValue*>;
 
-  RecordLookup(Record& row, std::size_t lookups) : row_(row) {
+  RecordLookup(Record& row, std::size_t lookups) : row_(row), next_(row.size()) {
     if (row.size() < 128 || lookups < 16) return;
     positions_.emplace(row.size());
     for (std::size_t i = 0; i < row.size(); ++i) positions_->try_emplace(row[i].first, i);
   }
 
   Pointer find(const std::string& name) const {
-    if (!positions_) return row_find(row_, name);
-    const auto found = positions_->find(name);
-    return found == positions_->end() ? nullptr : &row_[found->second].second;
+    if (positions_) {
+      const auto found = positions_->find(name);
+      return found == positions_->end() ? nullptr : &row_[found->second].second;
+    }
+    // Names compare through TransparentStringEqual, as the string maps above
+    // do: == calls memcmp for every field whose name is as long as the one
+    // asked for, and those calls were about half of a scan's time for a
+    // record of four-byte names (measured on an Apple M4).
+    const TransparentStringEqual same{};
+    const std::string_view wanted = name;
+    if (next_ < row_.size() && same(row_[next_].first, wanted)) return &row_[next_++].second;
+    for (std::size_t i = 0; i < row_.size(); ++i) {
+      if (same(row_[i].first, wanted)) {
+        next_ = i + 1;
+        return &row_[i].second;
+      }
+    }
+    return nullptr;
   }
 
  private:
   Record& row_;
+  // The cursor: the field find() tries first, the one after its previous hit.
+  // It starts past the last field, where there is none to try. Before any hit
+  // the scan compares the first field anyway, so trying it here as well would
+  // cost every lookup that begins elsewhere a second comparison of that field.
+  mutable std::size_t next_;
   std::optional<ankerl::unordered_dense::map<std::string_view, std::size_t>> positions_;
 };
 

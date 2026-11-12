@@ -18,6 +18,7 @@
 
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::Equals;
 using fft::testing::bool_column;
 using fft::testing::f64_column;
 using fft::testing::large_utf8_column;
@@ -481,6 +482,69 @@ TEST_CASE("cast refuses values that do not fit, on both paths") {
   fft::Schema utf8_schema = schema;
   to_utf8->resolve(utf8_schema);
   REQUIRE_THROWS_WITH(to_utf8->transform(make_batch({"s"}, {int_dictionary})), ContainsSubstring("cannot read"));
+}
+
+// The record path hands the cast table an empty place and puts
+// "<stage>: key '<name>'" in front of a refusal itself. Every message the
+// table has for a record value is pinned here in full, beside the batch
+// path's, which names the column where the record path names the key.
+TEST_CASE("cast names the stage and the key in front of every refusal of a record value") {
+  struct Refusal {
+    const char* target;
+    std::shared_ptr<arrow::Array> column;
+    fft::RowValue value;
+    std::string text;
+  };
+  const int64_t beyond_f64 = (int64_t{1} << 53) + 1;
+  const std::vector<Refusal> refusals{
+      {"i8", numeric_column<arrow::Int64Type>({300}), int64_t{300}, "value 300 does not fit in i8"},
+      {"i64", numeric_column<arrow::DoubleType>({1.5}), 1.5, "value 1.5 is not a whole number"},
+      {"i64", numeric_column<arrow::DoubleType>({1e19}), 1e19, "value 1e+19 does not fit in a 64-bit integer"},
+      {"i64", utf8_column({"12x"}), std::string("12x"), "'12x' is not an integer"},
+      {"i64", utf8_column({"9223372036854775808"}), std::string("9223372036854775808"),
+       "'9223372036854775808' does not fit in a 64-bit integer"},
+      {"f64", numeric_column<arrow::Int64Type>({beyond_f64}), beyond_f64,
+       "value 9007199254740993 is beyond 2^53 in magnitude, where f64 no longer holds every integer exactly"},
+      {"f32", numeric_column<arrow::DoubleType>({1e39}), 1e39, "value 1e+39 does not fit in f32"},
+      {"f64", utf8_column({"two"}), std::string("two"), "'two' is not a number"},
+      {"f64", utf8_column({"1e400"}), std::string("1e400"), "'1e400' is out of range for f64"},
+      {"utf8", numeric_column<arrow::DoubleType>({2.0}), 2.0,
+       "cannot cast a float to utf8 (a float has no single spelling; cast to an integer first)"},
+      {"f64", bool_column({true}), true, "cannot cast a bool to f64"},
+  };
+  for (const Refusal& refusal : refusals) {
+    CAPTURE(refusal.text);
+    // The refused column is the kernel's second, so the key a message names
+    // is the refused one and not the first.
+    auto kernel = cast_kernel({{"kept", "i64"}, {"n", refusal.target}});
+    REQUIRE_THROWS_WITH(
+        kernel->transform(make_batch({"kept", "n"}, {numeric_column<arrow::Int64Type>({1}), refusal.column})),
+        Equals("types: column 'n': " + refusal.text));
+    REQUIRE_THROWS_WITH(kernel->transform_row({{"kept", int64_t{1}}, {"n", refusal.value}}),
+                        Equals("types: key 'n': " + refusal.text));
+  }
+
+  // what() ends at a NUL byte of the value; the message keeps what follows.
+  using namespace std::string_literals;
+  auto kernel = cast_kernel({{"a", "i8"}, {"b", "i8"}, {"s", "i64"}});
+  try {
+    kernel->transform_row({{"a", int64_t{1}}, {"b", int64_t{2}}, {"s", "1\0002"s}});
+    FAIL("the record was accepted");
+  } catch (const fft::Error& error) {
+    REQUIRE(error.message == "types: key 's': '1\0002' is not an integer"s);
+  }
+  // A key the record lacks keeps its own message, with one place in front.
+  REQUIRE_THROWS_WITH(kernel->transform_row({{"a", int64_t{1}}, {"s", std::string("7")}}),
+                      Equals("types: key 'b' missing from record"));
+  // Of two refused values the one named is the first in the kernel's order.
+  REQUIRE_THROWS_WITH(kernel->transform_row({{"s", std::string("x")}, {"b", int64_t{300}}, {"a", int64_t{1}}}),
+                      Equals("types: key 'b': value 300 does not fit in i8"));
+  // No target refuses a null.
+  for (const char* target : {"utf8", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"}) {
+    CAPTURE(target);
+    const fft::Row row = cast_kernel({{"n", target}})->transform_row({{"n", std::monostate{}}});
+    REQUIRE(std::holds_alternative<std::monostate>(row[0].second));
+  }
 }
 
 namespace {

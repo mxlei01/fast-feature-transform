@@ -402,7 +402,9 @@ inline std::shared_ptr<arrow::Array> cast_array(const std::shared_ptr<arrow::Arr
                            : convert.template operator()<arrow::DoubleType>();
 }
 
-// Record path: the same scalar rules, keyed on the value's own type.
+// Record path: the same scalar rules, keyed on the value's own type. Every
+// message begins with `where`: the cast kernel hands in an empty one and
+// puts the key's place in front of a refusal itself.
 inline RowValue cast_value(RowValue value, const CastTarget& target, const std::string& where) {
   if (std::holds_alternative<std::monostate>(value)) return value;
   Family from = Family::Utf8;

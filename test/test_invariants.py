@@ -5,6 +5,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -12,7 +13,32 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import fast_feature_transform
-from fast_feature_transform import LabelEncoder, OneHotEncoder, Pipeline, Select
+from fast_feature_transform import (
+    Binarizer,
+    BinaryEncoder,
+    Cast,
+    CountEncoder,
+    HashingEncoder,
+    JamesSteinEncoder,
+    KBinsDiscretizer,
+    LabelEncoder,
+    MaxAbsScaler,
+    MinMaxScaler,
+    Normalizer,
+    OneHotEncoder,
+    OrdinalEncoder,
+    Pipeline,
+    PolynomialFeatures,
+    PowerTransformer,
+    QuantileEncoder,
+    QuantileTransformer,
+    RobustScaler,
+    Select,
+    SplineTransformer,
+    StandardScaler,
+    SumEncoder,
+    TargetEncoder,
+)
 
 THREADS: int = 16
 CALLS_PER_THREAD: int = 2_000
@@ -340,6 +366,113 @@ def test_summary_encoder_substitutes_in_place(wide: tuple[list[str], dict[str, o
     columns: list[str] = pq.read_table(step.transform_parquet(source, output_dir=tmp_path / "summary")[0]).column_names
     assert columns == ["pre", "x_25", "x_75", "post", "n", "y"]
     assert list(step.transform_dict(dict(record))) == columns
+
+
+def _reordered(record: dict[str, object]) -> list[dict[str, object]]:
+    """Return a record's fields with the keys reversed and in three shuffled orders.
+
+    Args:
+        record: The record.
+
+    Returns:
+        Four records holding the fields of ``record``.
+
+    """
+    items: list[tuple[str, object]] = list(record.items())
+    orders: list[dict[str, object]] = [dict(reversed(items))]
+    for seed in range(3):
+        order: np.ndarray = np.random.default_rng(seed).permutation(len(items))
+        orders.append(dict(items[index] for index in order))
+    return orders
+
+
+def _batch_rows(pipeline: Pipeline, path: str, output_dir: Path) -> list[dict[str, object]]:
+    """Transform a file through the batch path and read the rows back.
+
+    Args:
+        pipeline: A fitted pipeline.
+        path: The Parquet file to transform.
+        output_dir: Directory for the output parts.
+
+    Returns:
+        The transformed rows, in the file's row order.
+
+    """
+    parts: list[Path] = pipeline.transform_parquet([path], output_dir=output_dir)
+    return pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
+
+
+# A step finds the fields it reads by name, and it tries the field after the
+# one it found last before it searches the record. Each place a kernel does
+# that is reached by a step below. Their columns sit between other fields,
+# some are listed out of the table's order, and some are read by two steps.
+def test_a_record_gives_its_batch_row_whatever_order_its_keys_are_in(tmp_path: Path) -> None:
+    rows: int = 48
+    rng: np.random.Generator = np.random.default_rng(20)
+    columns: dict[str, object] = {}
+    for index in range(16):
+        columns[f"n{index:02d}"] = rng.normal(size=rows)
+        if index < 10:
+            columns[f"t{index:02d}"] = rng.choice(["a", "b", "c", "d"], size=rows)
+    columns["y"] = rng.normal(size=rows)
+    table: pa.Table = pa.table(columns)
+    path: str = _write(tmp_path / "wide.parquet", table)
+    pipeline: Pipeline = Pipeline(
+        [
+            ("cast", Cast({"n00": "f32", "n01": "f64"})),
+            ("standard", StandardScaler(columns=["n01", "n02", "n03"])),
+            ("min_max", MinMaxScaler(columns=["n05", "n04"])),
+            ("max_abs", MaxAbsScaler(columns=["n06"])),
+            ("robust", RobustScaler(columns=["n07", "n08"])),
+            ("quantile", QuantileTransformer(columns=["n09"], n_quantiles=10)),
+            ("power", PowerTransformer(columns=["n10"])),
+            ("binarize", Binarizer(columns=["n11"], threshold=0.5)),
+            ("normalize", Normalizer(columns=["n03", "n01", "n02"])),
+            ("bins", KBinsDiscretizer(columns=["n12"], n_bins=3, encode="ordinal", strategy="uniform")),
+            ("hot_bins", KBinsDiscretizer(columns=["n13"], n_bins=3, encode="onehot", strategy="uniform")),
+            ("polynomial", PolynomialFeatures(columns=["n15", "n14"], degree=2)),
+            ("spline", SplineTransformer(columns=["n04"], n_knots=3, degree=1)),
+            ("ordinal", OrdinalEncoder(columns=["t00", "t01"])),
+            ("count", CountEncoder(columns=["t02"])),
+            ("target", TargetEncoder(target="y", columns=["t03"])),
+            ("james_stein", JamesSteinEncoder(columns=["t04"], target="y")),
+            ("quantile_encode", QuantileEncoder(target="y", columns=["t05"])),
+            ("one_hot", OneHotEncoder(columns=["t06"])),
+            ("binary", BinaryEncoder(columns=["t07"])),
+            ("sum", SumEncoder(columns=["t08"])),
+            ("hashing", HashingEncoder(columns=["t09"], n_components=4)),
+        ]
+    ).fit([path])
+    expected: list[dict[str, object]] = _batch_rows(pipeline, path, tmp_path / "out")
+    source: list[dict[str, object]] = table.to_pylist()
+    for row in range(0, rows, 8):
+        kept: dict[str, object] = pipeline.transform_dict(dict(source[row]))
+        assert kept == expected[row]
+        assert list(kept) == list(expected[row])  # in the table's key order, the batch path's column order too
+        for record in _reordered(source[row]):
+            assert pipeline.transform_dict(record) == expected[row]
+
+
+# From 128 fields on, a step that reads 16 columns or more finds them through
+# an index of the record and a step that reads fewer searches it, so a wide
+# record has both kinds of step to get right.
+def test_a_record_of_128_fields_or_more_gives_its_batch_row_whatever_order_its_keys_are_in(tmp_path: Path) -> None:
+    rng: np.random.Generator = np.random.default_rng(21)
+    names: list[str] = [f"w{index:03d}" for index in range(140)]
+    table: pa.Table = pa.table({name: rng.normal(size=8) for name in names})
+    path: str = _write(tmp_path / "wider.parquet", table)
+    pipeline: Pipeline = Pipeline(
+        [
+            ("indexed", StandardScaler(columns=names[100:120])),
+            ("searched", MinMaxScaler(columns=names[112:104:-1] + names[130:136])),
+        ]
+    ).fit([path])
+    expected: list[dict[str, object]] = _batch_rows(pipeline, path, tmp_path / "out")
+    source: list[dict[str, object]] = table.to_pylist()
+    for row in (0, 7):
+        assert pipeline.transform_dict(dict(source[row])) == expected[row]
+        for record in _reordered(source[row]):
+            assert pipeline.transform_dict(record) == expected[row]
 
 
 def test_tracked_stub_matches_the_generated_one(tmp_path: Path) -> None:

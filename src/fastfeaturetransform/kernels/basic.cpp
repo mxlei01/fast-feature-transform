@@ -439,10 +439,20 @@ class Cast final : public Kernel {
 
   Row transform_row(Row row) const override {
     RecordLookup lookup(row, columns_.size());
+    // Every message of the cast table begins with the place it is handed.
+    // The table gets an empty one here, and "<stage>: key '<name>'" goes in
+    // front only of a refusal, so a value that converts builds no message.
+    // A refusal is thrown a second time for it, from the message rather than
+    // what(), which ends at a NUL byte of the value.
+    const std::string no_place;
     for (std::size_t i = 0; i < columns_.size(); ++i) {
       RowValue* value = lookup.find(columns_[i]);
       if (value == nullptr) throw Error(stage + ": key '" + columns_[i] + "' missing from record");
-      *value = cast_value(std::move(*value), targets_[i], stage + ": key '" + columns_[i] + "'");
+      try {
+        *value = cast_value(std::move(*value), targets_[i], no_place);
+      } catch (const Error& refusal) {
+        throw Error(stage + ": key '" + columns_[i] + "'" + refusal.message);
+      }
     }
     return row;
   }
