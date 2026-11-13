@@ -7,6 +7,7 @@
 #include "fastfeaturetransform/io.hpp"
 
 #include <arrow/array.h>
+#include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_decimal.h>
 #include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
@@ -50,6 +51,7 @@
 
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
+using Catch::Matchers::EndsWith;
 using Catch::Matchers::StartsWith;
 using fft::testing::bool_column;
 using fft::testing::f64_column;
@@ -626,6 +628,15 @@ TEST_CASE("a nested column's tag names its type and not the dictionaries its str
       {arrow::struct_({arrow::field("v", arrow::fixed_size_list(element(words), 2))}),
        arrow::struct_({arrow::field("v", arrow::fixed_size_list(element(arrow::utf8()), 2))}),
        "struct<v: fixed_size_list<element: string>[2]>"},
+      // The dictionary read gives a dictionary of string for a stored
+      // large_string or string_view too, and delta pages give the stored type.
+      {arrow::list(element(words)), arrow::list(element(arrow::large_utf8())), "list<element: string>"},
+      {arrow::list(element(words)), arrow::list(element(arrow::utf8_view())), "list<element: string>"},
+      {arrow::large_list(element(words)), arrow::large_list(element(arrow::utf8_view())),
+       "large_list<element: string>"},
+      {arrow::struct_({arrow::field("name", words)}), arrow::struct_({arrow::field("name", arrow::large_utf8())}),
+       "struct<name: string>"},
+      {arrow::map(arrow::utf8(), words), arrow::map(arrow::large_utf8(), arrow::utf8_view()), "map<string, string>"},
   };
   for (const Case& c : cases) {
     CAPTURE(c.tag);
@@ -641,11 +652,178 @@ TEST_CASE("a nested column's tag names its type and not the dictionaries its str
   };
   REQUIRE(tag(arrow::list(element(arrow::int64()))) == "list<element: int64>");
   REQUIRE(tag(arrow::large_list(element(words))) != tag(arrow::list(element(words))));
+  REQUIRE(tag(arrow::large_list(element(arrow::large_utf8()))) != tag(arrow::list(element(arrow::large_utf8()))));
   REQUIRE(tag(arrow::list(arrow::field("item", words))) == "list<item: string>");
   // A column that is a dictionary itself, and a vector of them, were already
-  // named by their values.
+  // named by their values; a column of strings of any layout is utf8.
   REQUIRE(tag(words) == "utf8");
   REQUIRE(tag(arrow::fixed_size_list(element(words), 3)) == "utf8[3]");
+  REQUIRE(tag(arrow::large_utf8()) == "utf8");
+  REQUIRE(tag(arrow::utf8_view()) == "utf8");
+  REQUIRE(tag(arrow::fixed_size_list(element(arrow::utf8_view()), 3)) == "utf8[3]");
+}
+
+namespace {
+
+// A column of the strings a Builder makes (StringViewBuilder,
+// LargeStringBuilder, or BinaryBuilder for bytes); nullopt is a null.
+template <typename Builder>
+std::shared_ptr<arrow::Array> strings_of(const std::vector<std::optional<std::string>>& values) {
+  Builder builder;
+  for (const auto& value : values) REQUIRE((value ? builder.Append(*value) : builder.AppendNull()).ok());
+  std::shared_ptr<arrow::Array> out;
+  REQUIRE(builder.Finish(&out).ok());
+  return out;
+}
+
+std::vector<std::optional<std::string>> large_string_values(const arrow::Array& column) {
+  REQUIRE(column.type_id() == arrow::Type::LARGE_STRING);
+  const auto& strings = static_cast<const arrow::LargeStringArray&>(column);
+  std::vector<std::optional<std::string>> out;
+  for (int64_t row = 0; row < strings.length(); ++row) {
+    out.push_back(strings.IsNull(row) ? std::nullopt : std::optional<std::string>(strings.GetString(row)));
+  }
+  return out;
+}
+
+enum class Pages { kDictionary, kPlain, kDelta };
+
+// `tables` as the row groups of one Parquet file that stores its Arrow
+// schema, as pyarrow does, so the reader gives back large_string and
+// string_view. Every string leaf is in dictionary pages, in plain pages, or,
+// for the leaves `delta` names, in DELTA_BYTE_ARRAY pages.
+std::string string_pages_file(const TempDir& dir, const std::string& name,
+                              const std::vector<std::shared_ptr<arrow::Table>>& tables, Pages pages,
+                              const std::vector<std::string>& delta = {}) {
+  parquet::WriterProperties::Builder properties;
+  if (pages != Pages::kDictionary) properties.disable_dictionary();
+  if (pages == Pages::kDelta) {
+    for (const std::string& leaf : delta) properties.encoding(leaf, parquet::Encoding::DELTA_BYTE_ARRAY);
+  }
+  const std::string path = (dir.path / (name + ".parquet")).string();
+  auto output = arrow::io::FileOutputStream::Open(path);
+  REQUIRE(output.ok());
+  auto writer = parquet::arrow::FileWriter::Open(*tables.front()->schema(), arrow::default_memory_pool(), *output,
+                                                 properties.build(),
+                                                 parquet::ArrowWriterProperties::Builder().store_schema()->build());
+  REQUIRE(writer.ok());
+  for (const auto& table : tables) REQUIRE((*writer)->WriteTable(*table, 1024).ok());
+  REQUIRE((*writer)->Close().ok());
+  REQUIRE((*output)->Close().ok());
+  return path;
+}
+
+}  // namespace
+
+TEST_CASE("a string_view column enters the engine as large_string, and any other column as it came") {
+  // Strings of up to 12 bytes sit inside their view; longer ones in a buffer.
+  const std::vector<std::optional<std::string>> words{"a", std::nullopt, "", "a string of more than 12 bytes", "b"};
+  const auto views = strings_of<arrow::StringViewBuilder>(words);
+  const auto strings = utf8_column(words);
+  const auto large = strings_of<arrow::LargeStringBuilder>(words);
+  const auto input =
+      arrow::RecordBatch::Make(arrow::schema({arrow::field("v", views->type()), arrow::field("s", strings->type()),
+                                              arrow::field("l", large->type())}),
+                               5, {views, strings, large});
+  const fft::Batch batch = fft::batch_from_arrow(*input);
+  REQUIRE(large_string_values(*batch.cols[0]) == words);
+  REQUIRE(batch.cols[1] == input->column(1));
+  REQUIRE(batch.cols[2] == input->column(2));
+  REQUIRE(large_string_values(*fft::batch_from_arrow(*input->Slice(1, 3)).cols[0]) ==
+          std::vector<std::optional<std::string>>(words.begin() + 1, words.begin() + 4));
+}
+
+TEST_CASE("files that store strings of any layout in dictionary, plain or delta pages are read together") {
+  TempDir dir;
+  // A top-level string_view column, and large_string and string_view leaves
+  // in a list, a large list, a struct and a fixed-size list.
+  const std::vector<std::optional<std::string>> words{"a", std::nullopt, "a string of more than 12 bytes"};
+  const auto offsets = numeric_column<arrow::Int32Type>({0, 2, 2, 3});
+  const auto large_offsets = numeric_column<arrow::Int64Type>({0, 2, 2, 3});
+  const auto large = strings_of<arrow::LargeStringBuilder>(words);
+  const auto views = strings_of<arrow::StringViewBuilder>(words);
+  const arrow::ArrayVector columns{views,
+                                   *arrow::ListArray::FromArrays(*offsets, *large),
+                                   *arrow::ListArray::FromArrays(*offsets, *views),
+                                   *arrow::LargeListArray::FromArrays(*large_offsets, *views),
+                                   *arrow::StructArray::Make({large, views}, std::vector<std::string>{"l", "v"}),
+                                   *arrow::FixedSizeListArray::FromArrays(views, 1)};
+  const auto schema =
+      arrow::schema({arrow::field("word", views->type()), arrow::field("tags", columns[1]->type()),
+                     arrow::field("seen", columns[2]->type()), arrow::field("big", columns[3]->type()),
+                     arrow::field("pair", columns[4]->type()), arrow::field("one", columns[5]->type())});
+  const auto table = arrow::Table::Make(schema, columns, 3);
+  const auto empty = *arrow::Table::MakeEmpty(schema);
+  const std::vector<std::string> leaves{
+      "word", "tags.list.element", "seen.list.element", "big.list.element", "pair.l", "pair.v", "one.list.element"};
+  // The delta file ends with an empty row group, which enters the engine as
+  // an empty batch.
+  const std::vector<std::string> files{string_pages_file(dir, "dictionary", {table}, Pages::kDictionary),
+                                       string_pages_file(dir, "plain", {table}, Pages::kPlain),
+                                       string_pages_file(dir, "delta", {table, empty}, Pages::kDelta, leaves)};
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> stored = parquet::ParquetFileReader::OpenFile(files[2]);
+    const std::unique_ptr<parquet::RowGroupMetaData> group = stored->metadata()->RowGroup(0);
+    for (int leaf = 0; leaf < group->num_columns(); ++leaf) {
+      const std::vector<parquet::Encoding::type> encodings = group->ColumnChunk(leaf)->encodings();
+      REQUIRE(std::find(encodings.begin(), encodings.end(), parquet::Encoding::DELTA_BYTE_ARRAY) != encodings.end());
+    }
+  }
+  const fft::Schema expected{{{"word", "utf8"},
+                              {"tags", "list<element: string>"},
+                              {"seen", "list<element: string>"},
+                              {"big", "large_list<element: string>"},
+                              {"pair", "struct<l: string, v: string>"},
+                              {"one", "utf8[1]"}}};
+  for (const std::string& first : files) {
+    for (const std::string& second : files) {
+      CAPTURE(first, second);
+      REQUIRE(fft::open_source({first, second})->schema().cols == expected.cols);
+    }
+  }
+  // The top-level column comes from the delta file as large_string, an empty
+  // row group's too, and from the dictionary file as a dictionary of string.
+  const auto delta = fft::open_source({files[2]});
+  REQUIRE(delta->plan_tasks().size() == 2);
+  REQUIRE(large_string_values(*read_task(*delta, 0).cols[0]) == words);
+  const fft::Batch none = read_task(*delta, 1);
+  REQUIRE(none.rows == 0);
+  REQUIRE(none.cols[0]->type_id() == arrow::Type::LARGE_STRING);
+  const fft::Batch dictionary = read_task(*fft::open_source({files[0]}), 0);
+  REQUIRE(dictionary.cols[0]->type()->Equals(arrow::dictionary(arrow::int32(), arrow::utf8())));
+
+  // Columns that differ in type are still refused, named by their tags.
+  const auto one_column = [&](const std::string& name, const std::string& column,
+                              const std::shared_ptr<arrow::Array>& values, Pages pages) {
+    const auto alone = arrow::Table::Make(arrow::schema({arrow::field(column, values->type())}), {values});
+    return string_pages_file(dir, name, {alone}, pages, {column, column + ".list.element"});
+  };
+  const std::string word_views = one_column("word_views", "word", views, Pages::kDelta);
+  const std::string word_numbers =
+      one_column("word_numbers", "word", numeric_column<arrow::Int64Type>({1, 2, 3}), Pages::kPlain);
+  REQUIRE_THROWS_WITH(fft::open_source({word_views, word_numbers}),
+                      EndsWith("word_numbers.parquet: column 'word' is i64 but " + word_views + " has utf8"));
+  const std::string tags_large = one_column("tags_large", "tags", columns[1], Pages::kDelta);
+  const std::string tags_numbers =
+      one_column("tags_numbers", "tags",
+                 *arrow::ListArray::FromArrays(*offsets, *numeric_column<arrow::Int64Type>({1, 2, 3})), Pages::kPlain);
+  REQUIRE_THROWS_WITH(
+      fft::open_source({tags_large, tags_numbers}),
+      EndsWith("column 'tags' is list<element: int64> but " + tags_large + " has list<element: string>"));
+  const std::string tags_big = one_column("tags_big", "tags", columns[3], Pages::kDelta);
+  REQUIRE_THROWS_WITH(
+      fft::open_source({tags_large, tags_big}),
+      EndsWith("column 'tags' is large_list<element: string> but " + tags_large + " has list<element: string>"));
+  // Strings and bytes stay two types, at the top level and inside a list.
+  const auto blobs = strings_of<arrow::BinaryBuilder>(words);
+  const std::string word_blobs = one_column("word_blobs", "word", blobs, Pages::kPlain);
+  REQUIRE_THROWS_WITH(fft::open_source({word_views, word_blobs}),
+                      EndsWith("word_blobs.parquet: column 'word' is binary but " + word_views + " has utf8"));
+  const std::string tags_blobs =
+      one_column("tags_blobs", "tags", *arrow::ListArray::FromArrays(*offsets, *blobs), Pages::kPlain);
+  REQUIRE_THROWS_WITH(
+      fft::open_source({tags_large, tags_blobs}),
+      EndsWith("column 'tags' is list<element: binary> but " + tags_large + " has list<element: string>"));
 }
 
 TEST_CASE("files must agree on whether a column holds integers, naive timestamps or zoned ones") {

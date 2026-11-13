@@ -650,8 +650,8 @@ class LabelEncoder(Transformer):
     to the observed vocabulary. Known categories sort by byte order and take
     indices 1..n; unknown categories, nulls, and categories below
     ``min_count`` map to 0 (the ``torch.nn.Embedding(padding_idx=0)``
-    convention). Both string layouts (``string`` and ``large_string``) are
-    supported; categories must be valid UTF-8.
+    convention). Every string layout (``string``, ``large_string`` and
+    ``string_view``) is supported; categories must be valid UTF-8.
     """
 
     kernel_id: ClassVar[str] = "label_encode"
