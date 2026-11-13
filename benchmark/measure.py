@@ -104,13 +104,12 @@ def as_table(output: Any) -> pa.Table:
 def sink_layout(parts: Iterable[str | Path]) -> list[list[int]]:
     """Read back how our sink split a transform's output into parts and row groups.
 
-    The sink writes one part per input row group. A batch of 4,096 rows or
-    more is a row group of its own, smaller batches are gathered until their
-    row group holds 4,096 rows or six batches, and the batch shrinks as the
-    pipeline's rows widen, so the layout depends on the transformer. Reading
-    every row group's size from the files ours wrote keeps the write-back
-    matched when that rule changes; a copy of the rule here would drift from
-    the sink's.
+    The sink writes one part per input row group and gathers small batches
+    into row groups by their rows, their number and their bytes, and the
+    batch shrinks as the pipeline's rows widen, so the layout depends on the
+    transformer. Reading every row group's size from the files ours wrote
+    keeps the write-back matched when that rule changes; a copy of the rule
+    here would drift from the sink's.
 
     Args:
         parts: The part files a ``transform_parquet`` call returned, in order.

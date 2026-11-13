@@ -99,10 +99,14 @@ class ParquetSource final : public RecordBatchSource {
 
 // One ordered part per source task, written a batch at a time. The first
 // batch establishes the physical Arrow schema; even an empty task must append
-// one typed empty batch. A nonempty batch of 4,096 rows or more is a row
-// group of its own. Smaller batches are gathered until their row group holds
-// 4,096 rows or six batches, so the writer holds no more than six batches at
-// a time, and no row group passes 65,536 rows unless one batch does.
+// one typed empty batch. Nonempty batches are gathered into row groups: a row
+// group closes once it holds 4,096 rows or six batches, or once one more
+// batch as large as its last would bring its buffers past 36 MiB. A batch of
+// 4,096 rows or more thus closes the row group it joins, and is a row group
+// of its own when no batch waits before it. A batch that would bring the
+// waiting rows past 65,536 starts a row group, so no row group passes 65,536
+// rows unless one batch does. Between appends the writer holds at most five
+// batches, of at most 36 MiB together.
 // Publication occurs only after schema/total-row validation and successful
 // writer close.
 // A batch reaches the Parquet writer with its row group, so a batch that

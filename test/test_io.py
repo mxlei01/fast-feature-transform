@@ -267,7 +267,8 @@ def test_a_wide_output_gathers_its_small_batches_into_row_groups(
     tmp_path: Path, columns: int, rows: int, row_groups: list[int]
 ) -> None:
     # REGRESSION: a batch of fewer than 4,096 rows shares a row group with the
-    # ones after it, until the row group holds 4,096 rows or six batches. Each
+    # ones after it, until the row group holds 4,096 rows or six batches, or
+    # one more batch as large as its last would bring it past 36 MiB. Each
     # batch used to be a row group, and a batch holds fewer rows the wider the
     # output is (5,592,405 bytes at 8 bytes a number), so a very wide output
     # was hundreds of row groups that held little but their own headers.

@@ -10,6 +10,7 @@
 #include <arrow/array/builder_decimal.h>
 #include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
+#include <arrow/buffer.h>
 #include <arrow/io/file.h>
 #include <arrow/memory_pool.h>
 #include <arrow/table.h>
@@ -1491,6 +1492,7 @@ TEST_CASE("PartWriter closes a row group once it holds 4,096 rows or six batches
       {{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, {21, 57, 13}},
       {{3, 0, 3, 0, 3, 3, 3, 3, 3}, {18, 3}},  // a batch without rows is no batch of a row group
       {{4096, 4096, 5}, {4096, 4096, 5}},      // a batch of 4,096 rows is a row group of its own
+      {{3, 4096}, {4099}},                     // unless batches wait: it joins them and closes theirs
       {{4095, 1, 7}, {4096, 7}},               // the batch that brings the 4,096th row closes it
       {{4095, 4095, 2}, {8190, 2}},
       {{2000, 2000, 2000, 2000}, {6000, 2000}},
@@ -1522,6 +1524,50 @@ TEST_CASE("PartWriter closes a row group once it holds 4,096 rows or six batches
       for (int64_t row = 0; row < values.length(); ++row) REQUIRE(values.Value(row) == expected++);
     }
     REQUIRE(expected == static_cast<double>(total));
+  }
+}
+
+namespace {
+
+// A column of `rows` fixed-size binary values of 1 MiB each, without a
+// validity bitmap, so that its buffers hold exactly `rows` MiB.
+std::shared_ptr<arrow::Array> mebibyte_values(int64_t rows) {
+  constexpr int32_t width = 1 << 20;
+  auto buffer = arrow::AllocateBuffer(rows * width);
+  REQUIRE(buffer.ok());
+  std::memset((*buffer)->mutable_data(), 0, static_cast<std::size_t>(rows * width));
+  return std::make_shared<arrow::FixedSizeBinaryArray>(arrow::fixed_size_binary(width), rows,
+                                                       std::shared_ptr<arrow::Buffer>(std::move(*buffer)));
+}
+
+}  // namespace
+
+// REGRESSION: a row group closes once one more batch as large as its last
+// would bring it past 36 MiB. Six batches used to wait whatever their bytes,
+// so a wide output with long strings took more memory than a row group per
+// batch.
+TEST_CASE("PartWriter closes a row group once one more batch as large as its last would pass 36 MiB") {
+  // Each value holds 1 MiB, so each layout lists the MiB of the batches
+  // appended and of the row groups the part must hold.
+  struct Layout {
+    std::vector<int64_t> batches, row_groups;
+  };
+  const std::vector<Layout> layouts{
+      {{19, 19}, {19, 19}},          // more than half of 36 MiB never waits
+      {{18, 18}, {36}},              // half of it waits for one more
+      {{11, 11, 11, 11}, {33, 11}},  // a fourth batch of 11 MiB would pass 36
+      {{6, 6, 6, 6, 6, 6}, {36}},    // six of 6 MiB fit
+      {{1, 1, 30, 1, 1}, {32, 2}},   // the last batch is the one that counts
+      {{1, 18, 1}, {19, 1}},         // 19 MiB and another 18 would be 37
+  };
+  for (const Layout& layout : layouts) {
+    CAPTURE(layout.batches);
+    TempDir dir;
+    int64_t total = 0;
+    for (const int64_t rows : layout.batches) total += rows;
+    fft::PartWriter writer(dir.path.string(), 0, total);
+    for (const int64_t rows : layout.batches) writer.append(make_batch({"v"}, {mebibyte_values(rows)}));
+    REQUIRE(fft::open_source({writer.finish()})->task_rows() == layout.row_groups);
   }
 }
 
@@ -1557,6 +1603,53 @@ TEST_CASE("PartWriter holds no more than the batches of one row group") {
     full.append(make_batch({"x"}, {values}));
   }
   REQUIRE(filled.expired());
+
+  // A batch of more than 18 MiB, half of 36 MiB, is written by its own
+  // append too, while one of 18 MiB waits for the next.
+  TempDir large;
+  fft::PartWriter bytes(large.path.string(), 0, 19 + 18);
+  std::weak_ptr<arrow::Array> written, waiting;
+  {
+    auto values = mebibyte_values(19);
+    written = values;
+    bytes.append(make_batch({"v"}, {values}));
+  }
+  REQUIRE(written.expired());
+  {
+    auto values = mebibyte_values(18);
+    waiting = values;
+    bytes.append(make_batch({"v"}, {values}));
+  }
+  REQUIRE_FALSE(waiting.expired());
+}
+
+TEST_CASE("PartWriter counts the whole dictionary that a sliced dictionary keeps alive") {
+  // A batch read as a dictionary from plain pages refers to a slice of the
+  // dictionary the reader has built for its row group so far, and the slice
+  // keeps all of it alive. Here each batch refers to 2 of the 19 entries of
+  // 1 MiB of a dictionary of its own, so it counts 19 MiB, more than half of
+  // 36 MiB, and is a row group of its own. Counted by the 2 MiB it refers
+  // to, the two would share one.
+  TempDir dir;
+  fft::PartWriter writer(dir.path.string(), 0, 4);
+  std::vector<std::optional<std::string>> expected;
+  for (int batch = 0; batch < 2; ++batch) {
+    std::vector<std::optional<std::string>> entries;
+    for (int entry = 0; entry < 19; ++entry) {
+      entries.emplace_back(std::string(std::size_t{1} << 20, static_cast<char>('a' + batch + entry)));
+    }
+    const auto column = *arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int32(), arrow::utf8()),
+                                                            numeric_column<arrow::Int32Type>({1, 0}),
+                                                            utf8_column(entries)->Slice(17, 2));
+    writer.append(make_batch({"s"}, {column}));
+    expected.push_back(entries[18]);
+    expected.push_back(entries[17]);
+  }
+  const std::string output = writer.finish();
+  REQUIRE(fft::open_source({output})->task_rows() == std::vector<int64_t>{2, 2});
+  // Compared outside REQUIRE, which would print 4 MiB of strings on failure.
+  const bool same = read_strings(output) == expected;
+  REQUIRE(same);
 }
 
 TEST_CASE("PartWriter gives the batches of a row group one dictionary") {
