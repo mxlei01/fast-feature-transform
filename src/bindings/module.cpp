@@ -109,6 +109,19 @@ Row row_from_dict(const nb::dict& record) {
   Row row;
   row.reserve(nb::len(record));
   for (auto [key, value] : record) {
+    // The record lends its keys and values, and its reference can be the
+    // only one. Code that runs while a field is read can take the key or the
+    // value out of the record and free it: a hook of the value or of its
+    // type, or another thread, which on the standard build can run whenever
+    // Python code runs and on a free-threaded build whenever this thread
+    // waits, since waiting suspends the record's lock. So from the first step
+    // that can run Python code or wait, the key and the value that are still
+    // to be read are held. Reading None, a bool, an int, a float or an ASCII
+    // str does neither. On a free-threaded build the first UTF-8 conversion
+    // of a str that is not ASCII locks the str, and can wait for that lock.
+    const bool key_can_wait = PyUnicode_Check(key.ptr()) && !PyUnicode_IS_ASCII(key.ptr());
+    const nb::object held_key = key_can_wait ? nb::borrow(key) : nb::object();
+    nb::object held_value = key_can_wait ? nb::borrow(value) : nb::object();
     std::string name;
     if (!nb::try_cast(key, name)) throw fastfeaturetransform::Error("record keys must be str");
     if (value.is_none()) {
@@ -124,12 +137,14 @@ Row row_from_dict(const nb::dict& record) {
     } else if (nb::isinstance<nb::float_>(value)) {
       row.emplace_back(std::move(name), nb::cast<double>(value));
     } else if (nb::isinstance<nb::str>(value)) {
+      if (!PyUnicode_IS_ASCII(value.ptr())) held_value = nb::borrow(value);
       std::string text;
       if (!nb::try_cast(value, text)) {
         throw fastfeaturetransform::Error("record value for '" + name + "' is not encodable as UTF-8");
       }
       row.emplace_back(std::move(name), std::move(text));
     } else {
+      held_value = nb::borrow(value);
       const std::string type = python_type_name(value);
       const auto unsupported = [&] {
         return fastfeaturetransform::Error("record value for '" + name +
@@ -150,10 +165,15 @@ Row row_from_dict(const nb::dict& record) {
           row.emplace_back(std::move(name), std::monostate{});
         }
       } else if (type == "bool" || type == "bool_") {  // numpy's bool (2.x / 1.x names)
-        row.emplace_back(std::move(name), PyObject_IsTrue(value.ptr()) == 1);
+        const int truth = PyObject_IsTrue(value.ptr());
+        if (truth < 0) throw nb::python_error();  // the error its __bool__ raised
+        row.emplace_back(std::move(name), truth == 1);
       } else if (nb::hasattr(value, "__index__")) {  // integer-like: fits int64 or fails, never widens
         nb::object index = nb::steal(PyNumber_Index(value.ptr()));
-        if (!index.is_valid()) {  // __index__ refused it (a float or non-scalar ndarray, say)
+        if (!index.is_valid()) {
+          // A TypeError is __index__ refusing it (a float or non-scalar
+          // ndarray, say); any other error is the value's own and propagates.
+          if (!PyErr_ExceptionMatches(PyExc_TypeError)) throw nb::python_error();
           PyErr_Clear();
           throw unsupported();
         }

@@ -269,6 +269,44 @@ def test_transform_dict_rejects_lookalike_numerics_by_type(source: str) -> None:
     assert pipeline.transform_dict({"device": "ios", "price": np.array(3)}) == {"device": "ios", "price": 3}
 
 
+class bool_:
+    """A value that carries the name of numpy's bool, which the record path tests by its truth."""
+
+    def __bool__(self) -> bool:
+        """Refuse a truth value.
+
+        Raises:
+            ValueError: Always.
+
+        """
+        raise ValueError("no truth value")
+
+
+class _NoIndex:
+    """An integer-like value whose __index__ fails with an error other than TypeError."""
+
+    def __index__(self) -> int:
+        """Refuse an integer.
+
+        Raises:
+            ValueError: Always.
+
+        """
+        raise ValueError("no integer value")
+
+
+def test_transform_dict_raises_the_error_a_value_raises_while_it_converts(source: str) -> None:
+    # REGRESSION: an error from a value's own __bool__ or __index__ reaches
+    # the caller. A raising __bool__ used to leave its error set, which
+    # surfaced as a SystemError, and any error from __index__ used to become
+    # the EngineError for an unsupported type.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    with pytest.raises(ValueError, match="no truth value"):
+        pipeline.transform_dict({"device": "ios", "flag": bool_()})
+    with pytest.raises(ValueError, match="no integer value"):
+        pipeline.transform_dict({"device": "ios", "n": _NoIndex()})
+
+
 def test_transform_dict_accepts_numpy_scalars(source: str) -> None:
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device", "n", "x", "flag"]))]).fit(
         [_with_extra_columns(source)]
