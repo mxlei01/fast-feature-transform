@@ -304,6 +304,70 @@ def test_readers_see_the_old_fit_or_the_new_one_while_a_transformer_is_fitted_ag
     assert race([fit_held, refit] * 500, [[old, new] for old, new in zip(alone, held, strict=True)]) == []
 
 
+# For 0.3 s the main thread fits one new transformer after another, each for
+# the first time, while another thread copies, deep-copies or pickles the
+# newest one and asks the copy for a record. The child prints the answers it
+# did not expect, and whether both threads got to work. A copy taken while a
+# first fit added attributes used to crash the free-threaded build, so this
+# runs in a child process.
+FIRST_FIT_COPY_CHILD: str = """
+import copy
+import pickle
+import sys
+import threading
+import time
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from fast_feature_transform import LabelEncoder
+
+source = sys.argv[1]
+pq.write_table(pa.table({"s": ["a", "b"]}), source)
+# The standard build passes the GIL from thread to thread every 0.1 ms here
+# rather than every 5 ms, so a first fit lands inside a copy more often.
+sys.setswitchinterval(0.0001)
+newest = [LabelEncoder(columns=["s"])]
+done = threading.Event()
+copies = [0]
+wrong = set()
+
+
+def copier():
+    ways = (copy.copy, copy.deepcopy, lambda encoder: pickle.loads(pickle.dumps(encoder)))
+    while not done.is_set():
+        try:
+            answer = ways[copies[0] % 3](newest[0]).transform_dict({"s": "b"})
+        except Exception as error:
+            answer = f"{type(error).__name__}: {error}"
+        # A copy taken before the fit published its result is unfitted, and
+        # one taken after it answers as the fit does.
+        if answer not in ({"s": 2}, "RuntimeError: LabelEncoder is not fitted"):
+            wrong.add(str(answer))
+        copies[0] += 1
+
+
+thread = threading.Thread(target=copier)
+thread.start()
+fits = 0
+deadline = time.perf_counter() + 0.3
+while time.perf_counter() < deadline:
+    encoder = LabelEncoder(columns=["s"])
+    newest[0] = encoder
+    encoder.fit([source], threads=1)
+    fits += 1
+done.set()
+thread.join()
+print(sorted(wrong), fits > 0 and copies[0] > 0)
+"""
+
+
+def test_a_transformer_copies_and_pickles_while_another_thread_fits_it_for_the_first_time(tmp_path: Path) -> None:
+    command: list[str] = [sys.executable, "-c", FIRST_FIT_COPY_CHILD, str(tmp_path / "first.parquet")]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=20, check=False)  # nosec B603
+    assert (child.returncode, child.stdout) == (0, "[] True\n"), child.stderr
+
+
 # Each case converts a record with a value that leaves the record while the
 # record path reads it, and prints the result and what the values recorded.
 # Reading a freed value crashes or hangs the process, so the cases run in a

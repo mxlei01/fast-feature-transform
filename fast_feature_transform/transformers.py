@@ -597,8 +597,16 @@ class Transformer:
             this transformer owns its handle.
 
         """
-        transient: tuple[str, ...] = ("_binding", "_state_cache")
-        state: dict[str, Any] = {key: value for key, value in self.__dict__.items() if key not in transient}
+        # REGRESSION: the state is built from a copy of the instance dict,
+        # which dict.copy takes while no other thread can change the dict. A
+        # first fit adds the binding and the state cache to that dict, and
+        # the state used to be built by a loop over the dict itself: a first
+        # fit on another thread meanwhile raised RuntimeError ("dictionary
+        # changed size during iteration") or, on the free-threaded build,
+        # crashed the process.
+        state: dict[str, Any] = self.__dict__.copy()
+        state.pop("_binding", None)
+        state.pop("_state_cache", None)
         binding: _Binding | None = self._binding
         if binding is not None and binding[2]:
             state["_manifest"] = _cached_manifest(binding[0])
