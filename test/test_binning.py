@@ -3,6 +3,8 @@
 import json
 import math
 import pickle
+import sys
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +404,57 @@ def test_kmeans_stops_at_the_first_pass_whose_centers_barely_move(tmp_path: Path
         [source]
     )
     assert binner.bin_edges_ == {"price": [0.0, 5868953.75, 15616841.25, 26730899.0]}
+
+
+def test_kmeans_stops_after_its_first_pass_when_its_squares_sum_past_f64(tmp_path: Path) -> None:
+    """A kmeans fit whose squares sum past the largest f64 stops after its first pass, as scikit-learn 1.9.0 does.
+
+    The column holds m + 16 values at -a, 1024 at -a / 1024, 33792 at
+    a / 1024 and m - 16 at a, with m = 8454530 and a = 0x1.fep499 just under
+    2**500, so nothing is scaled. Its mean is exactly 0 and every sum of its
+    values is exact. Each square is below 2**1000, so only more than 2**24
+    squares can sum past f64's range, and m is the smallest count whose
+    squares do: in sorted order they stay within range until the last one.
+    The refused sum then reads negative infinity, not NaN, so a fit that
+    turned only a NaN tolerance into infinity would run on here.
+    scikit-learn's variance overflows to infinity, and so does its
+    tolerance, so its run stops after the first pass, and these are that
+    pass's edges, to the bit. On the second pass the values at -a / 1024
+    join the upper cluster, and the labels repeat on the third.
+
+    REGRESSION: the fit used to ignore that the sum of the squares was
+    refused and to read a tolerance of negative infinity from it here, which
+    no shift is at or below, so the run went on until the labels repeated
+    and ended on a middle edge of -0x1.0b7a14f2f3680p+491.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    a: float = float.fromhex("0x1.fep499")
+    m: int = 8454530
+    # In sorted order the squares stay within f64's range until the last one,
+    # which takes their sum past it.
+    square: Fraction = Fraction(a) ** 2
+    before_last: Fraction = (2 * m - 1 + Fraction(1024 + 33792, 2**20)) * square
+    assert before_last <= sys.float_info.max
+    assert before_last + square >= 2**1024
+    column: pa.ChunkedArray = pa.chunked_array(
+        [pa.repeat(-a, m + 16), pa.repeat(-a / 1024, 1024), pa.repeat(a / 1024, 33792), pa.repeat(a, m - 16)]
+    )
+    source: str = write_parquet(tmp_path / "far.parquet", pa.table({"price": column}))
+    binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=2, encode="ordinal", strategy="kmeans").fit(
+        [source]
+    )
+    # The first pass starts from -a / 2 and a / 2 and splits the values at
+    # 0. The lower cluster sums to -(m + 17) * a and the upper one to the same
+    # with the other sign, and each mean is its sum times the inverse of its
+    # count, as scikit-learn computes it.
+    lower: float = -(m + 17) * a * (1.0 / (m + 16 + 1024))
+    upper: float = (m + 17) * a * (1.0 / (m - 16 + 33792))
+    middle: float = float.fromhex("-0x1.f774ee758c600p+490")
+    assert (lower + upper) * 0.5 == middle
+    assert binner.bin_edges_ == {"price": [-a, middle, a]}
 
 
 def test_every_fitted_bin_table_loads_back(tmp_path: Path) -> None:
