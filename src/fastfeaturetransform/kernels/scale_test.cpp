@@ -380,6 +380,90 @@ TEST_CASE("standard_scale fits values near 1e-155 alike however the workers spli
   }
 }
 
+TEST_CASE("standard_scale fits a column whose squares sum just under the largest double, and refuses one just over") {
+  // REGRESSION: once a column's squares are summed, its variance is formed.
+  // These three used to fail with "the variance leaves the range of f64".
+  // In the first pair, whose squares sum to 0.38 of a step under the
+  // largest double, 2*mean*Sum x is 1.98 times the largest double, and in
+  // the second 1.61 times it; in the triple, whose sum is exactly 0, the
+  // quotient of the division times 3 rounds past it. Each mean and variance
+  // is the exact one, rounded once, and scikit-learn's to the bit.
+  const fft::Schema schema{{{"a", "f64"}}};
+  const nlohmann::json params{{"columns", {"a"}}};
+  struct Fit {
+    std::string label;
+    Doubles values;
+    double mean;
+    double variance;
+  };
+  const Fit fits[] = {
+      {"just under", {0x1.8fae0c15ad389p+511, 0x1.4p511}, 0x1.67d7060ad69c4p+511, 0x1.8cce1c9cef26cp+1016},
+      {"9e153 and 8e153", {9e153, 8e153}, 0x1.449644e2e5e5ap+511, 2.500000000000001e+305},
+      {"centered",
+       {0x1.6cb8ed7755b00p+508, 0x1.51158df95e0f1p+511, -0x1.7eacaba848c51p+511},
+       0.0,
+       0x1.5555555555554p+1022},
+  };
+  for (const Fit& entry : fits) {
+    CAPTURE(entry.label);
+    Doubles with_null = entry.values;
+    with_null.push_back(std::nullopt);
+    const auto whole = fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(entry.values)})});
+    REQUIRE(whole->state().at("means").at("a").get<double>() == entry.mean);
+    REQUIRE(whole->state().at("variances").at("a").get<double>() == entry.variance);
+    REQUIRE(whole->state().at("scales").at("a").get<double>() == std::sqrt(entry.variance));
+    // The general path, which a null takes, and every split across two
+    // workers fit the same table.
+    REQUIRE(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(with_null)})})->state().dump() ==
+            whole->state().dump());
+    for (std::size_t cut = 1; cut < entry.values.size(); ++cut) {
+      CAPTURE(cut);
+      const auto at = entry.values.begin() + static_cast<std::ptrdiff_t>(cut);
+      const fft::Batch head = make_batch({"a"}, {doubles(Doubles(entry.values.begin(), at))});
+      const fft::Batch tail = make_batch({"a"}, {doubles(Doubles(at, entry.values.end()))});
+      REQUIRE(fit_scaler("standard_scale", params, schema, {head, tail})->state().dump() == whole->state().dump());
+      REQUIRE(fit_scaler("standard_scale", params, schema, {tail, head})->state().dump() == whole->state().dump());
+    }
+  }
+
+  // One step up from the first pair's larger value, the squares sum 1.18
+  // steps past the largest double, more than the half step that rounds to
+  // infinity: refused in either order, on both paths, and where two workers
+  // each hold one value and only their merge passes.
+  const std::string refused =
+      "scale: column 'a': its squares sum to the largest f64 or more (scale the column down first)";
+  const Doubles over{0x1.8fae0c15ad38ap+511, 0x1.4p511};
+  for (const Doubles& order : {over, Doubles(over.rbegin(), over.rend())}) {
+    Doubles with_null = order;
+    with_null.push_back(std::nullopt);
+    for (const auto& input : {doubles(order), doubles(with_null)}) {
+      REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {input})}), Equals(refused));
+    }
+    const fft::Batch first = make_batch({"a"}, {doubles({order[0]})});
+    const fft::Batch second = make_batch({"a"}, {doubles({order[1]})});
+    REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {first, second}), Equals(refused));
+  }
+
+  // Within half a step of the largest double, on either side, the squares
+  // sum to it, and the order of the rows decides. These squares sum to 0.08
+  // of a step under it. With the smaller value first, the running sum stands
+  // 0.38 of a step past it once the larger square, rounded up, is added and
+  // before its rounding error is, and a step of the walk over the partials
+  // overflows there, as ExactSum describes. In the other order, or with one
+  // value for each of two workers, the column fits the exact statistics,
+  // which are scikit-learn's.
+  const Doubles near{0x1.6a01f4e4a04bbp+511, 0x1.6a11d7beaa3e1p+511};
+  REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(near)})}),
+                      Equals(refused));
+  const auto reversed =
+      fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles({near[1], near[0]})})});
+  REQUIRE(reversed->state().at("means").at("a").get<double>() == 0x1.6a09e651a544ep+511);
+  REQUIRE(reversed->state().at("variances").at("a").get<double>() == 0x1.f8bd25bb58456p+995);
+  const fft::Batch smaller = make_batch({"a"}, {doubles({near[0]})});
+  const fft::Batch larger = make_batch({"a"}, {doubles({near[1]})});
+  REQUIRE(fit_scaler("standard_scale", params, schema, {smaller, larger})->state().dump() == reversed->state().dump());
+}
+
 TEST_CASE("standard_scale leaves out the centring or the division on request") {
   const fft::Schema schema{{{"a", "f64"}}};
   const fft::Batch batch = make_batch({"a"}, {doubles({1.0, 2.0, 3.0, 4.0, 5.0})});
@@ -410,7 +494,7 @@ TEST_CASE("standard_scale block precomputation preserves first invalid and overf
       values[static_cast<std::size_t>(first_bad)] = overflow_first ? 1e200 : std::numeric_limits<double>::infinity();
       values[static_cast<std::size_t>(first_bad + 1)] =
           overflow_first ? std::numeric_limits<double>::quiet_NaN() : 1e200;
-      const std::string error = overflow_first ? "sums past the range of f64" : "is not finite";
+      const std::string error = overflow_first ? "its squares sum to the largest f64 or more" : "is not finite";
       const auto dense = doubles(values);
       values.push_back(std::nullopt);
       const auto scalar = doubles(values);
@@ -434,7 +518,7 @@ TEST_CASE("standard_scale block precomputation preserves first invalid and overf
   values.push_back(std::nullopt);
   for (const auto& input : {dense, doubles(values)}) {
     REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {input})}),
-                        ContainsSubstring("scale: column 'a' sums past the range of f64"));
+                        ContainsSubstring("scale: column 'a': its squares sum to the largest f64 or more"));
   }
 }
 

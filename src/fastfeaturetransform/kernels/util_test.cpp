@@ -357,7 +357,7 @@ TEST_CASE("ExactSum agrees with plain partials on adversarial values, in any ord
   }
 }
 
-TEST_CASE("ExactSum refuses a sum past f64's range and a value that is not finite, and nothing less") {
+TEST_CASE("ExactSum refuses a sum past f64's range, a value that is not finite, and the steps math.fsum overflows") {
   struct Case {
     std::string label;
     std::vector<double> values;
@@ -393,6 +393,27 @@ TEST_CASE("ExactSum refuses a sum past f64's range and a value that is not finit
        std::nullopt,
        0x1.ep1023},
       {"out of range with three terms", {0x1.cp1022, 0x1p960, 0x1p900, 0x1p840, 0x1.cp1022, 0x1p1021}, 5, 0.0},
+      // A step of the walk over the partials can overflow while the exact sum
+      // rounds to a finite double, as in math.fsum, which refuses these too.
+      // Here every running sum is within the largest double, the last one
+      // 0x1.8p1023 - 2^970. The partials before the last value are 2^970 and
+      // -2^1022, and the largest double meets 2^970 first: their sum, half a
+      // step past the largest double, rounds to infinity.
+      {"the largest double over partials of both signs", {0x1p971, 0x1.fffffffffffffp1022, -0x1.8p1023, kMax}, 3, 0.0},
+      // The sum is 2^1024 - 2^970 - 2^968, under half a step past the largest
+      // double, and rounds to it. In this order the partials before the last
+      // value are -2^968 and 2^1023: 0x1.fffffffffffffp1022 absorbs the first
+      // as a rounding error and meets the second, and that sum, half a step
+      // past, rounds to infinity. Last, the small value finds the sum at the
+      // largest double and rounds into it.
+      {"under half a step past, small value first",
+       {0x1.8p969, 0x1.fffffffffffffp1022, 0x1.fffffffffffffp1022},
+       2,
+       0.0},
+      {"under half a step past, small value last",
+       {0x1.fffffffffffffp1022, 0x1.fffffffffffffp1022, 0x1.8p969},
+       std::nullopt,
+       kMax},
   };
   for (const Case& entry : cases) {
     CAPTURE(entry.label);

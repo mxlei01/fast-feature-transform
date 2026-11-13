@@ -3,6 +3,8 @@
 import json
 import math
 import pickle
+import sys
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -519,6 +521,61 @@ def test_standard_scaler_fits_values_near_1e_155_alike_for_every_split_and_threa
 
 
 @pytest.mark.parametrize(
+    "column",
+    [
+        ["0x1.8fae0c15ad389p+511", "0x1.4p511"],
+        [(9e153).hex(), (8e153).hex()],
+        ["0x1.6cb8ed7755b00p+508", "0x1.51158df95e0f1p+511", "-0x1.7eacaba848c51p+511"],
+    ],
+    ids=["just-under", "9e153-8e153", "centered"],
+)
+def test_standard_scaler_fits_a_column_whose_squares_sum_under_the_largest_f64(
+    tmp_path: Path, column: list[str]
+) -> None:
+    """Columns whose squares sum under the largest f64 fit the exact mean and variance, rounded once.
+
+    REGRESSION: these columns used to fail with "the variance leaves the range
+    of f64", because a step on the way to the variance passed the largest
+    f64: 2 * mean * sum(x) on the two pairs, and on the centered triple the
+    quotient of the division times 3. scikit-learn 1.9.0 fits each of them to
+    these same bits.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        column: The column's values, as hex.
+
+    """
+    values: list[float] = [float.fromhex(text) for text in column]
+    exact: list[Fraction] = [Fraction(value) for value in values]
+    assert sum(value**2 for value in exact) <= Fraction(sys.float_info.max)
+    mean: float = float(sum(exact) / len(exact))
+    variance: float = float(sum((value - Fraction(mean)) ** 2 for value in exact) / len(exact))
+    table: pa.Table = pa.table({"x": values})
+    for rows_per_group, threads in ((len(values), 1), (1, 2)):
+        path: str = write_parquet(tmp_path / f"top{rows_per_group}.parquet", table, row_group_size=rows_per_group)
+        scaler: StandardScaler = StandardScaler(columns=["x"]).fit([path], threads=threads)
+        assert scaler.mean_ == {"x": mean}
+        assert scaler.var_ == {"x": variance}
+        assert scaler.scale_ == {"x": math.sqrt(variance)}
+        rows: list[dict[str, Any]] = read_rows(scaler.transform_parquet([path], output_dir=tmp_path / f"out{threads}"))
+        assert [scaler.transform_dict({"x": value}) for value in values] == rows
+
+
+def test_standard_scaler_refuses_a_column_whose_squares_sum_past_the_largest_f64(tmp_path: Path) -> None:
+    """Half a step or more past the largest f64, a column's squares are an error that says so, in any row order."""
+    values: list[float] = [float.fromhex("0x1.8fae0c15ad38ap+511"), float.fromhex("0x1.4p511")]
+    assert sum(Fraction(value) ** 2 for value in values) >= Fraction(sys.float_info.max) + Fraction(2) ** 970
+    message: str = (
+        r"^standardscaler: column 'x': its squares sum to the largest f64 or more \(scale the column down first\)$"
+    )
+    for order in (values, values[::-1]):
+        for rows_per_group, threads in ((2, 1), (1, 2)):
+            path: str = write_parquet(tmp_path / "over.parquet", pa.table({"x": order}), row_group_size=rows_per_group)
+            with pytest.raises(EngineError, match=message):
+                StandardScaler(columns=["x"]).fit([path], threads=threads)
+
+
+@pytest.mark.parametrize(
     ("norm", "row"),
     [
         # The largest f64 and three values of half its last step: the sum is
@@ -548,6 +605,53 @@ def test_normalizer_refuses_a_row_whose_norm_leaves_the_range_through_both_paths
         normalizer.transform_dict(dict(zip(names, row, strict=True)))
     with pytest.raises(EngineError, match=message):
         normalizer.transform_parquet([path], output_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    ("norm", "small", "large"),
+    [
+        ("l1", "0x1.8p969", "0x1.fffffffffffffp1022"),
+        ("l2", "0x1.d02cd09e36569p+487", "0x1.6a09e667f3bc3p+511"),
+    ],
+    ids=["l1", "l2"],
+)
+def test_normalizer_answers_a_row_just_past_the_largest_f64_in_one_column_order_only(
+    tmp_path: Path, norm: str, small: str, large: str
+) -> None:
+    """A row whose sum is under half a step past the largest f64 can be refused in one column order only.
+
+    The sum, of the values for l1 and of their squares for l2, rounds to the
+    largest f64. With the small value first, a step of the exact sum's walk
+    overflows, as in ``math.fsum``; with it last, the row is divided by the
+    norm of a sum at the largest f64.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        norm: The norm to divide by.
+        small: The small value, as hex.
+        large: The value listed twice, as hex.
+
+    """
+    largest: float = sys.float_info.max
+    values: list[float] = [float.fromhex(small), float.fromhex(large), float.fromhex(large)]
+    terms: list[Fraction] = [Fraction(value if norm == "l1" else value * value) for value in values]
+    assert Fraction(largest) < sum(terms) < Fraction(largest) + Fraction(2) ** 970
+    names: list[str] = ["a", "b", "c"]
+    divisor: float = largest if norm == "l1" else math.sqrt(largest)
+    for order, refused in ((values, True), (values[1:] + values[:1], False)):
+        row: dict[str, float] = dict(zip(names, order, strict=True))
+        path: str = write_parquet(tmp_path / "top.parquet", pa.table({name: [value] for name, value in row.items()}))
+        normalizer: Normalizer = Normalizer(columns=names, norm=norm).fit([path])
+        if refused:
+            message: str = rf"a row's {norm} norm leaves the range of f64$"
+            with pytest.raises(EngineError, match=message):
+                normalizer.transform_dict(row)
+            with pytest.raises(EngineError, match=message):
+                normalizer.transform_parquet([path], output_dir=tmp_path / "refused")
+        else:
+            expected: dict[str, float] = {name: value / divisor for name, value in row.items()}
+            assert normalizer.transform_dict(row) == expected
+            assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == [expected]
 
 
 def test_normalizer_divides_a_row_whose_norm_is_the_largest_f64(tmp_path: Path) -> None:
