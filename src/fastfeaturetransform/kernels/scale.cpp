@@ -49,11 +49,12 @@ double handle_zeros(double divisor) { return divisor < kNearConstant ? 1.0 : div
 // doubles, where it can be one ulp off. Rounding the sum first and dividing
 // that would round twice, which costs the last bit of a mean or a variance
 // often enough to show up against numpy; one step of refinement over the
-// exact remainder puts it back.
-double divided(const ExactSum& sum, double count, const std::string& what) {
+// exact remainder puts it back. nullopt when quotient * count, which comes
+// within an ulp of the sum, rounds past the largest double.
+std::optional<double> divided(const ExactSum& sum, double count) {
   const double quotient = sum.value() / count;
   ExactSum remainder = sum;
-  if (!add_product(remainder, -quotient, count)) throw Error(what + " leaves the range of f64");
+  if (!add_product(remainder, -quotient, count)) return std::nullopt;
   return quotient + remainder.value() / count;
 }
 
@@ -258,6 +259,14 @@ std::unordered_map<std::string, Extrema> merge_extrema(const std::vector<std::st
 //     variance incrementally instead, so the two are the same number to
 //     within a rounding rather than by construction: every parity case lands
 //     on the same bits, but a pathological column need not
+//   * a column whose squares sum half a step or more past the largest
+//     double is a fit-time error: n values with a root mean square above
+//     about 1.34e154 / sqrt(n). Within half a step of it, on either side,
+//     where the sum rounds to the largest double, the column can be an error
+//     in one order or split of the rows and fit in another, and with several
+//     threads the split can change from one fit to the next. sklearn fits
+//     these columns when their squared deviations from the mean sum within
+//     f64's range. No other column is refused for its magnitude
 //   * columns=null scales every integer or float column that reaches the
 //     step, and the output is f64 whatever the input width
 // ---------------------------------------------------------------------------
@@ -324,7 +333,6 @@ class StandardScale final : public Kernel {
         std::array<double, width> residuals;
         ExactSum::Adder sum(accumulator.sum);
         ExactSum::Adder squares(accumulator.squares);
-        const auto refuse = [&] { throw Error(stage + ": column '" + name + "' sums past the range of f64"); };
         for (int64_t first = 0; first < array.length(); first += width) {
           const int64_t count = std::min(width, array.length() - first);
           bool inexact = false;
@@ -348,7 +356,8 @@ class StandardScale final : public Kernel {
             for (int64_t i = 0; i < count; ++i) {
               const auto slot = static_cast<std::size_t>(i);
               const double number = finite_number(numbers[slot], stage, name);
-              if (!sum.add(number) || !squares.add(products[slot]) || !squares.add(residuals[slot])) refuse();
+              if (!sum.add(number) || !squares.add(products[slot]) || !squares.add(residuals[slot]))
+                refuse_squares(name);
               ++accumulator.count;
               accumulator.low = std::min(accumulator.low, number);
               accumulator.high = std::max(accumulator.high, number);
@@ -357,7 +366,7 @@ class StandardScale final : public Kernel {
             for (int64_t i = 0; i < count; ++i) {
               const auto slot = static_cast<std::size_t>(i);
               const double number = finite_number(numbers[slot], stage, name);
-              if (!sum.add_short(number) || !squares.add_short(products[slot])) refuse();
+              if (!sum.add_short(number) || !squares.add_short(products[slot])) refuse_squares(name);
               ++accumulator.count;
               accumulator.low = std::min(accumulator.low, number);
               accumulator.high = std::max(accumulator.high, number);
@@ -376,9 +385,7 @@ class StandardScale final : public Kernel {
       for_each_numeric(array, stage, name, [&](int64_t, bool is_null, double value) {
         if (is_null) return;
         const double number = finite_number(value, stage, name);
-        if (!accumulator.sum.add(number) || !add_product(accumulator.squares, number, number)) {
-          throw Error(stage + ": column '" + name + "' sums past the range of f64");
-        }
+        if (!accumulator.sum.add(number) || !add_product(accumulator.squares, number, number)) refuse_squares(name);
         ++accumulator.count;
         accumulator.low = std::min(accumulator.low, number);
         accumulator.high = std::max(accumulator.high, number);
@@ -392,9 +399,7 @@ class StandardScale final : public Kernel {
       auto& state = static_cast<State&>(*raw);
       for (const auto& [name, accumulator] : state.columns) {
         Accumulator& into = merged[name];
-        if (!into.sum.merge(accumulator.sum) || !into.squares.merge(accumulator.squares)) {
-          throw Error(stage + ": column '" + name + "' sums past the range of f64");
-        }
+        if (!into.sum.merge(accumulator.sum) || !into.squares.merge(accumulator.squares)) refuse_squares(name);
         into.count += accumulator.count;
         into.low = std::min(into.low, accumulator.low);
         into.high = std::max(into.high, accumulator.high);
@@ -412,7 +417,9 @@ class StandardScale final : public Kernel {
       Statistics statistics;
       statistics.count = accumulator.count;
       const std::string where = stage + ": column '" + name + "'";
-      statistics.mean = finite_encoding(divided(accumulator.sum, rows, where + ": the mean"), stage, name, "columns");
+      const std::optional<double> mean = divided(accumulator.sum, rows);
+      if (!mean.has_value()) throw Error(where + ": the mean leaves the range of f64");
+      statistics.mean = finite_encoding(*mean, stage, name, "columns");
       // A constant column's variance is 0, as sklearn's is. Below about
       // 1e-146 add_product's residuals fall under the smallest subnormal and
       // round, so the exact sums can miss that by a subnormal step either way:
@@ -517,6 +524,20 @@ class StandardScale final : public Kernel {
     int64_t count = 0;
   };
 
+  // The one limit on a column's magnitude: the exact sum of its squares
+  // rounds to the largest double or past it, which a column of n values
+  // does when their root mean square passes about 1.34e154 / sqrt(n). Past
+  // it by half a step or more the sum is refused in every order; within half
+  // a step of it, on either side, in some orders and splits, as ExactSum
+  // describes for a running sum, which here stands above the column's total
+  // while a square that rounded up waits for its rounding error. The sum of
+  // the values never fails first: it is at most sqrt(n) times the square
+  // root of the sum of the squares.
+  [[noreturn]] void refuse_squares(const std::string& name) const {
+    throw Error(stage + ": column '" + name +
+                "': its squares sum to the largest f64 or more (scale the column down first)");
+  }
+
   // The population variance around a mean the caller has already rounded:
   // Sum x^2 - 2*mean*Sum x + n*mean^2, every term expanded so no bit is lost
   // until the division. It is the exact Sum (x - mean)^2, which is
@@ -528,16 +549,45 @@ class StandardScale final : public Kernel {
   // workers can leave split differently than one. Near 1e-155 the products
   // underflow and round, so the fitted variance depended on the thread
   // count by a subnormal step.
+  //
+  // REGRESSION: once a column's squares are summed, its variance is formed,
+  // however close that sum is to the largest double. At full size a step
+  // can pass it: 2*mean*Sum x is up to about twice Sum x^2, and the
+  // division's quotient * n, within an ulp of the residual, rounds past the
+  // largest double when the residual is that close to it. On
+  // [9e153, 8e153], whose variance is 2.5e305, 2*mean*Sum x is 2.9e308, and
+  // the fit used to fail with "the variance leaves the range of f64". Where
+  // a step fails, the same sum is formed a quarter the size, every term of
+  // Sum x^2 and of Sum x and the count divided by 4, and the quotient
+  // multiplied back by 4: no step there passes about half the largest
+  // double. Dividing by 4 drops the bits of a term below 2^-1072, so the
+  // full size goes first, and the quarter size changes no variance that the
+  // full size forms.
   static double population_variance(const Accumulator& accumulator, double mean, double rows,
                                     const std::string& where) {
-    ExactSum residual = accumulator.squares;
     const std::vector<double> terms = accumulator.sum.terms();
+    ExactSum residual = accumulator.squares;
+    if (add_deviations(residual, terms, mean, rows)) {
+      if (const std::optional<double> variance = divided(residual, rows)) return *variance;
+    }
+    ExactSum quarter;
+    bool held = true;
+    for (double term : accumulator.squares.terms()) held = held && quarter.add(term * 0.25);
+    std::vector<double> quarters = terms;
+    for (double& term : quarters) term *= 0.25;
+    held = held && add_deviations(quarter, quarters, mean, rows * 0.25);
+    const std::optional<double> variance = held ? divided(quarter, rows) : std::nullopt;
+    if (!variance.has_value()) throw Error(where + ": the variance leaves the range of f64");
+    return *variance * 4.0;
+  }
+
+  // Adds -2*mean*Sum x + count*mean^2 to `residual`, Sum x given by its
+  // terms; false when a step of the sum passes the largest double.
+  static bool add_deviations(ExactSum& residual, const std::vector<double>& terms, double mean, double count) {
     bool held = true;
     for (double term : terms) held = held && add_product(residual, -2.0 * mean, term);
     const double square = mean * mean;
-    held = held && add_product(residual, rows, square) && add_product(residual, rows, std::fma(mean, mean, -square));
-    if (!held) throw Error(where + ": the variance leaves the range of f64");
-    return divided(residual, rows, where + ": the variance");
+    return held && add_product(residual, count, square) && add_product(residual, count, std::fma(mean, mean, -square));
   }
 
   // sklearn subtracts and then divides, so the two roundings happen in that
@@ -1031,7 +1081,11 @@ class Binarize final : public Kernel {
 //   * a null is an error, as sklearn's NaN is: a norm over a missing number
 //     has no value
 //   * the l1 and l2 sums are exact partials, so the norm does not depend on
-//     the order the columns were listed in
+//     the order the columns were listed in, except at the top of the range:
+//     a row whose sum is half a step or more past the largest double is an
+//     error, and a row of three or more columns whose sum is less than half
+//     a step past it, which rounds to the largest double, can be an error in
+//     one column order, as ExactSum describes, and normalized in another
 //   * every listed column becomes f64 whatever the input width
 // ---------------------------------------------------------------------------
 class Normalize final : public Kernel {

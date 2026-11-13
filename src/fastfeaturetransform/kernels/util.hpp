@@ -316,11 +316,20 @@ inline const arrow::Array& column_array(const Batch& batch, const std::string& s
   return *batch.cols[static_cast<std::size_t>(idx)];
 }
 
-// An exact sum of doubles. add() and merge() lose no bit, so the same values
-// give the same sum in any order and however they are split across sums that
-// are merged later, and value() rounds that sum once, correctly. add() and
-// merge() answer false when a value is not finite or the sum leaves f64's
-// range; the sum then holds nothing a caller can use until clear().
+// An exact sum of doubles. add() and merge() lose no bit, so every order of
+// the same values, and every split of them across sums that are merged
+// later, gives the same sum when it takes them all, and value() rounds that
+// sum once, correctly. add() and merge() answer false when a value is not
+// finite or the exact sum reaches half a step past the largest double,
+// 2^1024 - 2^970, in magnitude, where it rounds to infinity. As in
+// math.fsum, whose partials these are, a step of the walk over the partials
+// can overflow while the exact sum is still in range, so they can also
+// answer false, in one order or split and not in another, for a sum that
+// rounds to a finite double: one that lies within half a step above the
+// largest double, or one reached by adding plus or minus the largest double
+// while the partials below the largest partial hold half a step or more of
+// that value's sign and the largest partial has the other sign. After a
+// false the sum holds nothing a caller can use until clear().
 //
 // The sum is the exact total of two parts.
 //
@@ -560,10 +569,11 @@ class ExactSum {
   }
 
   // The same step on the partials themselves. False when the largest partial
-  // is not finite: the sum left f64's range, or x was a NaN or an infinity.
-  // That partial is then dropped: a caller that goes on adding to a refused
-  // sum, as k-means does, would leave one more with every value, for each
-  // later value to walk.
+  // is not finite: x was a NaN or an infinity, the sum left f64's range, or
+  // a step of the walk overflowed in one of the two ways the class comment
+  // names. That partial is then dropped: a caller that goes on adding to a
+  // refused sum, as k-means does, would leave one more with every value, for
+  // each later value to walk.
   bool join(double x) {
     if (!partials_) partials_ = std::make_unique<std::vector<double>>();
     std::vector<double>& parts = *partials_;
