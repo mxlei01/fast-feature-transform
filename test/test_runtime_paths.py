@@ -628,21 +628,46 @@ def _longest_pause_during(call: Callable[[], object]) -> tuple[float, float]:
     return max(later - earlier for earlier, later in itertools.pairwise(inside)) * 1e3, (end - start) * 1e3
 
 
+def _first_that_lets_threads_run(measure: Callable[[], tuple[float, float]]) -> tuple[float, float]:
+    """Measure up to three times, and stop at the first call whose longest pause is under half of it.
+
+    One late wakeup on a loaded machine can take half of a call that lasts
+    tens of milliseconds. A call that holds the GIL fails every try, because
+    the other thread sleeps through each whole call.
+
+    Args:
+        measure: Makes the call afresh and measures it with _longest_pause_during.
+
+    Returns:
+        The first measurement under the bound, or the third.
+
+    """
+    longest, duration = measure()
+    for _ in range(2):
+        if longest < duration / 2:
+            break
+        longest, duration = measure()
+    return longest, duration
+
+
 @pytest.mark.parametrize("operation", ["save", "load", "pickle.dumps", "pickle.loads", "stages_state"])
 def test_artifact_calls_let_other_threads_run(large_artifact: Path, tmp_path: Path, operation: str) -> None:
     # On the standard build these calls stopped every other thread for their
     # whole duration: 1.2 s for a 2,000,000-category save. A free-threaded
     # build passes trivially; the Standard-CPython CI job is where it can fail.
-    pipeline = Pipeline.load(large_artifact)  # fresh: no manifest cached on its handle yet
-    payload = pickle.dumps(Pipeline.load(large_artifact))
-    calls: dict[str, Callable[[], object]] = {
-        "save": lambda: pipeline.save(tmp_path / "copy"),
-        "load": lambda: Pipeline.load(large_artifact),
-        "pickle.dumps": lambda: pickle.dumps(pipeline),
-        "pickle.loads": lambda: pickle.loads(payload).transform_dict({"key": "key-0000001"}),
-        "stages_state": pipeline.stages_state,
-    }
-    longest, duration = _longest_pause_during(calls[operation])
+    def measure() -> tuple[float, float]:
+        pipeline = Pipeline.load(large_artifact)  # fresh: no manifest cached on its handle yet
+        payload = pickle.dumps(Pipeline.load(large_artifact))
+        calls: dict[str, Callable[[], object]] = {
+            "save": lambda: pipeline.save(tmp_path / "copy"),
+            "load": lambda: Pipeline.load(large_artifact),
+            "pickle.dumps": lambda: pickle.dumps(pipeline),
+            "pickle.loads": lambda: pickle.loads(payload).transform_dict({"key": "key-0000001"}),
+            "stages_state": pipeline.stages_state,
+        }
+        return _longest_pause_during(calls[operation])
+
+    longest, duration = _first_that_lets_threads_run(measure)
     # Holding the GIL keeps the other thread asleep for the whole call.
     # Releasing it lets that thread wake every 1.3 ms at most on an idle
     # machine (measured on an Apple M4). A loaded machine stretches the
@@ -680,7 +705,7 @@ def test_batch_calls_let_other_threads_run(
         "parquet_to_memmap": lambda: parquet_to_memmap(numbers, output_dir=tmp_path / "memmap", threads=1),
         "stage_state": lambda: handle.stage_state("encode"),
     }
-    longest, duration = _longest_pause_during(calls[operation])
+    longest, duration = _first_that_lets_threads_run(lambda: _longest_pause_during(calls[operation]))
     assert longest < duration / 2, f"{operation}: another thread slept {longest:.0f} ms of a {duration:.0f} ms call"
 
 
