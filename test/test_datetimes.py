@@ -4,6 +4,8 @@
 # ruff: noqa: DTZ001
 
 import json
+import subprocess  # nosec B404
+import sys
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
@@ -187,6 +189,92 @@ def test_datetimes_outside_int64_microseconds_dates_and_other_time_types_are_ref
     ):
         with pytest.raises(EngineError, match=rf"must be str, int, float, bool, datetime, or None \(got {name}\)"):
             _through(pipeline, value)
+
+
+# Each case sends a value that the record path reads through attributes it
+# looks up: a value of a type named datetime64, as numpy's is, or a
+# datetime's asm8, as a pandas Timestamp has one. A lookup that failed used
+# to end the process, so the cases run in a child process, which prints what
+# came back under the value's key.
+ATTRIBUTE_LOOKUP_CHILD: str = """
+import datetime
+import sys
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from fast_feature_transform import Pipeline, StandardScaler
+
+
+class Count:
+    def item(self):
+        return 5
+
+
+def astype(self, kind):
+    return Count()
+
+
+def named(**members):
+    return type("datetime64", (), members)()
+
+
+def raising(error):
+    def get(self):
+        raise error
+
+    return property(get)
+
+
+def stamp(asm8):
+    return type("Stamp", (datetime.datetime,), {"asm8": asm8})(2024, 1, 5, 8, 30)
+
+
+cases = [
+    ("no dtype", named(astype=astype)),
+    ("no astype", named(dtype=np.dtype("M8[s]"))),
+    ("dtype raises", named(astype=astype, dtype=raising(ValueError("no dtype")))),
+    ("astype raises", named(astype=raising(ValueError("no astype")), dtype=np.dtype("M8[s]"))),
+    ("both", named(astype=astype, dtype=np.dtype("M8[s]"))),
+    ("asm8 without dtype", stamp(property(lambda self: named(astype=astype)))),
+    ("asm8 raises", stamp(raising(ValueError("no asm8")))),
+    ("asm8 absent", stamp(raising(AttributeError("asm8")))),
+]
+pq.write_table(pa.table({"x": [1.0, 3.0]}), sys.argv[1])
+pipeline = Pipeline([("scale", StandardScaler(columns=["x"]))]).fit([sys.argv[1]], threads=1)
+for label, value in cases:
+    try:
+        answer = pipeline.transform_dict({"x": 1.0, "when": value})["when"]
+    except Exception as error:
+        answer = f"{type(error).__name__}: {error}"
+    print(f"{label}: {answer}")
+"""
+
+
+def test_a_failed_attribute_lookup_raises_the_values_own_error(tmp_path: Path) -> None:
+    # REGRESSION: the record path fetches each attribute it calls with before
+    # the call. A value of a type named datetime64 that lacks astype or dtype
+    # is not numpy's, and gets the EngineError of a type that is not
+    # supported; any other failed lookup raises the value's own error, and an
+    # asm8 that raises AttributeError is taken as absent. nanobind used to
+    # convert value.attr("dtype") as a call's argument, where its failure
+    # ended the process, and an asm8 that raised anything else was read as
+    # absent.
+    unsupported: str = "EngineError: record value for 'when' must be str, int, float, bool, datetime, or None"
+    expected: list[str] = [
+        f"no dtype: {unsupported} (got datetime64)",
+        f"no astype: {unsupported} (got datetime64)",
+        "dtype raises: ValueError: no dtype",
+        "astype raises: ValueError: no astype",
+        "both: 5000000",  # 5 seconds
+        "asm8 without dtype: AttributeError: 'datetime64' object has no attribute 'dtype'",
+        "asm8 raises: ValueError: no asm8",
+        f"asm8 absent: {(datetime(2024, 1, 5, 8, 30) - EPOCH) // ONE_US}",  # read from its fields
+    ]
+    command: list[str] = [sys.executable, "-c", ATTRIBUTE_LOOKUP_CHILD, str(tmp_path / "x.parquet")]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=60, check=False)  # nosec B603
+    assert (child.returncode, child.stdout.splitlines()) == (0, expected), child.stderr
 
 
 def test_timestamp_columns_read_as_epoch_microseconds_and_agree_with_records(tmp_path: Path) -> None:

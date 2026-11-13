@@ -37,6 +37,14 @@ class Select final : public Kernel {
 
   nlohmann::json params() const override { return {{"columns", columns_}}; }
 
+  // Nothing is learned, so state() stays empty; a manifest that carries a
+  // table for this stage was hand-edited and is refused rather than ignored.
+  void load_state(const nlohmann::json& state) override {
+    if (!state.is_object() || !state.empty()) {
+      throw Error(stage + ": select learns nothing, so its 'state' must be an empty object");
+    }
+  }
+
   void resolve(Schema& schema) override {
     Schema out;
     for (const std::string& name : columns_) {
@@ -335,6 +343,14 @@ class Cast final : public Kernel {
     nlohmann::json types = nlohmann::json::object();
     for (std::size_t i = 0; i < columns_.size(); ++i) types[columns_[i]] = targets_[i].tag;
     return {{"types", types}};
+  }
+
+  // Nothing is learned, so state() stays empty; a manifest that carries a
+  // table for this stage was hand-edited and is refused rather than ignored.
+  void load_state(const nlohmann::json& state) override {
+    if (!state.is_object() || !state.empty()) {
+      throw Error(stage + ": cast learns nothing, so its 'state' must be an empty object");
+    }
   }
 
   void resolve(Schema& schema) override {

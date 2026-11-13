@@ -11,6 +11,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
 #include "fastfeaturetransform/spill.hpp"
@@ -325,6 +328,28 @@ TEST_CASE("select rejects missing columns at resolve and bad params at construct
                       ContainsSubstring("non-empty list"));
   REQUIRE_THROWS_WITH((fft::make_kernel("select", {{"columns", "a"}})), ContainsSubstring("non-empty list"));
   REQUIRE_THROWS_WITH(fft::make_kernel("select", nlohmann::json::object()), ContainsSubstring("non-empty list"));
+}
+
+TEST_CASE("select and cast load_state reject a table a hand-edited manifest put there") {
+  // Neither learns anything, so each writes an empty object as its state and
+  // takes nothing else back, as hash_encode, binarize and normalize do.
+  const std::vector<std::pair<std::string, nlohmann::json>> kernels{{"select", {{"columns", {"a"}}}},
+                                                                    {"cast", {{"types", {{"a", "f64"}}}}}};
+  for (const auto& kernel_and_params : kernels) {
+    const std::string& id = kernel_and_params.first;
+    const nlohmann::json& params = kernel_and_params.second;
+    auto fresh = [&] {
+      auto kernel = fft::make_kernel(id, params);
+      kernel->stage = "stage";
+      return kernel;
+    };
+    REQUIRE(fresh()->state() == nlohmann::json::object());
+    REQUIRE_NOTHROW(fresh()->load_state(nlohmann::json::object()));
+    const std::string refusal = "stage: " + id + " learns nothing, so its 'state' must be an empty object";
+    REQUIRE_THROWS_WITH((fresh()->load_state({{"columns", {"a"}}})), Equals(refusal));
+    REQUIRE_THROWS_WITH(fresh()->load_state(nlohmann::json::array()), Equals(refusal));
+    REQUIRE_THROWS_WITH(fresh()->load_state(nlohmann::json()), Equals(refusal));
+  }
 }
 
 TEST_CASE("label_encode validates its params") {

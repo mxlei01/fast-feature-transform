@@ -7,6 +7,7 @@ import itertools
 import json
 import math
 import pickle
+import re
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -22,6 +23,7 @@ from fast_feature_transform import (
     BackwardDifferenceEncoder,
     BaseNEncoder,
     BinaryEncoder,
+    Cast,
     CatBoostEncoder,
     CountEncoder,
     EngineError,
@@ -139,6 +141,24 @@ def test_loaded_label_maps_are_validated(source: str) -> None:
     manifest["ops"][0]["state"]["label_maps"]["device"] = {"ios": 1, "web": 500}
     with pytest.raises(EngineError, match="exactly 1..2"):
         _core.FittedPipeline.load_json(json.dumps(manifest))
+
+
+def test_select_and_cast_refuse_a_state_a_manifest_gives_them(source: str) -> None:
+    # REGRESSION: select and cast learn nothing, so a manifest that gives
+    # either a state other than an empty object is refused, as it is for the
+    # other steps that learn nothing. Such a state used to load and be ignored.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device", "price"])), ("c", Cast({"price": "f32"}))])
+    manifest: dict[str, Any] = _manifest(pipeline.fit([source]))
+    assert [op["state"] for op in manifest["ops"]] == [{}, {}]
+    record: dict[str, Any] = {"device": "ios", "price": 1.5}
+    assert _core.FittedPipeline.load_json(json.dumps(manifest)).transform_row(record) == record
+    for index, stage, kernel in ((0, "s", "select"), (1, "c", "cast")):
+        for state in ({"columns": ["price"]}, [], None):
+            edited: dict[str, Any] = json.loads(json.dumps(manifest))
+            edited["ops"][index]["state"] = state
+            refusal: str = f"{stage}: {kernel} learns nothing, so its 'state' must be an empty object"
+            with pytest.raises(EngineError, match=f"^{re.escape(refusal)}$"):
+                _core.FittedPipeline.load_json(json.dumps(edited))
 
 
 def test_loaded_explicit_columns_keep_their_order(tmp_path: Path) -> None:
@@ -617,6 +637,33 @@ def test_transform_dict_raises_the_error_a_value_raises_while_it_converts(source
         pipeline.transform_dict({"device": "ios", "flag": bool_()})
     with pytest.raises(ValueError, match="no integer value"):
         pipeline.transform_dict({"device": "ios", "n": _NoIndex()})
+
+
+class _LookupRaises:
+    """A value whose lookup of an attribute it lacks raises KeyError, as a __getattr__ that reads a dict does."""
+
+    def __getattr__(self, name: str) -> Any:
+        """Look the name up in an empty dict.
+
+        Args:
+            name: The attribute's name.
+
+        Raises:
+            KeyError: Always.
+
+        """
+        raise KeyError(name)
+
+
+def test_transform_dict_raises_the_error_a_value_raises_while_an_attribute_is_looked_up(source: str) -> None:
+    # REGRESSION: a value's lookup of an attribute that raises anything but
+    # AttributeError raises that error, as Python's hasattr does. The record
+    # path used to hand the error to sys.unraisablehook and go on as if the
+    # value lacked the attribute, here __index__, so the value got the
+    # EngineError for an unsupported type.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    with pytest.raises(KeyError, match="__index__"):
+        pipeline.transform_dict({"device": "ios", "n": _LookupRaises()})
 
 
 def test_transform_dict_accepts_numpy_scalars(source: str) -> None:

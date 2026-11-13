@@ -2,12 +2,15 @@
 
 import json
 import math
+import numbers
 import pickle
+import re
 import sys
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -444,6 +447,80 @@ def test_scaler_arguments_are_validated_before_the_engine_runs() -> None:
         Binarizer()  # ty: ignore[missing-argument]
     with pytest.raises(TypeError, match="missing 1 required positional argument"):
         Normalizer()  # ty: ignore[missing-argument]
+
+
+class _OpaqueReal:
+    """A number that numbers.Real takes and fractions.Fraction cannot read, read through __float__ alone."""
+
+    def __init__(self, value: float) -> None:
+        """Hold a float.
+
+        Args:
+            value: The float.
+
+        """
+        self.value: float = value
+
+    def __float__(self) -> float:
+        """Give the float.
+
+        Returns:
+            The float held.
+
+        """
+        return self.value
+
+    def __repr__(self) -> str:
+        """Name the float held.
+
+        Returns:
+            ``_OpaqueReal(<float>)``.
+
+        """
+        return f"_OpaqueReal({self.value!r})"
+
+
+numbers.Real.register(_OpaqueReal)
+
+
+def test_feature_range_bounds_in_order_that_round_to_one_f64_get_a_message_that_says_so() -> None:
+    # REGRESSION: bounds in order that round to one f64 are refused with a
+    # message that says so. They used to get the message that low was not
+    # below high, which is false of bounds such as 2**53 and 2**53 + 1.
+    # Each pair here differs, as Fraction compares the plain Python numbers
+    # that numpy's item() gives, and has one nearest f64; numpy's own
+    # comparison calls the second and third pairs equal. The last bound is an
+    # integer that only operator.index reads.
+    in_order: list[tuple[Any, Any]] = [
+        (2**53, 2**53 + 1),
+        (np.int64(2**53 + 3), float(2**53 + 4)),
+        (np.float32(2.0**53), 2**53 + 1),
+        (1.0, Fraction(2**60 + 1, 2**60)),
+        (2**53, np.array(2**53 + 1)),
+    ]
+    for low, high in in_order:
+        assert Fraction(np.asarray(low).item()) < Fraction(np.asarray(high).item())
+        assert float(low) == float(high)
+        message: str = (
+            f"MinMaxScaler: feature_range bounds {low!r} and {high!r} both round to the f64 {float(low)!r}, so low "
+            "is not below high; give bounds that differ as f64 values"
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            MinMaxScaler(feature_range=(low, high))
+    # Bounds that are equal or out of order as given keep the plain message,
+    # including a number that Fraction cannot read, which is compared as the
+    # f64 it gives.
+    not_in_order: list[tuple[Any, Any]] = [
+        (1.0, 1.0),
+        (2**53 + 1, 2**53),
+        (np.int64(5), 5.0),
+        (Fraction(2**60 + 1, 2**60), 1.0),
+        (_OpaqueReal(2.0), _OpaqueReal(2.0)),
+    ]
+    for low, high in not_in_order:
+        message = f"MinMaxScaler: feature_range must be (low, high) with low < high, got {(low, high)!r}"
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            MinMaxScaler(feature_range=(low, high))
 
 
 def test_scaler_reprs_round_trip_through_their_params() -> None:
