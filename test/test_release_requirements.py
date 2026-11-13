@@ -1,12 +1,14 @@
 """The hashed lists release.yaml installs from agree with pyproject.toml and uv.lock.
 
 make release-requirements writes them. These tests fail when a version changes in pyproject.toml, uv.lock or a .in
-file while the lists still hold the old one, and when the wheel tests' list trusts a file uv.lock does not.
+file while the lists still hold the old one, and when the wheel tests' list trusts a file uv.lock does not, leaves out
+a package the wheel-tests group installs, or holds one the group does not install.
 """
 
 import re
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -47,10 +49,38 @@ def _hashes(text: str) -> dict[str, set[str]]:
     return hashes
 
 
+def _group_packages(packages: list[dict[str, Any]], group: str) -> set[str]:
+    """Name every package of uv.lock that a dependency group of the project installs, on any platform.
+
+    That is the group's members, what each needs, and what the extras they ask for add, whatever their markers say:
+    what uv export writes for the group.
+    """
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        by_name.setdefault(_name(package["name"]), []).append(package)
+    (project,) = by_name["fast-feature-transform"]
+    wanted: list[dict[str, Any]] = list(project["dev-dependencies"][group])
+    found: set[tuple[str, str]] = set()  # a name, and one of its extras or "" for the package itself
+    while wanted:
+        dependency = wanted.pop()
+        name = _name(dependency["name"])
+        for extra in ["", *dependency.get("extra", [])]:
+            if (name, extra) in found:
+                continue
+            found.add((name, extra))
+            for package in by_name[name]:  # each locked version, when the lock holds more than one
+                if extra:
+                    wanted.extend(package.get("optional-dependencies", {}).get(extra, []))
+                else:
+                    wanted.extend(package.get("dependencies", []))
+    return {name for name, _ in found}
+
+
 def test_wheel_tests_match_uv_lock() -> None:
+    packages: list[dict[str, Any]] = tomllib.loads((ROOT / "uv.lock").read_text())["package"]
     versions: dict[str, set[str]] = {}
     hashes: dict[str, set[str]] = {}
-    for package in tomllib.loads((ROOT / "uv.lock").read_text())["package"]:
+    for package in packages:
         name = _name(package["name"])
         versions.setdefault(name, set()).add(package.get("version", ""))
         files = [package.get("sdist", {}), *package.get("wheels", [])]
@@ -62,6 +92,7 @@ def test_wheel_tests_match_uv_lock() -> None:
         for name, listed in _hashes(text).items()
         if not listed <= hashes.get(name, set())
     } == {}, STALE
+    assert set(_pins(text)) == _group_packages(packages, "wheel-tests"), STALE
 
 
 @pytest.mark.parametrize("name", COMPILED)
