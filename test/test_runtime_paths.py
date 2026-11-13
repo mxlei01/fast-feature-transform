@@ -3,6 +3,7 @@
 import itertools
 import json
 import pickle
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -281,6 +282,108 @@ def test_parquet_dictionary_indices_outside_the_dictionary_are_refused(tmp_path:
     model = encoder(columns=["c"]).fit([clean])
     with pytest.raises(EngineError, match=message):
         model.transform_parquet([corrupt], output_dir=tmp_path / "out")
+    with pytest.raises(EngineError, match=message):
+        model.transform_memmap([corrupt], output_dir=tmp_path / "memmap")
+
+
+_NESTED_ENTRIES = ["aa", "bb", *(f"c{i}" for i in range(10)), "zz"]
+
+
+def _nested_strings(kind: str) -> tuple[pa.Array, int]:
+    """A column of `kind` whose strings use all 13 of _NESTED_ENTRIES, with nulls among them and among its rows.
+
+    A map's keys and rows hold no null.
+
+    Args:
+        kind: "list", "large_list", "fixed_size_list", "struct", "map keys", "map values", "list of structs" or
+            "fixed_size_list of structs".
+
+    Returns:
+        The column, and the number of the Parquet leaf that holds the strings.
+    """
+    words = [_NESTED_ENTRIES[i % 13] for i in range(195)]
+    strings = pa.array([None if i % 7 == 3 else word for i, word in enumerate(words)])
+    offsets = pa.array(range(0, 196, 3), pa.int32())
+    rows = pa.array([row % 5 == 2 for row in range(65)])
+    records = pa.StructArray.from_arrays(
+        [strings, pa.array(range(195))], ["name", "n"], mask=pa.array([row % 11 == 5 for row in range(195)])
+    )
+    if kind == "list":
+        return pa.ListArray.from_arrays(offsets, strings, mask=rows), 0
+    if kind == "large_list":
+        return pa.LargeListArray.from_arrays(offsets.cast(pa.int64()), strings, mask=rows), 0
+    if kind == "fixed_size_list":
+        return pa.FixedSizeListArray.from_arrays(strings, 3, mask=rows), 0
+    if kind == "struct":
+        return records, 0
+    if kind == "list of structs":
+        return pa.ListArray.from_arrays(offsets, records, mask=rows), 0
+    if kind == "fixed_size_list of structs":
+        return pa.FixedSizeListArray.from_arrays(records, 3, mask=rows), 0
+    return pa.MapArray.from_arrays(offsets, pa.array(words), strings), 0 if kind == "map keys" else 1
+
+
+# REGRESSION: strings inside a list, large list, struct or map are read as a
+# dictionary in a child array, and their indices are checked as a top-level
+# column's are; strings inside a fixed-size list are read plain, Arrow's
+# decoder checks their indices, and the column it fails on is named. A file
+# whose nested indices lay outside the dictionary used to crash
+# transform_parquet, or, inside a fixed-size list with null rows, to pass
+# through with wrong values. Here the dictionary page of the strings declares
+# 12 entries instead of 13, so the rows that use the last one point past the
+# dictionary the reader keeps.
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "list",
+        "large_list",
+        "fixed_size_list",
+        "struct",
+        "map keys",
+        "map values",
+        "list of structs",
+        "fixed_size_list of structs",
+    ],
+)
+def test_parquet_dictionary_indices_outside_a_nested_dictionary_are_refused(tmp_path: Path, kind: str) -> None:
+    column, leaf = _nested_strings(kind)
+    table = pa.table({"c": column, "x": pa.array([float(row) for row in range(len(column))])})
+    clean, corrupt = tmp_path / "clean.parquet", tmp_path / "corrupt.parquet"
+    pq.write_table(table, clean, compression="NONE", write_statistics=False)
+    chunk = pq.ParquetFile(clean).metadata.row_group(0).column(leaf)
+    # In Thrift's compact encoding the dictionary page header (field 7 of the
+    # page header, a struct: 0x4C) opens with num_values (field 1, an i32:
+    # 0x15) as a zigzag varint: 13 is the byte 26, 12 the byte 24.
+    pages = slice(chunk.dictionary_page_offset, chunk.data_page_offset)
+    data = bytearray(clean.read_bytes())
+    assert bytes(data[pages]).count(b"\x4c\x15\x1a") == 1
+    data[pages.start + bytes(data[pages]).index(b"\x4c\x15\x1a") + 2] = 24
+    corrupt.write_bytes(bytes(data))
+    with pytest.raises(pa.ArrowInvalid, match="Index not in dictionary bounds"):
+        pq.read_table(corrupt)
+
+    model = Pipeline([("s", StandardScaler(columns=["x"]))]).fit([clean])
+    (part,) = model.transform_parquet([clean], output_dir=tmp_path / "clean-out")
+    assert pq.read_table(part).column("c").to_pylist() == table.column("c").to_pylist()
+    # Strings inside a fixed-size list are read plain: Arrow's decoder refuses
+    # the index, and the column that fails on its own is named.
+    problem = (
+        "column 'c' cannot be decoded: Invalid: Index not in dictionary bounds"
+        if kind.startswith("fixed_size_list")
+        else "column 'c' has a dictionary index outside its dictionary: Index 12 out of bounds"
+    )
+    message = f"{corrupt}: failed to read row group 0: {problem}"
+    with pytest.raises(EngineError, match=re.escape(message)):
+        model.transform_parquet([corrupt], output_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+    # No step takes a nested column, so only a step that keeps it reads it at
+    # fit; the memmap writers refuse such a column before reading a row.
+    with pytest.raises(EngineError, match=re.escape(message)):
+        Pipeline([("keep", Select(["c", "x"])), ("s", StandardScaler(columns=["x"]))]).fit([corrupt])
+    with pytest.raises(EngineError, match="which cannot be written to a memmap"):
+        model.transform_memmap([corrupt], output_dir=tmp_path / "memmap")
+    with pytest.raises(EngineError, match="which cannot be written to a memmap"):
+        parquet_to_memmap([corrupt], output_dir=tmp_path / "converted")
 
 
 # REGRESSION: EngineError was raised from a C string, so a message ended at a

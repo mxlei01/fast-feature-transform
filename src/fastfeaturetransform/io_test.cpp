@@ -105,6 +105,35 @@ std::string dictionary_file(const TempDir& dir, const std::string& name, const s
   return path;
 }
 
+// A copy of the file at `path`, written to `damaged`, whose dictionary page
+// for leaf column `leaf` of row group 0 declares 12 entries instead of 13: the
+// reader keeps all but the last entry, so the rows that use it point past the
+// dictionary. In Thrift's compact encoding the dictionary page header (field
+// 7 of the page header, a struct: 0x4c) opens with num_values (field 1, an
+// i32: 0x15) as a zigzag varint, which is 0x1a for 13 and 0x18 for 12.
+void drop_last_dictionary_entry(const std::string& path, int leaf, const std::string& damaged) {
+  std::size_t start = 0;
+  std::size_t end = 0;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> group = file->metadata()->RowGroup(0);
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = group->ColumnChunk(leaf);
+    REQUIRE(chunk->has_dictionary_page());
+    start = static_cast<std::size_t>(chunk->dictionary_page_offset());
+    end = static_cast<std::size_t>(chunk->data_page_offset());
+  }
+  std::string bytes = file_contents(path);
+  const std::string field("\x4c\x15\x1a", 3);
+  const std::size_t at = bytes.find(field, start);
+  REQUIRE(at < end);
+  REQUIRE(at + field.size() <= end);
+  REQUIRE(bytes.find(field, at + 1) >= end);
+  bytes[at + 2] = '\x18';
+  std::ofstream file(damaged, std::ios::binary | std::ios::trunc);
+  file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(file.good());
+}
+
 // Runs `action` while this process can grow no file past `bytes`, and
 // returns the message of the fft::Error it throws, or an empty string when it
 // throws none. A write past the limit fails with EFBIG, which stages a disk
@@ -713,6 +742,130 @@ TEST_CASE("dictionary indices outside their dictionary are refused") {
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(task, 8, [&](fft::Batch) { ++batches; }), ContainsSubstring(message));
     REQUIRE(batches == 2);  // rows 0 to 15 are whole, row 16 is not
+  }
+}
+
+TEST_CASE("dictionary indices outside a dictionary inside a list, struct or map are refused") {
+  TempDir dir;
+  // 195 strings that use all 13 entries, every seventh one null, and the
+  // same strings without nulls for a map's keys.
+  std::vector<std::string> entries{"aa", "bb"};
+  for (int i = 0; i < 10; ++i) entries.push_back("c" + std::to_string(i));
+  entries.emplace_back("zz");
+  std::vector<std::optional<std::string>> words;
+  std::vector<std::optional<std::string>> strings;
+  for (std::size_t i = 0; i < 195; ++i) {
+    words.emplace_back(entries[i % 13]);
+    strings.push_back(i % 7 == 3 ? std::nullopt : words.back());
+  }
+  const std::shared_ptr<arrow::Array> values = utf8_column(strings);
+  // A column whose nulls give the validity of `rows` rows, every `every`th
+  // one null.
+  const auto nulls = [](int64_t rows, int64_t every) {
+    std::vector<std::optional<int8_t>> slots;
+    for (int64_t row = 0; row < rows; ++row) {
+      slots.push_back(row % every == every / 2 ? std::nullopt : std::optional<int8_t>(0));
+    }
+    return numeric_column<arrow::Int8Type>(slots);
+  };
+  const std::shared_ptr<arrow::Array> lists = nulls(65, 5);
+  const std::shared_ptr<arrow::Array> records = nulls(195, 11);
+  std::vector<std::optional<int32_t>> offsets;
+  std::vector<std::optional<int64_t>> large_offsets;
+  for (int32_t offset = 0; offset <= 195; offset += 3) {
+    offsets.emplace_back(offset);
+    large_offsets.emplace_back(offset);
+  }
+  const auto offsets32 = numeric_column<arrow::Int32Type>(offsets);
+  const auto offsets64 = numeric_column<arrow::Int64Type>(large_offsets);
+  std::vector<std::optional<int64_t>> numbers;
+  for (int64_t i = 0; i < 195; ++i) numbers.emplace_back(i);
+  const auto pool = arrow::default_memory_pool();
+  const std::shared_ptr<arrow::Array> map =
+      arrow::MapArray::FromArrays(offsets32, utf8_column(words), values, pool).ValueOrDie();
+  const std::shared_ptr<arrow::Array> structs =
+      arrow::StructArray::Make({values, numeric_column<arrow::Int64Type>(numbers)},
+                               std::vector<std::string>{"name", "n"}, records->null_bitmap(), records->null_count())
+          .ValueOrDie();
+
+  struct Case {
+    std::string name;
+    std::shared_ptr<arrow::Array> column;
+    int leaf;
+    arrow::Type::type read_as;  // the type the reader gives the strings
+    std::string problem;
+  };
+  const std::string outside = "column 'c' has a dictionary index outside its dictionary: Index 12 out of bounds";
+  // Strings at any depth inside a fixed-size list are read plain: Arrow's
+  // decoder refuses the index, and the column that fails on its own is named.
+  const std::string plain = "column 'c' cannot be decoded: Invalid: Index not in dictionary bounds";
+  const std::vector<Case> cases{
+      {"list",
+       arrow::ListArray::FromArrays(*offsets32, *values, pool, lists->null_bitmap(), lists->null_count()).ValueOrDie(),
+       0, arrow::Type::DICTIONARY, outside},
+      {"large_list",
+       arrow::LargeListArray::FromArrays(*offsets64, *values, pool, lists->null_bitmap(), lists->null_count())
+           .ValueOrDie(),
+       0, arrow::Type::DICTIONARY, outside},
+      {"fixed_size_list",
+       arrow::FixedSizeListArray::FromArrays(values, 3, lists->null_bitmap(), lists->null_count()).ValueOrDie(), 0,
+       arrow::Type::STRING, plain},
+      {"struct", structs, 0, arrow::Type::DICTIONARY, outside},
+      {"map keys", map, 0, arrow::Type::DICTIONARY, outside},
+      {"map values", map, 1, arrow::Type::DICTIONARY, outside},
+      {"list of structs",
+       arrow::ListArray::FromArrays(*offsets32, *structs, pool, lists->null_bitmap(), lists->null_count()).ValueOrDie(),
+       0, arrow::Type::DICTIONARY, outside},
+      {"fixed_size_list of structs",
+       arrow::FixedSizeListArray::FromArrays(structs, 3, lists->null_bitmap(), lists->null_count()).ValueOrDie(), 0,
+       arrow::Type::STRING, plain},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    // A clean column before the damaged one, which the error does not name.
+    std::vector<std::optional<int64_t>> counts;
+    for (int64_t row = 0; row < c.column->length(); ++row) counts.emplace_back(row);
+    const auto table =
+        arrow::Table::Make(arrow::schema({arrow::field("before", arrow::int64()), arrow::field("c", c.column->type())}),
+                           {numeric_column<arrow::Int64Type>(counts), c.column});
+    const std::string clean = (dir.path / (c.name + ".parquet")).string();
+    {
+      auto output = arrow::io::FileOutputStream::Open(clean);
+      REQUIRE(output.ok());
+      parquet::WriterProperties::Builder properties;
+      properties.compression(parquet::Compression::UNCOMPRESSED)->disable_statistics();
+      // The stored Arrow schema brings back the large and fixed-size lists.
+      const arrow::Status written =
+          parquet::arrow::WriteTable(*table, pool, *output, 1024, properties.build(),
+                                     parquet::ArrowWriterProperties::Builder().store_schema()->build());
+      INFO(written.ToString());
+      REQUIRE(written.ok());
+      REQUIRE((*output)->Close().ok());
+    }
+    auto source = fft::open_source({clean});
+    const fft::Batch read = read_task(*source, 0);
+    REQUIRE(read.cols[1]->type_id() == c.column->type_id());
+    REQUIRE(read.cols[1]->length() == c.column->length());
+    const arrow::ArrayData* innermost = read.cols[1]->data().get();
+    while (!innermost->child_data.empty()) innermost = innermost->child_data.front().get();
+    REQUIRE(innermost->type->id() == c.read_as);
+
+    const std::string damaged = (dir.path / (c.name + "-damaged.parquet")).string();
+    drop_last_dictionary_entry(clean, c.leaf + 1, damaged);
+    auto damaged_source = fft::open_source({damaged});
+    auto readers = damaged_source->readers(1, nullptr);
+    // Two rows a batch: the first rows use no damaged index, so the batches
+    // that hold them arrive whole, and the failure comes in a later batch.
+    std::size_t batches = 0;
+    REQUIRE_THROWS_WITH(readers[0]->read_batches(damaged_source->plan_tasks()[0], 2, [&](fft::Batch) { ++batches; }),
+                        damaged + ": failed to read row group 0: " + c.problem);
+    REQUIRE(batches > 0);
+    // With 'c' read alone, it is the first column read and the second in the
+    // file: the error names it all the same.
+    const std::vector<std::string> selected{"c"};
+    auto projected = damaged_source->readers(1, &selected);
+    REQUIRE_THROWS_WITH(projected[0]->read_batches(damaged_source->plan_tasks()[0], 2, [](fft::Batch) {}),
+                        damaged + ": failed to read row group 0: " + c.problem);
   }
 }
 
