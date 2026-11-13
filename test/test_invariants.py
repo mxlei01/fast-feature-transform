@@ -304,6 +304,131 @@ def test_readers_see_the_old_fit_or_the_new_one_while_a_transformer_is_fitted_ag
     assert race([fit_held, refit] * 500, [[old, new] for old, new in zip(alone, held, strict=True)]) == []
 
 
+# Each case converts a record with a value that leaves the record while the
+# record path reads it, and prints the result and what the values recorded.
+# Reading a freed value crashes or hangs the process, so the cases run in a
+# child process.
+HELD_VALUE_CHILD: str = """
+import datetime
+import gc
+import sys
+import threading
+
+from fast_feature_transform import Pipeline, Select
+
+source, case = sys.argv[1], sys.argv[2]
+record = {}
+events = []
+
+
+class Integer:
+    # Looking up its __index__ takes it out of the record: "clear" empties
+    # the record, "replace" puts another value under its key.
+    def __init__(self, n, change):
+        self.n = n
+        self.change = change
+
+    def __getattribute__(self, name):
+        if name == "__index__":
+            if object.__getattribute__(self, "change") == "clear":
+                record.clear()
+            else:
+                record["a"] = 99
+        return object.__getattribute__(self, name)
+
+    def __index__(self):
+        return self.n
+
+
+class EmptiesTheRecord(type):
+    # Reading the type name, as the record path does for a value that is not
+    # a builtin, empties the record.
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            record.clear()
+        return type.__getattribute__(cls, name)
+
+
+class Named(metaclass=EmptiesTheRecord):
+    def __index__(self):
+        return 5
+
+
+class Zone(datetime.tzinfo):
+    def utcoffset(self, dt):
+        events.append("utcoffset")
+        return datetime.timedelta(hours=1)
+
+
+made, asked, replaced = threading.Event(), threading.Event(), threading.Event()
+
+
+class Stamp(datetime.datetime):
+    # The record path asks a datetime for the asm8 of a pandas Timestamp.
+    # This one waits there until another thread has replaced the record's
+    # values; waiting lets that thread change the record on either build.
+    def __getattr__(self, name):
+        if name == "asm8":
+            asked.set()
+            replaced.wait(5)
+        raise AttributeError(name)
+
+    def __del__(self):
+        events.append("del")
+
+
+def writer():
+    # The values come from this thread. On a free-threaded build the last
+    # reference that another thread drops then frees a value at once.
+    record.update({"a": 1, "t": Stamp(2021, 6, 1, 12, tzinfo=Zone())})
+    made.set()
+    asked.wait(5)
+    record.update({"a": 2, "t": datetime.datetime(2000, 1, 1)})
+    replaced.set()
+
+
+if case == "other_thread":
+    pipeline = Pipeline([("s", Select(["t"]))]).fit([source], threads=1)
+    thread = threading.Thread(target=writer)
+    thread.start()
+    made.wait(5)
+    result = pipeline.transform_dict(record)
+    thread.join()
+else:
+    pipeline = Pipeline([("s", Select(["a"]))]).fit([source], threads=1)
+    record["a"] = Named() if case == "type_name" else Integer(7, case)
+    result = pipeline.transform_dict(record)
+gc.collect()
+print(result, events)
+"""
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("clear", "{'a': 7} []"),
+        ("replace", "{'a': 7} []"),
+        ("type_name", "{'a': 5} []"),
+        # 12:00 at +01:00, read before the value is released.
+        ("other_thread", "{'t': 1622545200000000} ['utcoffset', 'del']"),
+    ],
+)
+def test_a_record_value_stays_alive_while_the_record_path_reads_it(tmp_path: Path, case: str, expected: str) -> None:
+    # REGRESSION: the record path holds each value of a record until it has
+    # read it. It used to borrow the record's reference, so a value that left
+    # the record while its own code ran, or that another thread replaced
+    # meanwhile, was freed and then read: the process crashed or hung.
+    times: pa.Array = pa.array([0, 1], pa.timestamp("us"))
+    source: str = write_parquet(tmp_path / "record.parquet", pa.table({"a": [1, 2], "t": times}))
+    command: list[str] = [sys.executable, "-c", HELD_VALUE_CHILD, source, case]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=20, check=False)  # nosec B603
+    if case == "key_wait" and child.returncode == 0 and child.stdout.startswith("missed"):
+        # A loaded machine can let the replacement fall outside the key's wait
+        # in all three attempts. That shows nothing about the record path.
+        pytest.skip("the value was not replaced while its key waited")
+    assert (child.returncode, child.stdout) == (0, expected + "\n"), child.stderr
+
+
 @settings(max_examples=60, deadline=None)
 @given(
     values=st.lists(st.one_of(st.none(), st.text(max_size=8)), max_size=120),
