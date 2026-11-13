@@ -409,7 +409,7 @@ class Transformer:
             The transformed record.
 
         Raises:
-            EngineError: If a value cannot be converted or a required key is missing.
+            EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
             RuntimeError: If unfitted, or fitted as part of a Pipeline.
 
         """

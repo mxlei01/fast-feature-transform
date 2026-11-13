@@ -90,6 +90,8 @@ using StringValues = ankerl::unordered_dense::map<std::string, double, Transpare
 //
 // A record that holds one name twice answers with one of the two fields: the
 // index and the scan with the first, the cursor with the one it stands on.
+// transform_dict refuses such a record, unless another thread changes the
+// record while it is read.
 template <typename Record>
 class RecordLookup {
  public:
@@ -99,7 +101,7 @@ class RecordLookup {
     for (std::size_t i = 0; i < row.size(); ++i) positions_->try_emplace(row[i].first, i);
   }
 
-  RowValue* find(const std::string& name) const {
+  RowValue* find(const std::string& name) {
     if (positions_) {
       const auto found = positions_->find(name);
       return found == positions_->end() ? nullptr : &row_[found->second].second;
@@ -126,7 +128,7 @@ class RecordLookup {
   // It starts past the last field, where there is none to try. Before any hit
   // the scan compares the first field anyway, so trying it here as well would
   // cost every lookup that begins elsewhere a second comparison of that field.
-  mutable std::size_t next_;
+  std::size_t next_;
   std::optional<ankerl::unordered_dense::map<std::string_view, std::size_t>> positions_;
 };
 
