@@ -422,8 +422,8 @@ def test_count_encode_saved_pipeline_grows_linearly_with_the_folded_categories(t
 # Loading looks a group's name up once and not once for each member, so the
 # load is linear in the members. The default name is as long as the members
 # together: with a lookup for each of 128,000 members of 9 characters the load
-# took 7.5 s of CPU time, and it takes 18 ms. The bound of one second is 50
-# times that.
+# took 7.5 s of CPU time on an Apple M4, and it takes 18 ms. The bound of one
+# second is more than 50 times that.
 def test_count_encode_loads_a_large_group_in_time_linear_in_its_members(tmp_path: Path) -> None:
     members: int = 128_000
     table: pa.Table = pa.table({"c": [f"cat{index:06d}" for index in range(members)] + ["big"] * 5})

@@ -46,8 +46,9 @@ jobs:
       with:
         # The uv that wrote uv.lock.
         version: "0.13.6"
-        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
-        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        # The checksum of 0.13.6's uv-x86_64-unknown-linux-gnu.tar.gz, as uv's
+        # release lists it: the download is checked against it whatever
+        # checksums this setup-uv knows.
         checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
     # The install tree is the only thing worth caching: every build directory
     # (Python module and C++ tests) links against this one copy. It is saved
@@ -101,8 +102,9 @@ jobs:
     - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
       with:
         version: "0.13.6"
-        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
-        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        # The checksum of 0.13.6's uv-x86_64-unknown-linux-gnu.tar.gz, as uv's
+        # release lists it: the download is checked against it whatever
+        # checksums this setup-uv knows.
         checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
     - name: Restore the static Arrow build
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -140,8 +142,9 @@ jobs:
     - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
       with:
         version: "0.13.6"
-        # setup-uv v10.3.2 knows checksums up to uv 0.13.5; this is 0.13.6's
-        # uv-x86_64-unknown-linux-gnu.tar.gz, as uv's release lists it.
+        # The checksum of 0.13.6's uv-x86_64-unknown-linux-gnu.tar.gz, as uv's
+        # release lists it: the download is checked against it whatever
+        # checksums this setup-uv knows.
         checksum: "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645"
     - name: Restore the static Arrow build
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0

@@ -576,10 +576,7 @@ class ExactSum {
   }
 
   // Behind a pointer and absent until a value needs them, which almost none
-  // does: a sum is then 32 bytes. Held inline they make it 48, and an
-  // accumulator such as target_encode's 80 bytes instead of 64, which its
-  // loop indexes with a multiply instead of a shift: a fit of 1,000,000 rows
-  // on an integer target then takes 6.8 ms instead of 6.6 (Apple M4).
+  // does: a sum is then 32 bytes, and 48 with them held inline.
   std::unique_ptr<std::vector<double>> partials_;
   double head_ = 0.0;  // NaN once the partials alone hold the sum
   double carry_ = 0.0;

@@ -134,7 +134,7 @@ def write_parts(table: pa.Table, directory: Path, layout: Sequence[Sequence[int]
     compression, Parquet format 2.6, no stored Arrow schema, dictionary
     encoding off for floats and on for everything else, the sink's
     dictionary page limit (see ``dictionary_page_limit``), and the sink's
-    write buffer of ``PART_BUFFER_BYTES`` in front of each file. Our sink also
+    write buffer of ``PART_BUFFER_BYTES`` in front of each file. The sink also
     deletes the directory's existing part files when a run starts and writes
     each part under a temporary name and renames it; this does neither, since
     both cost a few file operations per part, not per row.

@@ -214,8 +214,11 @@ else()
   # nothing but those helpers around a kernel call, and it is the serving path.
   nanobind_add_module(_core FREE_THREADED NOMINSIZE src/bindings/module.cpp)
   target_link_libraries(_core PRIVATE fftcore fft_project_options)
-  # Export only the module init symbol: our static Arrow stays private, so its
-  # (weak) symbols can never coalesce with pyarrow's Arrow in the same process.
+  # Keep the static Arrow private, so that its symbols never coalesce with
+  # pyarrow's Arrow in the same process. macOS exports only the module init
+  # symbol. Linux hides every symbol of the static libraries; the weak
+  # instances of libstdc++ and Arrow header templates in this package's own
+  # objects stay exported, and nothing in pyarrow imports them.
   if(APPLE)
     target_link_options(_core PRIVATE "LINKER:-exported_symbol,_PyInit__core")
   else()

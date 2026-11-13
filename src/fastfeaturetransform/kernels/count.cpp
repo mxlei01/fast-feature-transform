@@ -326,14 +326,14 @@ class CountEncode final : public Kernel {
         // The group's name is looked up with the entry's first member and not
         // with each of them: the default name is as long as its members
         // together, and a lookup for each of 64,000 members of 8 bytes made a
-        // load of 9 ms take 1.7 s.
+        // load of 9 ms take 1.7 s (Apple M4, one thread).
         std::size_t group = 0;
         for (std::size_t i = 0; i < size; ++i) {
           const std::string& member = listed ? value[i].get_ref<const std::string&>() : key;
           // A member is folded away and a group is what it folds into, so the
           // one must be absent from the counts and the other present. Either
           // way round, a wrong entry would answer a fitted category as unseen.
-          // A member may share its key with its own group, as a min_group_name
+          // A member can share its key with its own group, as a min_group_name
           // naming a folded category gives it: that key answers the group's
           // count either way.
           if (member != into && table.counts.contains(member)) {

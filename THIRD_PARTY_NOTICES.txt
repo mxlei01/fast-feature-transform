@@ -3,7 +3,7 @@ Third-party notices
 fast-feature-transform's own code is under the MIT license in LICENSE. Its wheels also contain the libraries below,
 linked statically into fast_feature_transform._core, and code adapted from SciPy, so each one's license ships with them
 and follows in full. The versions are those the build pins: vcpkg's baseline in vcpkg.json, and CMakeLists.txt and
-pyproject.toml for the rest. SciPy's is the version the parity tests run against (uv.lock).
+pyproject.toml for the rest. SciPy's is the version the scikit-learn fixtures are generated with (Makefile).
 
  1. Apache Arrow and Parquet C++ 26.0.0, with the code they vendor: Apache-2.0, and the licenses its section gives for
     the vendored code in these wheels
