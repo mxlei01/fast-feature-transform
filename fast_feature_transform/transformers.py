@@ -9,6 +9,7 @@ import contextlib
 import itertools
 import json
 import math
+import numbers
 import operator
 import os
 import tempfile
@@ -41,10 +42,12 @@ def _cached_manifest(handle: _core.FittedPipeline) -> str:
 
 
 def _integer(value: Any, what: str) -> int:
-    """Accept any integral number (numpy included) except bool, from -2**63 to 2**63 - 1.
+    """Accept an integer from -2**63 to 2**63 - 1, as a plain int.
 
-    The kernels read every integer argument as an int64, so a larger one is
-    refused here rather than read wrapped or refused at fit.
+    An integer is a value that ``operator.index`` takes, such as an int or a
+    numpy integer, but not a bool or a numpy bool. The kernels read every
+    integer option as an int64, so a larger one is refused here rather than
+    read wrapped or refused at fit.
 
     Args:
         value: The value to check.
@@ -54,7 +57,7 @@ def _integer(value: Any, what: str) -> int:
         The value as an int.
 
     Raises:
-        TypeError: If the value is a bool or not integral.
+        TypeError: If the value is a bool or not an integer.
         ValueError: If the value is outside -2**63 to 2**63 - 1.
 
     """
@@ -66,6 +69,55 @@ def _integer(value: Any, what: str) -> int:
         raise TypeError(f"{what} must be an integer, got {value!r}") from None
     if not -(2**63) <= number < 2**63:
         raise ValueError(f"{what} must be an integer from -2**63 to 2**63 - 1, got {value!r}")
+    return number
+
+
+def _real(value: Any, what: str) -> float:
+    """Accept a number within the range of f64, as the nearest float.
+
+    A number is an integer, as ``_integer`` defines one, or an instance of
+    ``numbers.Real`` that is not a ``numbers.Integral``: a float, a
+    ``fractions.Fraction`` or a numpy float. A bool, a numpy bool or a numpy
+    timedelta64 is not a number. The kernels read every number option as an
+    f64, so a number whose nearest f64 is infinite or 0 though the number is
+    neither, such as ``10**400`` or ``Fraction(1, 10**400)``, is outside the
+    range of f64 and refused here rather than read as that infinity or 0.
+
+    Args:
+        value: The value to check.
+        what: What the value is, for the error message.
+
+    Returns:
+        The nearest float to the value.
+
+    Raises:
+        TypeError: If the value is a bool or not a number.
+        ValueError: If the value is outside the range of f64.
+
+    """
+    # int and float are named first because a check against numbers.Real
+    # takes several times as long for them.
+    real: Any = (
+        value
+        if isinstance(value, (int, float))
+        or (isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral))
+        else None
+    )
+    if real is None:
+        # Any other integer, such as a numpy integer or a numpy integer array
+        # of no dimensions, is read through operator.index, as _integer reads
+        # it. numpy registers timedelta64 as a numbers.Integral, and
+        # operator.index refuses it.
+        with contextlib.suppress(TypeError):
+            real = operator.index(value)
+    if real is None or isinstance(real, bool):
+        raise TypeError(f"{what} must be a number, got {value!r}")
+    try:
+        number: float = float(real)
+    except OverflowError:
+        number = math.inf
+    if (math.isinf(number) or number == 0.0) and number != real:
+        raise ValueError(f"{what} is outside the range of f64, got {value!r}")
     return number
 
 
@@ -839,23 +891,32 @@ class GroupAgg(Transformer):
         return self._state()["values"]
 
 
-def _group_size(value: object) -> None:
-    """Validate CountEncoder's min_group_size: an integer count or a float share of rows.
+def _group_size(value: object) -> float:
+    """Validate CountEncoder's min_group_size: an integer count or a share of rows.
+
+    An integer, as ``_integer`` defines one, is a count. Any other number,
+    as ``_real`` defines one, is a share of the fitted rows.
 
     Args:
         value: The value passed for ``min_group_size``.
 
+    Returns:
+        The count as an int, or the share as a float.
+
     Raises:
         TypeError: If the value is a bool or not a number.
-        ValueError: If the value is not finite, not above 0, or an integer
-            above 2**63 - 1.
+        ValueError: If the value is not finite, not above 0, an integer above
+            2**63 - 1, or outside the range of f64.
 
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"CountEncoder: min_group_size must be a number, got {value!r}")
-    number: float = _integer(value, "CountEncoder: min_group_size") if isinstance(value, int) else value
-    if not math.isfinite(number) or number <= 0:
+    size: float
+    try:
+        size = _integer(value, "CountEncoder: min_group_size")
+    except TypeError:
+        size = _real(value, "CountEncoder: min_group_size")
+    if not math.isfinite(size) or size <= 0:
         raise ValueError(f"CountEncoder: min_group_size must be a finite number > 0, got {value!r}")
+    return size
 
 
 class CountEncoder(Transformer):
@@ -898,8 +959,9 @@ class CountEncoder(Transformer):
             normalize: Divide each count by the fitted row count.
             min_group_size: Fold the categories below this threshold into one
                 group whose count is their sum, when that group gets two or
-                more members and some non-null category stays out of it. A
-                float is a fraction of the fitted rows; an integer is a count.
+                more members and some non-null category stays out of it. An
+                integer is a count, and any other number is a fraction of the
+                fitted rows.
             min_group_name: Name for that group; the members joined with "_"
                 in sorted order when omitted.
             combine_min_nan_groups: Whether the null category joins the folded
@@ -915,44 +977,42 @@ class CountEncoder(Transformer):
         Raises:
             TypeError: If columns is a bare string or an option has the wrong type.
             ValueError: If an option is not one of the accepted values, an
-                integer handle_unknown is outside -2**63 to 2**63 - 1, or
-                combine_min_nan_groups is "force" with handle_missing
-                "return_nan".
+                integer handle_unknown or min_group_size is outside -2**63 to
+                2**63 - 1, min_group_size is not a finite number above 0 or is
+                outside the range of f64, or combine_min_nan_groups is "force"
+                with handle_missing "return_nan".
 
         """
         self.columns: list[str] | None = _optional_columns(columns, "CountEncoder")
         _flag(normalize, "CountEncoder", "normalize")
-        if min_group_size is not None:
-            _group_size(min_group_size)
+        size: float | None = None if min_group_size is None else _group_size(min_group_size)
         if min_group_name is not None and not isinstance(min_group_name, str):
             raise TypeError(f"CountEncoder: min_group_name must be a string, got {min_group_name!r}")
         if not isinstance(combine_min_nan_groups, bool) and combine_min_nan_groups != "force":
             raise ValueError(
                 f"CountEncoder: combine_min_nan_groups must be True, False or 'force', got {combine_min_nan_groups!r}"
             )
-        if isinstance(handle_unknown, bool) or (
-            not isinstance(handle_unknown, int) and handle_unknown not in _HANDLE_UNKNOWN
-        ):
-            raise ValueError(
-                f"CountEncoder: handle_unknown must be an integer or one of {sorted(_HANDLE_UNKNOWN)}, "
-                f"got {handle_unknown!r}"
-            )
+        unknown: str | int
+        if isinstance(handle_unknown, str) and handle_unknown in _HANDLE_UNKNOWN:
+            unknown = _one_of(handle_unknown, _HANDLE_UNKNOWN, "CountEncoder", "handle_unknown")
+        else:
+            try:
+                unknown = _integer(handle_unknown, "CountEncoder: handle_unknown")
+            except TypeError:
+                raise ValueError(
+                    f"CountEncoder: handle_unknown must be an integer or one of {sorted(_HANDLE_UNKNOWN)}, "
+                    f"got {handle_unknown!r}"
+                ) from None
         handle_missing = _one_of(handle_missing, _HANDLE_MISSING, "CountEncoder", "handle_missing")
-        if isinstance(handle_unknown, int):
-            _integer(handle_unknown, "CountEncoder: handle_unknown")
         if combine_min_nan_groups == "force" and handle_missing == "return_nan":
             raise ValueError("CountEncoder: combine_min_nan_groups='force' needs handle_missing 'value' or 'error'")
         self.normalize: bool = normalize
-        self.min_group_size: float | None = min_group_size
+        self.min_group_size: float | None = size
         self.min_group_name: str | None = None if min_group_name is None else str.__str__(min_group_name)
         self.combine_min_nan_groups: bool | str = (
             combine_min_nan_groups if isinstance(combine_min_nan_groups, bool) else "force"
         )
-        self.handle_unknown: str | int = (
-            handle_unknown
-            if isinstance(handle_unknown, int)
-            else _one_of(handle_unknown, _HANDLE_UNKNOWN, "CountEncoder", "handle_unknown")
-        )
+        self.handle_unknown: str | int = unknown
         self.handle_missing: str = handle_missing
 
     @override
@@ -1592,14 +1652,14 @@ def _positive(value: Any, what: str) -> float:
 
     Raises:
         TypeError: If the value is a bool or not a number.
-        ValueError: If the value is not positive or not finite.
+        ValueError: If the value is not positive, not finite, or outside the
+            range of f64.
 
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{what} must be a number, got {value!r}")
-    if not math.isfinite(value) or value <= 0:
+    number: float = _real(value, what)
+    if not math.isfinite(number) or number <= 0:
         raise ValueError(f"{what} must be a finite number > 0, got {value!r}")
-    return float(value)
+    return number
 
 
 class TargetEncoder(_TargetBlend):
@@ -1651,8 +1711,8 @@ class TargetEncoder(_TargetBlend):
             TypeError: If an argument has the wrong type.
             ValueError: If columns is empty or holds the target,
                 min_samples_leaf is outside -2**63 to 2**63 - 1, smoothing
-                is not a finite number above 0, or an option is not one of
-                the accepted values.
+                is not a finite number above 0 or is outside the range of
+                f64, or an option is not one of the accepted values.
 
         """
         super().__init__(target, columns, handle_unknown, handle_missing)
@@ -1708,16 +1768,13 @@ class MEstimateEncoder(_TargetBlend):
 
         Raises:
             TypeError: If an argument has the wrong type.
-            ValueError: If columns is empty or holds the target, m is negative
-                or not finite, or an option is not one of the accepted values.
+            ValueError: If columns is empty or holds the target, m is negative,
+                not finite, or outside the range of f64, or an option is not
+                one of the accepted values.
 
         """
         super().__init__(target, columns, handle_unknown, handle_missing)
-        if isinstance(m, bool) or not isinstance(m, (int, float)):
-            raise TypeError(f"MEstimateEncoder: m must be a number, got {m!r}")
-        if not math.isfinite(m) or m < 0:
-            raise ValueError(f"MEstimateEncoder: m must be a finite number >= 0, got {m!r}")
-        self.m: float = float(m)
+        self.m: float = _smoothing(m, "MEstimateEncoder: m")
 
     @override
     def params(self) -> dict[str, Any]:
@@ -1770,8 +1827,8 @@ class WOEEncoder(_TargetBlend):
         Raises:
             TypeError: If an argument has the wrong type.
             ValueError: If columns is empty or holds the target, regularization
-                is not a finite number above 0, or an option is not one of the
-                accepted values.
+                is not a finite number above 0 or is outside the range of f64,
+                or an option is not one of the accepted values.
 
         """
         super().__init__(target, columns, handle_unknown, handle_missing)
@@ -2021,16 +2078,13 @@ class CatBoostEncoder(_ShrinkageEncoder):
         Raises:
             TypeError: If columns is a bare string, target is not a column
                 name, or a is not a number.
-            ValueError: If columns is empty or holds the target, a is negative
-                or not finite, or an option is not one of the accepted values.
+            ValueError: If columns is empty or holds the target, a is negative,
+                not finite, or outside the range of f64, or an option is not
+                one of the accepted values.
 
         """
         super().__init__(columns, target, handle_unknown, handle_missing)
-        if isinstance(a, bool) or not isinstance(a, (int, float)):
-            raise TypeError(f"CatBoostEncoder: a must be a number, got {a!r}")
-        if not a >= 0 or a == float("inf"):
-            raise ValueError(f"CatBoostEncoder: a must be a finite number >= 0, got {a!r}")
-        self.a: float = float(a)
+        self.a: float = _smoothing(a, "CatBoostEncoder: a")
 
     @override
     def params(self) -> dict[str, Any]:
@@ -2049,37 +2103,37 @@ def _quantile(quantile: object, what: str, key: str) -> float:
         The quantile as a float.
 
     Raises:
-        TypeError: If the quantile is not a number.
-        ValueError: If the quantile is outside [0, 1].
+        TypeError: If the quantile is a bool or not a number.
+        ValueError: If the quantile is outside [0, 1] or outside the range of
+            f64.
 
     """
-    if isinstance(quantile, bool) or not isinstance(quantile, (int, float)):
-        raise TypeError(f"{what}: {key} must be a number between 0 and 1, got {quantile!r}")
-    if not 0.0 <= quantile <= 1.0:
+    number: float = _real(quantile, f"{what}: {key}")
+    if not 0.0 <= number <= 1.0:
         raise ValueError(f"{what}: {key} must be a number between 0 and 1, got {quantile!r}")
-    return float(quantile)
+    return number
 
 
-def _smoothing(m: object, what: str) -> float:
-    """Validate an m-probability smoothing weight.
+def _smoothing(value: object, what: str) -> float:
+    """Validate a smoothing weight that may be 0, such as an m or an a.
 
     Args:
-        m: The value passed for ``m``.
-        what: The transformer name, for the error message.
+        value: The value to check.
+        what: What the value is, for the error message.
 
     Returns:
         The weight as a float.
 
     Raises:
-        TypeError: If m is not a number.
-        ValueError: If m is negative or not finite.
+        TypeError: If the value is a bool or not a number.
+        ValueError: If the value is negative, not finite, or outside the
+            range of f64.
 
     """
-    if isinstance(m, bool) or not isinstance(m, (int, float)):
-        raise TypeError(f"{what}: m must be a number, got {m!r}")
-    if not math.isfinite(m) or m < 0:
-        raise ValueError(f"{what}: m must be a finite number >= 0, got {m!r}")
-    return float(m)
+    number: float = _real(value, what)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{what} must be a finite number >= 0, got {value!r}")
+    return number
 
 
 class QuantileEncoder(Transformer):
@@ -2135,15 +2189,16 @@ class QuantileEncoder(Transformer):
         Raises:
             TypeError: If target, columns, quantile, or m has the wrong type.
             ValueError: If columns is empty or holds the target, quantile is
-                outside [0, 1], m is negative or not finite, or a handling
-                option is not one of the accepted values.
+                outside [0, 1], m is negative or not finite, quantile or m is
+                outside the range of f64, or a handling option is not one of
+                the accepted values.
 
         """
         self.target: str = _target(target, "QuantileEncoder")
         self.columns: list[str] | None = _optional_columns(columns, "QuantileEncoder")
         _target_outside(self.target, self.columns, "QuantileEncoder")
         self.quantile: float = _quantile(quantile, "QuantileEncoder", "quantile")
-        self.m: float = _smoothing(m, "QuantileEncoder")
+        self.m: float = _smoothing(m, "QuantileEncoder: m")
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, "QuantileEncoder", "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, "QuantileEncoder", "handle_missing")
 
@@ -2233,8 +2288,9 @@ class SummaryEncoder(Transformer):
                 or quantiles is empty.
             ValueError: If columns is empty or holds the target, quantiles
                 holds a value outside [0, 1] or two that round to the same
-                percentile, m is negative or not finite, or a handling option
-                is not one of the accepted values.
+                percentile, m is negative or not finite, a quantile or m is
+                outside the range of f64, or a handling option is not one of
+                the accepted values.
 
         """
         self.target: str = _target(target, "SummaryEncoder")
@@ -2246,7 +2302,7 @@ class SummaryEncoder(Transformer):
         percentiles: list[int] = [round(value * 100) for value in self.quantiles]
         if len(set(percentiles)) != len(percentiles):
             raise ValueError(f"SummaryEncoder: two quantiles round to the same percentile, got {self.quantiles!r}")
-        self.m: float = _smoothing(m, "SummaryEncoder")
+        self.m: float = _smoothing(m, "SummaryEncoder: m")
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, "SummaryEncoder", "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, "SummaryEncoder", "handle_missing")
 
@@ -2324,15 +2380,14 @@ def _finite(value: object, what: str, key: str) -> float:
         The value as a float.
 
     Raises:
-        TypeError: If the value is not a number.
-        ValueError: If the value is not finite.
+        TypeError: If the value is a bool or not a number.
+        ValueError: If the value is not finite or outside the range of f64.
 
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{what}: {key} must be a number, got {value!r}")
-    if not math.isfinite(value):
+    number: float = _real(value, f"{what}: {key}")
+    if not math.isfinite(number):
         raise ValueError(f"{what}: {key} must be a finite number, got {value!r}")
-    return float(value)
+    return number
 
 
 class _Scaler(Transformer):
@@ -2505,8 +2560,9 @@ class MinMaxScaler(_Scaler):
         Raises:
             TypeError: If columns is a bare string, feature_range is not a
                 pair of numbers, or clip is not a bool.
-            ValueError: If columns is empty, or feature_range is not two
-                finite numbers with the first below the second.
+            ValueError: If columns is empty, feature_range is not two finite
+                numbers with the first below the second, or a bound is
+                outside the range of f64.
 
         """
         super().__init__(columns)
@@ -2659,7 +2715,8 @@ class Binarizer(Transformer):
 
         Raises:
             TypeError: If columns is a bare string or threshold is not a number.
-            ValueError: If columns is empty or threshold is not finite.
+            ValueError: If columns is empty, or threshold is not finite or is
+                outside the range of f64.
 
         """
         self.columns: list[str] = _column_list(columns, "Binarizer")
@@ -2756,19 +2813,17 @@ def _percentile_range(value: object, what: str) -> tuple[float, float]:
 
     Raises:
         TypeError: If the value is not a pair of numbers.
-        ValueError: If the pair is not ``0 <= q_min <= q_max <= 100``.
+        ValueError: If the pair is not ``0 <= q_min <= q_max <= 100``, or a
+            bound is outside the range of f64.
 
     """
     if isinstance(value, str) or not isinstance(value, (list, tuple)) or len(value) != 2:
         raise TypeError(f"{what}: quantile_range must be two percentiles, got {value!r}")
-    bounds: list[float] = []
-    for bound in value:
-        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
-            raise TypeError(f"{what}: quantile_range must be two percentiles, got {value!r}")
-        bounds.append(float(bound))
-    if not 0.0 <= bounds[0] <= bounds[1] <= 100.0:
+    low: float = _real(value[0], f"{what}: quantile_range")
+    high: float = _real(value[1], f"{what}: quantile_range")
+    if not 0.0 <= low <= high <= 100.0:
         raise ValueError(f"{what}: quantile_range must satisfy 0 <= q_min <= q_max <= 100, got {value!r}")
-    return bounds[0], bounds[1]
+    return low, high
 
 
 class RobustScaler(Transformer):
@@ -2825,8 +2880,9 @@ class RobustScaler(Transformer):
         Raises:
             TypeError: If columns, a flag, or a quantile bound has the wrong type.
             ValueError: If columns is empty, the quantile range is not two
-                ordered percentiles, or unit_variance is set and the range is
-                not ``0 < q_min < q_max < 100`` or ``q_min / 100`` rounds to 0.
+                ordered percentiles, a bound is outside the range of f64, or
+                unit_variance is set and the range is not
+                ``0 < q_min < q_max < 100`` or ``q_min / 100`` rounds to 0.
 
         """
         self.columns: list[str] | None = _optional_columns(columns, "RobustScaler")

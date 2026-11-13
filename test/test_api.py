@@ -1,11 +1,15 @@
 """Tests for the Python API surface: validation, nesting rules, pickling, and ergonomics."""
 
 import copy
+import decimal
 import enum
+import fractions
 import importlib.metadata
 import inspect
 import json
+import math
 import pickle
+import re
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -22,6 +26,8 @@ import pytest
 
 import fast_feature_transform
 from fast_feature_transform import (
+    BaseNEncoder,
+    Binarizer,
     BinaryEncoder,
     Cast,
     CatBoostEncoder,
@@ -33,13 +39,17 @@ from fast_feature_transform import (
     JamesSteinEncoder,
     KBinsDiscretizer,
     LabelEncoder,
+    MEstimateEncoder,
+    MinMaxScaler,
     Normalizer,
     OneHotEncoder,
     OrdinalEncoder,
     Pipeline,
+    PolynomialFeatures,
     PowerTransformer,
     QuantileEncoder,
     QuantileTransformer,
+    RobustScaler,
     Select,
     SplineTransformer,
     StandardScaler,
@@ -389,6 +399,226 @@ def test_an_encoder_whose_option_is_an_enum_fits_like_one_given_the_string(tmp_p
         plain.fit([source])
         for record in ({"c": "a", "y": 0.0}, {"c": "never seen", "y": 0.0}):
             assert repr(given.transform_dict(dict(record))) == repr(plain.transform_dict(dict(record)))
+
+
+# Where an option holds the value a test varies: alone, or as one member of
+# the pair or list the option takes.
+_PLACES: dict[str, Callable[[Any], Any]] = {
+    "v": lambda value: value,
+    "(1, v)": lambda value: (1, value),
+    "[v]": lambda value: [value],
+    "(v, 9)": lambda value: (value, 9),
+    "(v, 90)": lambda value: (value, 90),
+}
+
+# Every number option of every transformer: the arguments the transformer
+# needs besides it, where the value goes, what the option takes ("integer",
+# "number", or "count or share", where an integer is a count and any other
+# number a share), and a whole number it accepts.
+_NUMBER_OPTIONS: list[tuple[type[Transformer], dict[str, Any], str, str, str, int]] = [
+    (LabelEncoder, {}, "min_count", "v", "integer", 2),
+    (OrdinalEncoder, {}, "index_start", "v", "integer", 2),
+    (BaseNEncoder, {}, "base", "v", "integer", 2),
+    (HashingEncoder, {"columns": ["c"]}, "n_components", "v", "integer", 2),
+    (TargetEncoder, {"target": "y"}, "min_samples_leaf", "v", "integer", 2),
+    (QuantileTransformer, {}, "n_quantiles", "v", "integer", 2),
+    (KBinsDiscretizer, {}, "n_bins", "v", "integer", 2),
+    (PolynomialFeatures, {"columns": ["x"]}, "degree", "v", "integer", 2),
+    (PolynomialFeatures, {"columns": ["x"]}, "degree", "(1, v)", "integer", 2),
+    (SplineTransformer, {"columns": ["x"]}, "n_knots", "v", "integer", 5),
+    (SplineTransformer, {"columns": ["x"]}, "degree", "v", "integer", 2),
+    (CountEncoder, {}, "handle_unknown", "v", "integer", 2),
+    (CountEncoder, {}, "min_group_size", "v", "count or share", 2),
+    (TargetEncoder, {"target": "y"}, "smoothing", "v", "number", 2),
+    (WOEEncoder, {"target": "y"}, "regularization", "v", "number", 2),
+    (MEstimateEncoder, {"target": "y"}, "m", "v", "number", 2),
+    (CatBoostEncoder, {"target": "y"}, "a", "v", "number", 2),
+    (QuantileEncoder, {"target": "y"}, "quantile", "v", "number", 1),
+    (QuantileEncoder, {"target": "y"}, "m", "v", "number", 2),
+    (SummaryEncoder, {"target": "y"}, "quantiles", "[v]", "number", 1),
+    (SummaryEncoder, {"target": "y"}, "m", "v", "number", 2),
+    (MinMaxScaler, {}, "feature_range", "(v, 9)", "number", 2),
+    (Binarizer, {"columns": ["x"]}, "threshold", "v", "number", 2),
+    (RobustScaler, {}, "quantile_range", "(v, 90)", "number", 20),
+]
+_NUMBER_OPTION_IDS: list[str] = [
+    f"{transformer.__name__}-{option}-{place}" for transformer, _, option, place, _, _ in _NUMBER_OPTIONS
+]
+
+# Each makes, from a whole number, an integer of one kind: an int, every
+# numpy integer type, an IntEnum member, and a numpy integer array of no
+# dimensions, which operator.index reads as an int.
+_INTEGER_KINDS: list[Callable[[int], Any]] = [
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    lambda whole: enum.IntEnum("Whole", {"N": whole}).N,
+    np.array,
+]
+# Each makes, from a whole number, a number that is not an integer.
+_FLOAT_KINDS: list[Callable[[int], Any]] = [float, np.float16, np.float32, np.float64, fractions.Fraction]
+# Each makes, from a whole number, a value that is not a number. numpy
+# registers timedelta64 as a numbers.Integral, and float() reads one in
+# nanoseconds as its count and refuses one in seconds.
+_NOT_NUMBERS: list[Callable[[int], Any]] = [
+    lambda whole: whole > 0,
+    lambda whole: np.bool_(whole > 0),
+    decimal.Decimal,
+    str,
+    complex,
+    lambda whole: np.array(float(whole)),
+    lambda whole: np.timedelta64(whole, "ns"),
+    lambda whole: np.timedelta64(whole, "s"),
+]
+
+
+def _types(value: Any) -> Any:
+    """Name the type of a value and, inside dicts, lists and tuples, of every member.
+
+    Args:
+        value: The value to describe.
+
+    Returns:
+        The type names, nested as the value is.
+
+    """
+    if isinstance(value, dict):
+        return {key: _types(member) for key, member in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [type(value).__name__, *(_types(member) for member in value)]
+    return type(value).__name__
+
+
+@pytest.mark.parametrize(
+    ("transformer", "arguments", "option", "place", "takes", "whole"), _NUMBER_OPTIONS, ids=_NUMBER_OPTION_IDS
+)
+def test_a_number_option_takes_numpy_numbers_and_stores_a_plain_int_or_float(
+    transformer: type[Transformer], arguments: dict[str, Any], option: str, place: str, takes: str, whole: int
+) -> None:
+    # REGRESSION: every number option takes an integer of any kind, numpy's
+    # included, and every option that takes a fraction takes a number of any
+    # kind, and each stores a plain int or float. CountEncoder refused numpy
+    # integers, the other options that take a fraction refused numpy integers
+    # and numpy floats other than float64, each with a message that said the
+    # value is not a number or not an integer, and CountEncoder kept an
+    # IntEnum member or a numpy float64 as given, which params() and repr
+    # then showed.
+    def build(value: Any) -> Transformer:
+        return transformer(**arguments, **{option: _PLACES[place](value)})
+
+    if (transformer, option) == (CountEncoder, "handle_unknown"):
+        refusal: tuple[type[Exception], str] = (
+            ValueError,
+            "must be an integer or one of ['error', 'return_nan', 'value']",
+        )
+    else:
+        refusal = (TypeError, "must be an integer" if takes == "integer" else "must be a number")
+    for make in _INTEGER_KINDS:
+        plain: Transformer = build(float(whole) if takes == "number" else whole)
+        given: Transformer = build(make(whole))
+        assert given.params() == plain.params(), make
+        assert _types(given.params()) == _types(plain.params()), make
+        assert repr(given) == repr(plain)
+        assert json.dumps(given.params()) == json.dumps(plain.params())
+    for make in _FLOAT_KINDS:
+        value: Any = make(whole)
+        if takes == "integer":
+            message: str = f"{transformer.__name__}: {option} {refusal[1]}, got {value!r}"
+            with pytest.raises(refusal[0], match=f"^{re.escape(message)}$"):
+                build(value)
+            continue
+        plain = build(float(whole))
+        given = build(value)
+        assert given.params() == plain.params(), make
+        assert _types(given.params()) == _types(plain.params()), make
+        assert repr(given) == repr(plain)
+    for make in _NOT_NUMBERS:
+        value = make(whole)
+        message = f"{transformer.__name__}: {option} {refusal[1]}, got {value!r}"
+        with pytest.raises(refusal[0], match=f"^{re.escape(message)}$"):
+            build(value)
+
+
+@pytest.mark.parametrize(
+    ("transformer", "arguments", "option", "place", "takes", "whole"), _NUMBER_OPTIONS, ids=_NUMBER_OPTION_IDS
+)
+def test_a_number_option_refuses_a_value_it_cannot_hold_with_a_message_true_for_the_value(
+    transformer: type[Transformer], arguments: dict[str, Any], option: str, place: str, takes: str, whole: int
+) -> None:
+    # REGRESSION: a number whose nearest f64 is infinite or 0 though the
+    # number is neither is a ValueError that says it is outside the range of
+    # f64. 10**400 raised OverflowError for every "number" option other than
+    # a quantile.
+    def build(value: Any) -> Transformer:
+        return transformer(**arguments, **{option: _PLACES[place](value)})
+
+    name: str = f"{transformer.__name__}: {option}"
+    # The whole number is accepted, so each refusal below comes from the value.
+    build(whole)
+    if takes != "number":
+        # The kernels read an integer as an int64.
+        for value in (2**63, -(2**63) - 1, np.uint64(2**63), 10**400, -(10**400)):
+            message: str = f"{name} must be an integer from -2**63 to 2**63 - 1, got {value!r}"
+            with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+                build(value)
+    if takes == "integer":
+        return
+    outside: list[Any] = [fractions.Fraction(10**400), fractions.Fraction(1, 10**400), fractions.Fraction(-1, 10**400)]
+    if takes == "number":
+        outside += [10**400, -(10**400)]
+    for value in outside:
+        with pytest.raises(ValueError, match=f"^{re.escape(f'{name} is outside the range of f64, got {value!r}')}$"):
+            build(value)
+    # A value that is not finite gets the option's own message, which names it.
+    for value in (math.nan, math.inf, -math.inf, np.float32("nan"), np.float64("inf")):
+        with pytest.raises(ValueError, match=f"^{re.escape(name)} must ") as refused:
+            build(value)
+        text: str = str(refused.value)
+        assert text.endswith((f"got {value!r}", f"got {_PLACES[place](value)!r}")), text
+
+
+def test_a_number_is_read_as_its_nearest_f64_and_refused_only_where_that_is_infinite_or_0() -> None:
+    largest: float = float.fromhex("0x1.fffffffffffffp+1023")
+    smallest: float = float.fromhex("0x0.0000000000001p-1022")
+    # The numbers halfway between the largest f64 and 2**1024, and between 0
+    # and the smallest f64, round to even: to infinity and to 0.
+    halfway_up: int = 2**1024 - 2**970
+    halfway_down: fractions.Fraction = fractions.Fraction(1, 2**1075)
+    assert fractions.Fraction(largest) + fractions.Fraction(2**970) == halfway_up
+    assert fractions.Fraction(smallest) / 2 == halfway_down
+    beyond: fractions.Fraction = fractions.Fraction(1, 2**1200)
+    held: list[tuple[Any, float]] = [
+        (halfway_up - 1, largest),
+        (-(halfway_up - 1), -largest),
+        (halfway_down + beyond, smallest),
+        (-halfway_down - beyond, -smallest),
+        (fractions.Fraction(0), 0.0),
+    ]
+    for value, nearest in held:
+        threshold: float = Binarizer(columns=["x"], threshold=value).threshold
+        assert type(threshold) is float
+        assert threshold == nearest
+    outside: list[Any] = [halfway_up, -halfway_up, halfway_down, -halfway_down]
+    for value in outside:
+        message: str = f"Binarizer: threshold is outside the range of f64, got {value!r}"
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            Binarizer(columns=["x"], threshold=value)
+
+
+def test_the_number_option_table_names_every_number_option_of_every_transformer() -> None:
+    named: set[tuple[type[Transformer], str]] = {
+        (transformer, parameter.name)
+        for transformer in _TRANSFORMERS
+        for parameter in inspect.signature(transformer).parameters.values()
+        if "int" in str(parameter.annotation) or "float" in str(parameter.annotation)
+    }
+    assert named == {(transformer, option) for transformer, _, option, _, _, _ in _NUMBER_OPTIONS}
 
 
 def _subclassed_strings(value: Any) -> list[Any]:
@@ -896,6 +1126,46 @@ def test_numpy_integers_are_accepted_for_counts_and_threads(train_files: list[st
     encoder: LabelEncoder = LabelEncoder(columns=["device"], min_count=count).fit(train_files, threads=threads)
     assert encoder.min_count == 2
     assert encoder.label_maps_["device"] == {"mob": 1}
+
+
+def test_number_options_given_as_numpy_numbers_fit_and_answer_like_plain_ones(train_files: list[str]) -> None:
+    count: Any = np.int64(2)
+    fill: Any = np.int8(-1)
+    share: Any = np.float32(0.5)
+    leaf: Any = np.uint8(1)
+    smoothing: Any = np.float16(0.5)
+    feature_range: Any = (np.int64(-1), np.float32(2))
+    pairs: list[tuple[Transformer, Transformer]] = [
+        (
+            CountEncoder(columns=["device"], min_group_size=count, handle_unknown=fill),
+            CountEncoder(columns=["device"], min_group_size=2, handle_unknown=-1),
+        ),
+        (
+            CountEncoder(columns=["device"], min_group_size=share),
+            CountEncoder(columns=["device"], min_group_size=0.5),
+        ),
+        (
+            TargetEncoder(target="price", columns=["device"], min_samples_leaf=leaf, smoothing=smoothing),
+            TargetEncoder(target="price", columns=["device"], min_samples_leaf=1, smoothing=0.5),
+        ),
+        (
+            MinMaxScaler(columns=["price"], feature_range=feature_range),
+            MinMaxScaler(columns=["price"], feature_range=(-1.0, 2.0)),
+        ),
+    ]
+    records: list[dict[str, Any]] = [{"device": "tab", "price": 2.0}, {"device": "never seen", "price": 9.0}]
+    answers: list[list[dict[str, Any]]] = []
+    for given, plain in pairs:
+        given.fit(train_files)
+        plain.fit(train_files)
+        assert json.dumps(given.params()) == json.dumps(plain.params())
+        answers.append([given.transform_dict(dict(record)) for record in records])
+        assert repr(answers[-1]) == repr([plain.transform_dict(dict(record)) for record in records])
+    # The count 2 and the share 0.5 of the four rows are the same threshold,
+    # so desk and tab, seen once each, fold into one group of 2. An unseen
+    # category gets the fill -1, or 0 by default.
+    assert [answer["device"] for answer in answers[0]] == [2, -1]
+    assert [answer["device"] for answer in answers[1]] == [2, 0]
 
 
 def test_fitted_state_is_read_once_per_binding(train_files: list[str]) -> None:
