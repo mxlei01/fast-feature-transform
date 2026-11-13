@@ -170,6 +170,27 @@ def _fit_engine(threads: int, temp_dir: str | Path | None) -> _core.Engine:
     return _core.Engine(_check_threads(threads), directory)
 
 
+def _target(target: object, what: str) -> str:
+    """Validate a supervised encoder's target column name.
+
+    Args:
+        target: The value passed for a ``target`` argument.
+        what: The transformer name, for the error message.
+
+    Returns:
+        The target column name, as a plain ``str``.
+
+    Raises:
+        TypeError: If target is not a non-empty string.
+
+    """
+    if not isinstance(target, str) or not target:
+        raise TypeError(f"{what}: target must be a column name, got {target!r}")
+    # A name given as a str subclass is stored as the plain string it equals,
+    # as _column_list stores a column name.
+    return str.__str__(target)
+
+
 def _target_outside(target: str, columns: list[str] | None, what: str) -> None:
     """Refuse a target that is also one of the columns to encode.
 
@@ -194,7 +215,7 @@ def _column_list(columns: object, what: str) -> list[str]:
         what: The transformer name, for the error message.
 
     Returns:
-        The column names as a list.
+        The column names as a new list of plain ``str``.
 
     Raises:
         TypeError: If columns is a bare string or holds non-strings.
@@ -203,11 +224,20 @@ def _column_list(columns: object, what: str) -> list[str]:
     """
     if isinstance(columns, str):
         raise TypeError(f"{what}: columns must be a list of column names, not a single string")
-    if not isinstance(columns, (list, tuple)) or not all(isinstance(column, str) for column in columns):
+    if not isinstance(columns, (list, tuple)):
         raise TypeError(f"{what}: columns must be a list of column names, got {columns!r}")
-    if not columns:
+    try:
+        # str.__str__ refuses anything but a str and returns a plain str
+        # unchanged. A str subclass, such as an Enum with a str mixin, comes
+        # back as the plain string it equals, which output_columns formats and
+        # a pickle stores; the member formats as "ClassName.MEMBER" and
+        # pickles as a reference to its class.
+        names: list[str] = list(map(str.__str__, columns))
+    except TypeError:
+        raise TypeError(f"{what}: columns must be a list of column names, got {columns!r}") from None
+    if not names:
         raise ValueError(f"{what}: columns must name at least one column")
-    return list(columns)
+    return names
 
 
 def _optional_columns(columns: object, what: str) -> list[str] | None:
@@ -671,16 +701,23 @@ class Cast(Transformer):
         """
         if not isinstance(types, dict) or not types:
             raise TypeError("Cast: types must be a non-empty mapping of column name to type tag")
+        plain: bool = True
         for column, tag in types.items():
-            if not isinstance(column, str) or not isinstance(tag, str):
-                raise TypeError(f"Cast: types must map column names to type tags, got {column!r}: {tag!r}")
+            if type(column) is not str or type(tag) is not str:
+                if not isinstance(column, str) or not isinstance(tag, str):
+                    raise TypeError(f"Cast: types must map column names to type tags, got {column!r}: {tag!r}")
+                plain = False
             if tag not in TYPE_TAGS:
                 raise ValueError(
                     f"Cast: unsupported type {tag!r} for column {column!r}; choose one of {sorted(TYPE_TAGS)}"
                 )
-        # A tag given as a str subclass, such as an Enum with a str mixin, is
-        # stored as the plain string it equals, as _one_of stores an option.
-        self.types: dict[str, str] = {column: str.__str__(tag) for column, tag in types.items()}
+        # A name or tag given as a str subclass, such as an Enum with a str
+        # mixin, is stored as the plain string it equals, as _column_list
+        # stores a name and _one_of an option. A mapping of plain strings is
+        # copied whole rather than pair by pair, which costs a call per pair.
+        self.types: dict[str, str] = (
+            dict(types) if plain else {str.__str__(column): str.__str__(tag) for column, tag in types.items()}
+        )
 
     @override
     def params(self) -> dict[str, Any]:
@@ -771,8 +808,10 @@ class GroupAgg(Transformer):
                     )
             if len(set(names)) != len(names):
                 raise ValueError(f"GroupAgg: column {column!r} lists an aggregate more than once")
-            validated[column] = [str.__str__(name) for name in names]
-        self.key: str = key
+            # A name or aggregate given as a str subclass, such as an Enum
+            # with a str mixin, is stored as the plain string it equals.
+            validated[str.__str__(column)] = [str.__str__(name) for name in names]
+        self.key: str = str.__str__(key)
         self.aggs: dict[str, list[str]] = validated
 
     @override
@@ -905,7 +944,7 @@ class CountEncoder(Transformer):
             raise ValueError("CountEncoder: combine_min_nan_groups='force' needs handle_missing 'value' or 'error'")
         self.normalize: bool = normalize
         self.min_group_size: float | None = min_group_size
-        self.min_group_name: str | None = min_group_name
+        self.min_group_name: str | None = None if min_group_name is None else str.__str__(min_group_name)
         self.combine_min_nan_groups: bool | str = (
             combine_min_nan_groups if isinstance(combine_min_nan_groups, bool) else "force"
         )
@@ -1490,11 +1529,9 @@ class _TargetBlend(Transformer):
 
         """
         what: str = type(self).__name__
-        if not isinstance(target, str) or not target:
-            raise TypeError(f"{what}: target must be a column name, got {target!r}")
+        self.target: str = _target(target, what)
         self.columns: list[str] | None = _optional_columns(columns, what)
-        _target_outside(target, self.columns, what)
-        self.target: str = target
+        _target_outside(self.target, self.columns, what)
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
@@ -1783,10 +1820,8 @@ class _ShrinkageEncoder(Transformer):
         """
         what: str = type(self).__name__
         self.columns: list[str] | None = _optional_columns(columns, what)
-        if not isinstance(target, str) or not target:
-            raise TypeError(f"{what}: target must be a column name, got {target!r}")
-        _target_outside(target, self.columns, what)
-        self.target: str = target
+        self.target: str = _target(target, what)
+        _target_outside(self.target, self.columns, what)
         self.handle_unknown: str = _one_of(handle_unknown, _HANDLE_UNKNOWN, what, "handle_unknown")
         self.handle_missing: str = _one_of(handle_missing, _HANDLE_MISSING, what, "handle_missing")
 
@@ -2000,25 +2035,6 @@ class CatBoostEncoder(_ShrinkageEncoder):
     @override
     def params(self) -> dict[str, Any]:
         return {**super().params(), "a": self.a}
-
-
-def _target(target: object, what: str) -> str:
-    """Validate a supervised encoder's target column name.
-
-    Args:
-        target: The value passed for a ``target`` argument.
-        what: The transformer name, for the error message.
-
-    Returns:
-        The target column name.
-
-    Raises:
-        TypeError: If target is not a non-empty string.
-
-    """
-    if not isinstance(target, str) or not target:
-        raise TypeError(f"{what}: target must be a column name, got {target!r}")
-    return target
 
 
 def _quantile(quantile: object, what: str, key: str) -> float:

@@ -3,6 +3,7 @@
 import copy
 import enum
 import importlib.metadata
+import inspect
 import json
 import pickle
 import subprocess  # nosec B404
@@ -41,6 +42,7 @@ from fast_feature_transform import (
     QuantileTransformer,
     Select,
     SplineTransformer,
+    StandardScaler,
     SummaryEncoder,
     TargetEncoder,
     Transformer,
@@ -49,6 +51,7 @@ from fast_feature_transform import (
     parquet_to_memmap,
 )
 from fast_feature_transform.transformers import _output_directory
+from helpers import NAME_KIND_IDS, NAME_KINDS
 
 # LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
 MOB_INDEX: int = 2
@@ -386,6 +389,213 @@ def test_an_encoder_whose_option_is_an_enum_fits_like_one_given_the_string(tmp_p
         plain.fit([source])
         for record in ({"c": "a", "y": 0.0}, {"c": "never seen", "y": 0.0}):
             assert repr(given.transform_dict(dict(record))) == repr(plain.transform_dict(dict(record)))
+
+
+def _subclassed_strings(value: Any) -> list[Any]:
+    """Find the strings whose type is a subclass of str in nested dicts, lists and tuples.
+
+    Args:
+        value: The value to search, dict keys included.
+
+    Returns:
+        Every such string, in the order found.
+
+    """
+    if isinstance(value, str):
+        return [] if type(value) is str else [value]
+    if isinstance(value, dict):
+        return [found for pair in value.items() for found in _subclassed_strings(pair)]
+    if isinstance(value, (list, tuple)):
+        return [found for item in value for found in _subclassed_strings(item)]
+    return []
+
+
+# Every transformer class the package exports.
+_TRANSFORMERS: list[type[Transformer]] = sorted(
+    (
+        each
+        for each in vars(fast_feature_transform).values()
+        if isinstance(each, type) and issubclass(each, Transformer) and each is not Transformer
+    ),
+    key=lambda each: each.__name__,
+)
+
+
+def _named_arguments(transformer: type[Transformer], name: Callable[[str], Any]) -> dict[str, Any]:
+    """Build constructor arguments that pass a transformer every kind of name it takes.
+
+    Args:
+        transformer: The transformer class.
+        name: Makes each name from its value.
+
+    Returns:
+        The arguments.
+
+    """
+    if transformer is Cast:
+        return {"types": {name("price"): "f32", name("device"): "utf8"}}
+    if transformer is GroupAgg:
+        return {"key": name("device"), "aggs": {name("price"): ["mean", "max"], name("source"): ["count"]}}
+    arguments: dict[str, Any] = {"columns": [name("device"), name("source")]}
+    parameters = inspect.signature(transformer).parameters
+    if "target" in parameters:
+        arguments["target"] = name("price")
+    if "min_group_name" in parameters:
+        arguments["min_group_name"] = name("rare")
+    return arguments
+
+
+@pytest.mark.parametrize("name", NAME_KINDS, ids=NAME_KIND_IDS)
+def test_every_name_a_transformer_takes_is_stored_as_the_plain_string(name: Callable[[str], Any]) -> None:
+    # REGRESSION: a column name, a target, the GroupAgg key, min_group_name
+    # and the keys of Cast and GroupAgg given as a str subclass are stored as
+    # the plain strings they equal. They used to be kept as given, so repr
+    # and params() showed an Enum member, and a pickle loaded only where the
+    # caller's class could be imported.
+    for transformer in _TRANSFORMERS:
+        given: Transformer = transformer(**_named_arguments(transformer, name))
+        plain: Transformer = transformer(**_named_arguments(transformer, str))
+        assert _subclassed_strings(vars(given)) == [], transformer.__name__
+        assert repr(given) == repr(plain)
+
+
+def _named_pipeline(name: Callable[[str], Any]) -> Pipeline:
+    """Build a pipeline nested three deep whose step names ``name`` makes.
+
+    Args:
+        name: Makes each step name from its value.
+
+    Returns:
+        The unfitted pipeline.
+
+    """
+    inner: Pipeline = Pipeline([(name("label"), LabelEncoder(columns=["device"]))])
+    outer: Pipeline = Pipeline([(name("inner"), inner), (name("scale"), StandardScaler(columns=["price"]))])
+    return Pipeline([(name("outer"), outer), (name("target"), TargetEncoder(target="price", columns=["source"]))])
+
+
+def _fitted_attributes(pipeline: Pipeline, prefix: str = "") -> dict[str, Any]:
+    """Read every fitted attribute of every transformer in a pipeline.
+
+    Args:
+        pipeline: A fitted pipeline.
+        prefix: The dotted step names above this pipeline.
+
+    Returns:
+        Each attribute's value, by dotted step name and attribute name.
+
+    """
+    found: dict[str, Any] = {}
+    for step_name, step in pipeline.steps:
+        if isinstance(step, Pipeline):
+            found.update(_fitted_attributes(step, f"{prefix}{step_name}."))
+            continue
+        for attribute in dir(type(step)):
+            if attribute.endswith("_") and isinstance(getattr(type(step), attribute), property):
+                found[f"{prefix}{step_name}.{attribute}"] = getattr(step, attribute)
+    assert [type(step_name) for step_name, _ in pipeline.steps] == [str] * len(pipeline)
+    return found
+
+
+@pytest.mark.parametrize("name", NAME_KINDS, ids=NAME_KIND_IDS)
+def test_a_step_name_given_as_a_str_subclass_is_stored_as_the_plain_string(
+    name: Callable[[str], Any], train_files: list[str]
+) -> None:
+    # REGRESSION: a step name given as a str subclass is stored as the plain
+    # string it equals. A nested step's stage name is built by formatting the
+    # step names, and an Enum with a str mixin formats as "EnumName.outer",
+    # so every fitted attribute of a nested step raised EngineError "no stage
+    # named 'EnumName.outer.EnumName.inner.EnumName.label' in this pipeline".
+    plain: Pipeline = _named_pipeline(str).fit(train_files)
+    expected: dict[str, Any] = _fitted_attributes(plain)
+    assert list(expected) == [
+        "outer.inner.label.label_maps_",
+        "outer.scale.mean_",
+        "outer.scale.n_samples_seen_",
+        "outer.scale.scale_",
+        "outer.scale.var_",
+        "target.null_values_",
+        "target.prior_",
+        "target.values_",
+    ]
+    given: Pipeline = _named_pipeline(name).fit(train_files)
+    assert given.stages_json() == plain.stages_json()
+    for pipeline in (given, pickle.loads(pickle.dumps(given))):
+        assert _fitted_attributes(pipeline) == expected
+        assert repr(pipeline) == repr(plain)
+        outer = pipeline[name("outer")]
+        assert isinstance(outer, Pipeline)
+        inner = outer[name("inner")]
+        assert isinstance(inner, Pipeline)
+        encoder = inner[name("label")]
+        assert isinstance(encoder, LabelEncoder)
+        assert encoder.vocab_size("device") == len(expected["outer.inner.label.label_maps_"]["device"]) + 1
+        with pytest.raises(RuntimeError, match=r"^Pipeline 'outer' is a step of a larger pipeline"):
+            outer.stages_json()
+        with pytest.raises(RuntimeError, match=r"^Pipeline 'outer\.inner' is a step of a larger pipeline"):
+            inner.stages_json()
+    # An error that shows a step name shows the plain string.
+    with pytest.raises(ValueError, match=r"^duplicate step name 'label'$"):
+        Pipeline([("label", Select(columns=["device"])), (name("label"), Select(columns=["device"]))])
+    with pytest.raises(ValueError, match=r"^invalid step name 'a\.b'"):
+        Pipeline([(name("a.b"), Select(columns=["device"]))])
+    a_class: Any = Select
+    with pytest.raises(TypeError, match=r"^step 'label' must be a Transformer or Pipeline instance"):
+        Pipeline([(name("label"), a_class)])
+
+
+# Loads each pickled case in an interpreter that cannot import the modules
+# named after the file of cases, and prints what each loaded object answers.
+_LOAD_IN_A_CHILD: str = """
+import importlib.util
+import json
+import pickle
+import sys
+
+assert [importlib.util.find_spec(module) for module in sys.argv[2:]] == [None] * len(sys.argv[2:])
+answers = []
+with open(sys.argv[1], "rb") as cases:
+    for payload, record in pickle.load(cases):
+        try:
+            loaded = pickle.loads(payload)
+        except Exception as error:
+            answers.append([type(error).__name__, str(error)])
+            continue
+        answers.append([repr(loaded), None if record is None else repr(loaded.transform_dict(record))])
+print(json.dumps(answers))
+"""
+
+
+def test_a_pickle_of_names_given_as_str_subclasses_loads_where_their_class_is_not_defined(
+    train_files: list[str], tmp_path: Path
+) -> None:
+    # REGRESSION: a pickle of a transformer or pipeline given its names as a
+    # str subclass holds only plain strings. It used to hold the subclass, so
+    # it loaded only in an interpreter that could import the caller's class.
+    record: dict[str, Any] = {"device": "desk", "source": "a", "price": 1.0}
+    cases: list[tuple[bytes, dict[str, Any] | None]] = []
+    expected: list[list[str | None]] = []
+    fitted: list[Callable[[Callable[[str], Any]], Transformer | Pipeline]] = [
+        _named_pipeline,
+        lambda name: TargetEncoder(target=name("price"), columns=[name("source")]),
+        lambda name: GroupAgg(key=name("device"), aggs={name("price"): ["mean"]}),
+        lambda name: CountEncoder(columns=[name("device")], min_group_size=2, min_group_name=name("rare")),
+        lambda name: Cast({name("price"): "f32"}),
+    ]
+    for name in NAME_KINDS:
+        for transformer in _TRANSFORMERS:
+            cases.append((pickle.dumps(transformer(**_named_arguments(transformer, name))), None))
+            expected.append([repr(transformer(**_named_arguments(transformer, str))), None])
+        for make in fitted:
+            cases.append((pickle.dumps(make(name).fit(train_files)), record))
+            plain: Transformer | Pipeline = make(str).fit(train_files)
+            expected.append([repr(plain), repr(plain.transform_dict(record))])
+    path: Path = tmp_path / "cases.pickle"
+    path.write_bytes(pickle.dumps(cases))
+    modules: list[str] = sorted({kind.__module__ for kind in NAME_KINDS})
+    command: list[str] = [sys.executable, "-c", _LOAD_IN_A_CHILD, str(path), *modules]
+    child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path)  # nosec B603
+    assert json.loads(child.stdout) == expected
 
 
 def test_threads_are_validated_and_accepted_everywhere(train_files: list[str], tmp_path: Path) -> None:
