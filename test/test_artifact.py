@@ -1,6 +1,7 @@
 """Tests for artifact integrity: provenance, validation on load, and how engine errors surface."""
 
 import datetime
+import enum
 import importlib.metadata
 import inspect
 import itertools
@@ -8,6 +9,7 @@ import json
 import math
 import pickle
 import re
+import weakref
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -472,6 +474,34 @@ class _OwnEquality(str):
         return type(other) is _OwnEquality and str.__eq__(self, other)
 
 
+class _InheritedHash(_OwnHash):
+    """An _OwnHash subclass that defines no hash: its type takes the hash of _OwnHash, not of str."""
+
+    __slots__ = ()
+
+
+class _Bare(str):
+    """A str subclass that keeps the hash and comparison of str."""
+
+    __slots__ = ()
+
+
+class _Texts(enum.StrEnum):
+    """The key texts of the test below, as StrEnum members."""
+
+    A = "a"
+    ACUTE = "é"
+    DEVICE = "device"
+
+
+class _MixedTexts(str, enum.Enum):
+    """The key texts of the test below, as members of an Enum with a str mixin."""
+
+    A = "a"
+    ACUTE = "é"
+    DEVICE = "device"
+
+
 def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -> None:
     # REGRESSION: a record whose keys hold one text twice is an error that
     # names the text. A step used to read one of the two fields, which one
@@ -479,10 +509,12 @@ def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -
     # step, and the output dict kept the value of the later field.
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
     # Each record holds "device" and then one to three keys, of every text and
-    # kind in every order; one text is not ASCII. A str and a numpy.str_ of
-    # one text are one key of a dict; each of the other kinds is a key of its
-    # own beside a str.
-    kinds: list[type[str]] = [str, np.str_, _OwnHash, _OwnEquality]
+    # kind in every order; one text is not ASCII. A str, a numpy.str_, a
+    # StrEnum member, a member of an Enum with a str mixin and a _Bare of one
+    # text are one key of a dict, since their types use the hash and
+    # comparison of str. An _OwnHash, an _InheritedHash and an _OwnEquality
+    # are each a key of their own beside those.
+    kinds: list[type[str]] = [str, np.str_, _Texts, _MixedTexts, _Bare, _OwnHash, _InheritedHash, _OwnEquality]
     keys: list[str] = [kind(text) for text in ("a", "é", "device") for kind in kinds]
     refused_records: int = 0
     for count in (1, 2, 3):
@@ -501,6 +533,36 @@ def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -
                 pipeline.transform_dict(record)
             assert str(refused.value) in {f"record holds the key '{text}' twice" for text in repeated}, chosen
     assert refused_records > 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0.5,
+        np.int64(1),
+        np.float32(0.5),
+        np.bool_(True),
+        np.array(3),
+        datetime.datetime(2021, 6, 1),  # noqa: DTZ001
+        datetime.datetime(2021, 6, 1, tzinfo=datetime.UTC),
+        datetime.datetime(2021, 6, 1, tzinfo=datetime.timezone(datetime.timedelta(hours=2))),
+    ],
+    ids=["float", "int64", "float32", "numpy_bool", "numpy_array", "datetime", "datetime_utc", "datetime_offset"],
+)
+def test_transform_dict_does_not_check_keys_and_values_that_cannot_repeat_a_key(source: str, value: Any) -> None:
+    # The names are checked only for a key whose type has its own hash or
+    # comparison, or a value whose conversion can run Python code. Records of
+    # StrEnum members, numpy.str_ values, numpy scalars and arrays, and
+    # datetimes whose tzinfo is None or a datetime.timezone do not pay for the
+    # check. A key whose class changes after it is stored breaks the rule for
+    # dict keys: the record then holds one text twice, and the check, which
+    # does not run for such a record, does not see it.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    key: str = _OwnHash("device")
+    record: dict[str, Any] = {"device": "ios", key: "android", "v": value}
+    object.__setattr__(key, "__class__", _Bare)
+    assert [type(each) for each in record] == [str, _Bare, str]
+    assert list(pipeline.transform_dict(record)) == ["device"]
 
 
 def _move_device(record: dict[str, Any], grow: int) -> None:
@@ -563,17 +625,67 @@ class _MovesOnAsm8(datetime.datetime):
         raise AttributeError(name)
 
 
-@pytest.mark.parametrize("mover", ["index", "index_grown", "asm8"])
-def test_transform_dict_refuses_a_record_whose_value_moves_a_key_while_it_is_read(source: str, mover: str) -> None:
+class _MovesOnUtcoffset(datetime.tzinfo):
+    """A tzinfo whose utcoffset moves the key "device" of its record."""
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        """Hold the record to change.
+
+        Args:
+            record: The record whose value holds this tzinfo.
+
+        """
+        self.record: dict[str, Any] = record
+
+    def utcoffset(self, dt: datetime.datetime | None, /) -> datetime.timedelta:
+        """Move the key, then answer.
+
+        Args:
+            dt: The datetime asked about.
+
+        Returns:
+            One hour.
+
+        """
+        _move_device(self.record, 0)
+        return datetime.timedelta(hours=1)
+
+
+@pytest.mark.parametrize(
+    "mover", ["index", "index_grown", "asm8", "weakref_proxy", "named_numpy", "tzinfo", "datetime_data"]
+)
+def test_transform_dict_refuses_a_record_whose_value_moves_a_key_while_it_is_read(
+    source: str, mover: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # REGRESSION: a value whose own code, run while the record is read, takes
     # a key that was read out of the record and stores it again is an error
     # that names the key. The read used to reach the key a second time, at
-    # its new place, and gave the steps a record that held it twice.
+    # its new place, and gave the steps a record that held it twice. The code
+    # is Python code that reading the value reaches: a method of the value's
+    # class, also when the class is named like numpy's int64; the __index__
+    # of the object that a weakref proxy refers to; a tzinfo's utcoffset; and
+    # numpy.datetime_data, which reading a datetime64 calls.
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
     record: dict[str, Any] = {"device": "ios"}
     if mover == "asm8":
         _MovesOnAsm8.record = record
         record["t"] = _MovesOnAsm8(2021, 6, 1)
+    elif mover == "weakref_proxy":
+        referent: _MovesOnIndex = _MovesOnIndex(record, 0)  # alive until the test ends
+        record["n"] = weakref.proxy(referent)
+    elif mover == "named_numpy":
+        record["n"] = type("numpy.int64", (_MovesOnIndex,), {})(record, 0)
+    elif mover == "tzinfo":
+        record["t"] = datetime.datetime(2021, 6, 1, tzinfo=_MovesOnUtcoffset(record))
+    elif mover == "datetime_data":
+        datetime_data: Callable[..., Any] = np.datetime_data
+
+        def moving_datetime_data(dtype: Any) -> Any:
+            _move_device(record, 0)
+            return datetime_data(dtype)
+
+        monkeypatch.setattr(np, "datetime_data", moving_datetime_data)
+        record["t"] = np.datetime64("2021-06-01T00:00", "us")
     else:
         record["n"] = _MovesOnIndex(record, 40 if mover == "index_grown" else 0)
     with pytest.raises(EngineError) as refused:

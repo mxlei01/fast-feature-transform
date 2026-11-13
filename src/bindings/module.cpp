@@ -124,13 +124,19 @@ std::optional<int64_t> numpy_epoch_microseconds(const nb::object& astype, const 
 
 // A record that holds one key twice is an error: a step reads one of the two
 // fields, and the output dict keeps the later one. A dict holds each key
-// once, yet two of its keys can have one text: a str subclass with its own
-// hash or equality beside a str. And code that runs while the record is read
-// can take a key out and store it again past the field being read, where the
-// walk reaches it a second time. So the names are checked only when a key is
-// not an exact str or a value's conversion can run Python code: a record of
-// exact str keys whose values are None, bools, ints, floats or strs,
-// subclasses included, is not checked.
+// once, but it treats two keys of one text as one key only when their hashes
+// are equal and they compare equal. Keys whose types use str's own hash and
+// comparison always do: a str, a StrEnum member, a member of an Enum with a
+// str mixin, a numpy.str_. A key whose type has its own hash or comparison
+// can sit beside a str of its text. And Python code that runs while the
+// record is read can take a key out and store it again past the field being
+// read, where the walk reaches it a second time. So the names are checked
+// only when a key's type has its own hash or comparison, or a value's
+// conversion can run Python code (see converts_without_python). A key whose
+// hash or equality changes while it is in the record, as when its class or
+// its class's __hash__ or __eq__ changes, breaks the rule for dict keys: the
+// walk sees only the type the key has now, so such a key can repeat a text
+// unchecked.
 // Another thread that changes the record while this one waits for a str's
 // lock, on a free-threaded build, can repeat a key too; that race in the
 // caller's code is not checked, since checking it would cost every record
@@ -143,6 +149,31 @@ void refuse_repeated_keys(const Row& row) {
       throw fastfeaturetransform::Error("record holds the key '" + field.first + "' twice");
     }
   }
+}
+
+// Whether row_from_dict reads a value that is not None, a bool, an int, a
+// float or a str without running Python code, so that the value cannot
+// change the record while it is read: an exact datetime whose tzinfo is None
+// or a datetime.timezone, or a value of a numpy type other than datetime64,
+// which numpy's C functions alone convert or refuse. A type is numpy's when
+// its C name starts with "numpy." and it is not a heap type: a class made in
+// Python is a heap type, whatever its name. Any other value counts as one
+// that can run Python code: the methods of a class made in Python, another
+// tzinfo's utcoffset, a static type of another library that calls Python
+// code from its C functions (a weakref proxy calls its referent's
+// __index__), and a datetime64, which converts through numpy.datetime_data
+// and builtins.__import__, both of which Python code can replace.
+// It is kept out of line: inlined into row_from_dict, it made a record of 128
+// str values that are not ASCII, which never reach it, take 5% more time
+// through one Select step (an Apple M4, one thread).
+[[gnu::noinline]] bool converts_without_python(PyObject* value) {
+  if (PyDateTime_CheckExact(value)) {
+    PyObject* const tzinfo = PyDateTime_DATE_GET_TZINFO(value);
+    return tzinfo == Py_None || Py_IS_TYPE(tzinfo, Py_TYPE(PyDateTime_TimeZone_UTC));
+  }
+  PyTypeObject* const type = Py_TYPE(value);
+  const std::string_view name = type->tp_name;
+  return !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) && name.starts_with("numpy.") && name != "numpy.datetime64";
 }
 
 // Record values: str, int, float, bool, None, datetimes (as epoch
@@ -159,7 +190,11 @@ Row row_from_dict(const nb::dict& record) {
     // fields through one Select step took a sixth less time than through
     // nb::try_cast (an Apple M4, one thread).
     if (!PyUnicode_Check(key.ptr())) throw fastfeaturetransform::Error("record keys must be str");
-    if (!PyUnicode_CheckExact(key.ptr())) can_repeat = true;
+    if (const PyTypeObject* const key_type = Py_TYPE(key.ptr());
+        key_type != &PyUnicode_Type &&
+        (key_type->tp_hash != PyUnicode_Type.tp_hash || key_type->tp_richcompare != PyUnicode_Type.tp_richcompare)) {
+      can_repeat = true;
+    }
     // The record lends its keys and values, and its reference can be the
     // only one. Code that runs while a field is read can take the key or the
     // value out of the record and free it: a hook of the value or of its
@@ -201,7 +236,7 @@ Row row_from_dict(const nb::dict& record) {
       row.emplace_back(std::move(name), std::move(text));
     } else {
       held_value = nb::borrow(value);
-      can_repeat = true;
+      if (!converts_without_python(value.ptr())) can_repeat = true;
       const std::string type = python_type_name(value);
       const auto unsupported = [&] {
         return fastfeaturetransform::Error("record value for '" + name +
