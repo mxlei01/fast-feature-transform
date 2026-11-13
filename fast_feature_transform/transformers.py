@@ -257,7 +257,10 @@ def _fit_engine(threads: int, temp_dir: str | Path | None) -> _core.Engine:
     directory: str = ""
     # An empty string has always meant the system temporary directory, as
     # None does, so it is not refused here as an empty output directory is.
-    if temp_dir is not None and temp_dir != "":
+    # Only a str is compared with "", by its text, so a value whose comparison
+    # has no truth value, such as a numpy array, reaches _directory_path and
+    # its TypeError.
+    if temp_dir is not None and not (isinstance(temp_dir, str) and str.__str__(temp_dir) == ""):
         directory = _directory_path(temp_dir, "temp_dir")
         if not os.path.isdir(directory):
             raise ValueError(f"temp_dir must be an existing directory, got {directory!r}")

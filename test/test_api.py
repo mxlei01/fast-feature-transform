@@ -1122,6 +1122,20 @@ def test_an_empty_temp_dir_means_the_system_temporary_directory(train_files: lis
     column: dict[str, Any] = {"device": "tab"}
     alone: dict[str, Any] = LabelEncoder(columns=["device"]).fit(train_files).transform_dict(column)
     assert LabelEncoder(columns=["device"]).fit(train_files, temp_dir="").transform_dict(column) == alone
+    # A str subclass is read by its text, so an empty one means the same.
+    empty: Any = enum.Enum("Empty", {"NAME": ""}, type=str).NAME
+    assert _nested().fit(train_files, temp_dir=empty).transform_dict(record) == expected
+
+
+def test_a_temp_dir_whose_comparison_has_no_truth_value_gets_the_temp_dir_type_error(
+    train_files: list[str], tmp_path: Path
+) -> None:
+    # REGRESSION: only a str is compared with the empty string that means the
+    # system temporary directory. A numpy array of two paths used to raise
+    # numpy's ValueError about an array's truth value, which names no argument.
+    paths: Any = np.array([str(tmp_path), str(tmp_path)])
+    with pytest.raises(TypeError, match="^temp_dir must be a str or os.PathLike, got ndarray$"):
+        _nested().fit(train_files, temp_dir=paths)
 
 
 def test_pipeline_indexing_length_and_repr(train_files: list[str]) -> None:
