@@ -915,6 +915,25 @@ TEST_CASE("power_transform load_state rejects a malformed table") {
       "must be present exactly when standardize is true");
   broken(false, [](nlohmann::json& state) { (void)state; }, "must be present exactly when standardize is true");
   broken(true, [](nlohmann::json& state) { state["means"] = {{"b", 1.0}}; }, "means has no entry for column 'a'");
+  // REGRESSION: both keys are required, as every saved pipeline holds them,
+  // null when the columns were not standardized. Without standardize, a
+  // state that lacked them used to load.
+  for (const bool standardize : {true, false}) {
+    CAPTURE(standardize);
+    for (const char* key : {"means", "scales"}) {
+      CAPTURE(key);
+      broken(
+          standardize,
+          [&](nlohmann::json& state) {
+            if (!standardize) {
+              state["means"] = nullptr;
+              state["scales"] = nullptr;
+            }
+            state.erase(key);
+          },
+          std::string("expand: state must hold a '") + key + "' object or null");
+    }
+  }
 }
 
 // REGRESSION: an expander never writes a value its own readers refuse. a^2 for

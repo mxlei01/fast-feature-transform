@@ -207,8 +207,12 @@ class LabelEncode final : public Kernel {
         seen[static_cast<std::size_t>(index.get<int64_t>())] = true;
         map.emplace(key, index.get<int64_t>());
       }
-      if (state.contains("vocab_sizes") && state.at("vocab_sizes").is_object() &&
-          state.at("vocab_sizes").contains(name) && state.at("vocab_sizes").at(name) != map.size() + 1) {
+    }
+    // vocab_sizes repeats what label_maps holds, so it is only checked
+    // against them, and it is required like every entry state() writes.
+    const nlohmann::json& vocab_sizes = *per_column_object(state, "vocab_sizes", columns_, stage);
+    for (const std::string& name : columns_) {
+      if (vocab_sizes.at(name) != maps_.at(name).size() + 1) {
         throw Error(stage + ": column '" + name + "' vocab_sizes disagrees with label_maps");
       }
     }

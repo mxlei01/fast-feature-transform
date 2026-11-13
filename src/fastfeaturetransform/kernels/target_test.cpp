@@ -246,10 +246,11 @@ TEST_CASE("the target-mean family refuses an encoding that is not finite") {
   // A table holding such a value is refused at load, even one written by hand.
   auto loading = fft::make_kernel("target_encode", {{"columns", {"c"}}, {"target", "y"}});
   loading->stage = "blend";
-  REQUIRE_THROWS_WITH(
-      loading->load_state(
-          {{"columns", {"c"}}, {"prior", 0.5}, {"values", {{"c", {{"x", std::numeric_limits<double>::infinity()}}}}}}),
-      ContainsSubstring("must be a finite number"));
+  REQUIRE_THROWS_WITH(loading->load_state({{"columns", {"c"}},
+                                           {"prior", 0.5},
+                                           {"values", {{"c", {{"x", std::numeric_limits<double>::infinity()}}}}},
+                                           {"null_values", {{"c", nullptr}}}}),
+                      ContainsSubstring("values['c']['x'] must be a finite number"));
 }
 
 // A row whose target is null teaches nothing, even when its category is the
@@ -369,6 +370,17 @@ TEST_CASE("target_encode load_state rejects a malformed table") {
   // started mapping missing values onto the unknown value.
   broken([](nlohmann::json& state) { state["null_values"] = 0.5; }, "'null_values' must be an object");
   broken([](nlohmann::json& state) { state["null_values"].erase("c"); }, "null_values has no entry for column 'c'");
+  // REGRESSION: null_values is required, as every saved pipeline holds it. A
+  // state without it, with the key misspelled or with null in its place used
+  // to load with no null category, so a null encoded to the prior.
+  broken([](nlohmann::json& state) { state.erase("null_values"); }, "blend: state must hold a 'null_values' object");
+  broken(
+      [](nlohmann::json& state) {
+        state["null_value"] = state.at("null_values");
+        state.erase("null_values");
+      },
+      "blend: state must hold a 'null_values' object");
+  broken([](nlohmann::json& state) { state["null_values"] = nullptr; }, "blend: 'null_values' must be an object");
 
   // A loaded encoder reads its column alone, so a serving file may omit the target.
   auto loaded = fresh();

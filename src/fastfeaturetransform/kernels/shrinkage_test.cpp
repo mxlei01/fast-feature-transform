@@ -387,6 +387,11 @@ TEST_CASE("shrinkage load_state rejects a malformed table") {
   // 'no null category' rather than as an error.
   broken([](nlohmann::json& state) { state["null_values"] = 2.0; }, "'null_values' must be an object");
   broken([](nlohmann::json& state) { state["null_values"].erase("c"); }, "null_values has no entry for column 'c'");
+  // REGRESSION: null_values is required, as every saved pipeline holds it. A
+  // state without it, or with null in its place, used to load with no null
+  // category, so a null encoded to the prior.
+  broken([](nlohmann::json& state) { state.erase("null_values"); }, "shrink: state must hold a 'null_values' object");
+  broken([](nlohmann::json& state) { state["null_values"] = nullptr; }, "shrink: 'null_values' must be an object");
 }
 
 TEST_CASE("shrinkage dictionary fits preserve target exclusion exact sums and loaded outputs") {

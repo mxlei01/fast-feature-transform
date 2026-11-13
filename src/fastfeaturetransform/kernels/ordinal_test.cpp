@@ -366,4 +366,9 @@ TEST_CASE("the ordinal substrate's load_state rejects a malformed table") {
   // 'no null category' rather than as an error.
   broken([](nlohmann::json& state) { state["has_null"] = true; }, "'has_null' must be an object");
   broken([](nlohmann::json& state) { state["has_null"].erase("c"); }, "has_null has no entry for column 'c'");
+  // REGRESSION: has_null is required, as every saved pipeline holds it. A
+  // state without it, or with null in its place, used to load with no null
+  // category.
+  broken([](nlohmann::json& state) { state.erase("has_null"); }, "enc: state must hold a 'has_null' object");
+  broken([](nlohmann::json& state) { state["has_null"] = nullptr; }, "enc: 'has_null' must be an object");
 }

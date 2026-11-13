@@ -258,16 +258,21 @@ inline double serializable(double value, const std::string& stage, const std::st
   return value;
 }
 
-// An optional per-column object in a manifest, such as 'has_null',
-// 'null_values' or 'null_counts'. Absent is the legitimate spelling of
-// 'nothing to say', but present and the wrong shape is an error rather than a
-// default: a hand-edited manifest must never quietly lose the null category.
-// Returns null when the key is absent or null, and otherwise an object
-// holding an entry for every column.
-inline const nlohmann::json* optional_per_column_object(const nlohmann::json& state, const std::string& key,
-                                                        const std::vector<std::string>& columns,
-                                                        const std::string& stage) {
-  if (!state.contains(key) || state.at(key).is_null()) return nullptr;
+// A per-column object of a fitted state, such as 'has_null', 'null_values'
+// or 'null_counts', holding an entry for every column in `columns`. Every
+// version that saves the step writes it, so a state without it is an error,
+// and so is one with the wrong shape: a hand-edited manifest must never
+// quietly lose the null category. A state key the kernel does not read is
+// ignored, so a misspelled key fails here as a missing one. `nullable`
+// accepts null in its place and returns nullptr for it: power_transform
+// writes null for 'means' and 'scales' when it does not standardize.
+inline const nlohmann::json* per_column_object(const nlohmann::json& state, const std::string& key,
+                                               const std::vector<std::string>& columns, const std::string& stage,
+                                               bool nullable = false) {
+  if (!state.contains(key)) {
+    throw Error(stage + ": state must hold a '" + key + "' object" + (nullable ? " or null" : ""));
+  }
+  if (nullable && state.at(key).is_null()) return nullptr;
   const nlohmann::json& object = state.at(key);
   if (!object.is_object()) throw Error(stage + ": '" + key + "' must be an object");
   for (const std::string& name : columns) {
@@ -504,7 +509,7 @@ inline std::unordered_map<std::string, Categories> load_categories(const nlohman
   }
   const nlohmann::json& categories = state.at("categories");
   load_fitted_columns(state, stage, columns, explicit_columns, &categories);
-  const nlohmann::json* has_null = optional_per_column_object(state, "has_null", columns, stage);
+  const nlohmann::json& has_null = *per_column_object(state, "has_null", columns, stage);
   std::unordered_map<std::string, Categories> tables;
   for (const std::string& name : columns) {
     if (!categories.contains(name) || !categories.at(name).is_array()) {
@@ -519,11 +524,9 @@ inline std::unordered_map<std::string, Categories> load_categories(const nlohman
         std::adjacent_find(table.sorted.begin(), table.sorted.end()) != table.sorted.end()) {
       throw Error(stage + ": categories['" + name + "'] must be sorted and unique");
     }
-    if (has_null != nullptr) {
-      const nlohmann::json& flag = has_null->at(name);
-      if (!flag.is_boolean()) throw Error(stage + ": has_null['" + name + "'] must be true or false");
-      table.has_null = flag.get<bool>();
-    }
+    const nlohmann::json& flag = has_null.at(name);
+    if (!flag.is_boolean()) throw Error(stage + ": has_null['" + name + "'] must be true or false");
+    table.has_null = flag.get<bool>();
     if (table.sorted.empty() && !table.has_null) throw Error(stage + ": categories['" + name + "'] is empty");
     table.index();
     tables.emplace(name, std::move(table));

@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import pickle
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,33 @@ import pyarrow.parquet as pq
 import pytest
 
 import fast_feature_transform
-from fast_feature_transform import EngineError, _core
+from fast_feature_transform import (
+    BackwardDifferenceEncoder,
+    BaseNEncoder,
+    BinaryEncoder,
+    CatBoostEncoder,
+    CountEncoder,
+    EngineError,
+    GrayEncoder,
+    HelmertEncoder,
+    JamesSteinEncoder,
+    LeaveOneOutEncoder,
+    MEstimateEncoder,
+    OneHotEncoder,
+    OrdinalEncoder,
+    PolynomialEncoder,
+    PowerTransformer,
+    QuantileEncoder,
+    RankHotEncoder,
+    SumEncoder,
+    SummaryEncoder,
+    TargetEncoder,
+    WOEEncoder,
+    _core,
+)
 from fast_feature_transform.pipeline import _SHELLS, Pipeline
 from fast_feature_transform.transformers import LabelEncoder, Select, StandardScaler, Transformer
+from helpers import write_parquet
 
 INT64_MAX: int = 2**63 - 1
 
@@ -203,6 +228,144 @@ def test_a_manifest_that_misspells_a_parameter_name_is_refused_at_load(source: s
     with pytest.raises(EngineError) as refused:
         _core.FittedPipeline.load_json(json.dumps(manifest))
     assert str(refused.value) == MISSPELLED
+
+
+# 'c' holds nulls and two categories seen once, which min_group_size=2 folds
+# into one group.
+_FRAME: dict[str, list[Any]] = {
+    "c": ["a", "a", "b", "b", "b", "r", None, None, "a", "q"],
+    "y": [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+    "x": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.0, 9.0, 12.0],
+}
+_ENCODE: dict[str, Any] = {"columns": ["c"]}
+_TARGET: dict[str, Any] = {"columns": ["c"], "target": "y"}
+
+# The entries of a fitted state that every version writes and that a kernel
+# used to read as optional, each with a step that writes it.
+_ALWAYS_WRITTEN: list[tuple[type[Transformer], dict[str, Any], str]] = [
+    (LabelEncoder, _ENCODE, "vocab_sizes"),
+    (CountEncoder, _ENCODE | {"min_group_size": 2}, "null_counts"),
+    (CountEncoder, _ENCODE | {"min_group_size": 2}, "groups"),
+    *[
+        (encoder, _ENCODE, "has_null")
+        for encoder in (
+            OrdinalEncoder,
+            OneHotEncoder,
+            RankHotEncoder,
+            BaseNEncoder,
+            BinaryEncoder,
+            GrayEncoder,
+            BackwardDifferenceEncoder,
+            HelmertEncoder,
+            SumEncoder,
+            PolynomialEncoder,
+        )
+    ],
+    *[
+        (encoder, _TARGET, "null_values")
+        for encoder in (
+            TargetEncoder,
+            MEstimateEncoder,
+            WOEEncoder,
+            JamesSteinEncoder,
+            LeaveOneOutEncoder,
+            CatBoostEncoder,
+        )
+    ],
+    *[
+        (PowerTransformer, {"columns": ["x"], "standardize": standardize}, entry)
+        for standardize in (True, False)
+        for entry in ("means", "scales")
+    ],
+]
+
+
+def _fitted_manifest(shell: type[Transformer], arguments: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
+    """Fit one step named 'step' on the frame above and return its manifest.
+
+    Args:
+        shell: The transformer class.
+        arguments: Its constructor's arguments.
+        tmp_path: Directory for the training file.
+
+    Returns:
+        The parsed manifest, which loads as saved.
+
+    """
+    path: str = write_parquet(tmp_path / "train.parquet", pa.table(_FRAME))
+    manifest: dict[str, Any] = _manifest(Pipeline([("step", shell(**arguments))]).fit([path]))
+    _core.FittedPipeline.load_json(json.dumps(manifest))
+    return manifest
+
+
+def _refusal(manifest: dict[str, Any], edit: Callable[[dict[str, Any]], object]) -> str:
+    """Load a copy of a manifest whose one state an edit changed, and return the error.
+
+    Args:
+        manifest: A manifest of one op.
+        edit: Changes the op's state in place.
+
+    Returns:
+        The message of the EngineError that loading raises.
+
+    """
+    edited: dict[str, Any] = json.loads(json.dumps(manifest))
+    edit(edited["ops"][0]["state"])
+    with pytest.raises(EngineError) as refused:
+        _core.FittedPipeline.load_json(json.dumps(edited))
+    return str(refused.value)
+
+
+# REGRESSION: an entry of a fitted state that every saved pipeline holds is
+# required at load, so a manifest that drops it or misspells its key fails and
+# names the step and the entry. Such a manifest used to load. Without
+# has_null, null_values, null_counts or groups, a null or a folded category then
+# got another answer; without vocab_sizes, or without the null means and scales
+# of a step that does not standardize, no answer changed.
+@pytest.mark.parametrize(
+    ("shell", "arguments", "entry"),
+    _ALWAYS_WRITTEN,
+    ids=[
+        f"{shell.__name__}-{entry}" + ("" if arguments.get("standardize", True) else "-unstandardized")
+        for shell, arguments, entry in _ALWAYS_WRITTEN
+    ],
+)
+def test_a_manifest_without_a_state_entry_every_version_writes_is_refused(
+    shell: type[Transformer], arguments: dict[str, Any], entry: str, tmp_path: Path
+) -> None:
+    manifest: dict[str, Any] = _fitted_manifest(shell, arguments, tmp_path)
+    if shell is PowerTransformer:
+        # Without standardize, 'means' and 'scales' are saved as null, and
+        # null is accepted in place of the object for these two alone.
+        assert (manifest["ops"][0]["state"][entry] is None) == (not arguments["standardize"])
+        missing: str = f"step: state must hold a '{entry}' object or null"
+    else:
+        # The frame gives the entry something to say about 'c': a null
+        # category, a folded group or a vocabulary size.
+        saved: Any = manifest["ops"][0]["state"][entry]["c"]
+        assert saved is not None
+        assert saved is not False
+        missing = f"step: state must hold a '{entry}' object"
+        assert _refusal(manifest, lambda state: state.update({entry: None})) == f"step: '{entry}' must be an object"
+    assert _refusal(manifest, lambda state: state.pop(entry)) == missing
+    assert _refusal(manifest, lambda state: state.update({entry + "s": state.pop(entry)})) == missing
+
+
+# REGRESSION: the quantile encoders write a null encoding for every output,
+# null when its column had no null category, and a manifest that lacks one is
+# refused. Dropping every entry of a column used to load, and a null then
+# encoded to the prior.
+@pytest.mark.parametrize("shell", [QuantileEncoder, SummaryEncoder])
+def test_a_manifest_without_the_null_encoding_of_an_output_is_refused(shell: type[Transformer], tmp_path: Path) -> None:
+    manifest: dict[str, Any] = _fitted_manifest(shell, _TARGET, tmp_path)
+    outputs: list[str] = list(manifest["ops"][0]["state"]["nulls"])
+    for dropped in [[output] for output in outputs] + [outputs]:
+
+        def drop(state: dict[str, Any], dropped: list[str] = dropped) -> None:
+            for output in dropped:
+                del state["nulls"][output]
+
+        assert _refusal(manifest, drop) == f"step: nulls has no entry for column '{dropped[0]}'"
 
 
 # What each constructor requires, by argument name.

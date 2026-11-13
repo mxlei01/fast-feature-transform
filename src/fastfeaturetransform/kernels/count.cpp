@@ -276,18 +276,17 @@ class CountEncode final : public Kernel {
     if (rows_ < 0) throw Error(stage + ": 'rows' must not be negative");
     const nlohmann::json& counts = state.at("counts");
     load_fitted_columns(state, stage, columns_, explicit_columns_, &counts);
-    // Both sub-objects are optional, but a present one must have the shape
-    // state() writes: a wrong type here would delete the null category or
-    // quietly turn a fitted category into an unknown.
-    const nlohmann::json* null_counts = optional_per_column_object(state, "null_counts", columns_, stage);
-    const nlohmann::json* groups = optional_per_column_object(state, "groups", {}, stage);
-    if (groups != nullptr) {
-      for (const auto& [name, members] : groups->items()) {
-        if (std::find(columns_.begin(), columns_.end(), name) == columns_.end()) {
-          throw Error(stage + ": groups names column '" + name + "', which this encoder does not encode");
-        }
-        if (!members.is_object()) throw Error(stage + ": groups['" + name + "'] must be an object");
+    // Both sub-objects are required in the shape state() writes: a missing or
+    // wrong one would delete the null category or quietly turn a folded
+    // category into an unknown. 'groups' names only the columns that fold a
+    // category, so it holds no entry for the others.
+    const nlohmann::json& null_counts = *per_column_object(state, "null_counts", columns_, stage);
+    const nlohmann::json& groups = *per_column_object(state, "groups", {}, stage);
+    for (const auto& [name, members] : groups.items()) {
+      if (std::find(columns_.begin(), columns_.end(), name) == columns_.end()) {
+        throw Error(stage + ": groups names column '" + name + "', which this encoder does not encode");
       }
+      if (!members.is_object()) throw Error(stage + ": groups['" + name + "'] must be an object");
     }
     tables_.clear();
     for (const std::string& name : columns_) {
@@ -301,17 +300,17 @@ class CountEncode final : public Kernel {
         }
         table.counts.emplace(key, count.get<int64_t>());
       }
-      if (null_counts != nullptr && !null_counts->at(name).is_null()) {
-        const nlohmann::json& count = null_counts->at(name);
+      if (!null_counts.at(name).is_null()) {
+        const nlohmann::json& count = null_counts.at(name);
         if (!count.is_number_integer() || count.get<int64_t>() < 0) {
           throw Error(stage + ": null_counts['" + name + "'] must be a count or null");
         }
         table.has_null_category = true;
         table.null_count = count.get<int64_t>();
       }
-      if (groups == nullptr || !groups->contains(name)) continue;
+      if (!groups.contains(name)) continue;
       StringIndex group_ids;
-      for (const auto& [key, value] : groups->at(name).items()) {
+      for (const auto& [key, value] : groups.at(name).items()) {
         // An entry is a group's name and the list of its members. Version
         // 0.0.1 saved a member and its group's name instead, and a string in
         // the list's place tells that layout apart.

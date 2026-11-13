@@ -433,8 +433,11 @@ class QuantileEncode final : public Kernel {
         for (std::size_t i = 0; i < table.categories.size(); ++i) {
           table.values[i * quantiles_.size() + q] = number(encodings.at(output).at(i), where);
         }
+        // state() writes an entry for every output, null when the column had
+        // no null category, so a missing entry is a damaged manifest.
         const nlohmann::json& nulls = state.at("nulls");
-        if (!nulls.contains(output) || nulls.at(output).is_null()) continue;
+        if (!nulls.contains(output)) throw Error(stage + ": nulls has no entry for column '" + output + "'");
+        if (nulls.at(output).is_null()) continue;
         table.has_null = true;
         table.null_values.push_back(number(nulls.at(output), stage + ": nulls['" + output + "']"));
       }

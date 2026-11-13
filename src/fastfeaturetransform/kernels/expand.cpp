@@ -1666,11 +1666,13 @@ class PowerTransform final : public Kernel {
     if (!state.is_object() || !state.contains("lambdas") || !state.at("lambdas").is_object()) {
       throw Error(stage + ": state must hold a 'lambdas' object");
     }
-    // Both are present exactly when the params say the columns were
-    // standardized: a manifest missing them would silently serve values
-    // that are not standardized.
-    const nlohmann::json* means = optional_per_column_object(state, "means", columns_, stage);
-    const nlohmann::json* scales = optional_per_column_object(state, "scales", columns_, stage);
+    // state() writes both keys: objects when the params say the columns were
+    // standardized, null when they say they were not. A manifest without
+    // either key is refused, and so is one whose keys disagree with the
+    // params: null under standardize would silently serve values that are
+    // not standardized.
+    const nlohmann::json* means = per_column_object(state, "means", columns_, stage, true);
+    const nlohmann::json* scales = per_column_object(state, "scales", columns_, stage, true);
     if (standardize_ != (means != nullptr) || standardize_ != (scales != nullptr)) {
       throw Error(stage + ": 'means' and 'scales' must be present exactly when standardize is true");
     }
