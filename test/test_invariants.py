@@ -1,7 +1,10 @@
 """Tests for the invariants the engine design rests on: pass scheduling, parity, merges, concurrency, column order."""
 
+import copy
 import subprocess  # nosec B404
 import sys
+import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -235,6 +238,70 @@ def test_transform_dict_is_safe_under_free_threaded_concurrency(tmp_path: Path) 
 
     with ThreadPoolExecutor(max_workers=THREADS) as pool:
         assert sum(pool.map(worker, range(THREADS))) == 0
+
+
+@pytest.mark.skipif(
+    sys._is_gil_enabled(),
+    reason="with the GIL, the reading threads hold it and every fit waits for a thread switch",
+)
+def test_readers_see_the_old_fit_or_the_new_one_while_a_transformer_is_fitted_again(tmp_path: Path) -> None:
+    # Two threads use an encoder while this one fits it again 1,000 times
+    # standalone on the same file, then 1,000 times alternately as a step of
+    # a pipeline that gives the encoder's standalone stage name to another
+    # step and standalone again. test_api forces each interleaving in one
+    # thread; this runs them on parallel threads, where a reader that reads
+    # the binding twice can see two fits.
+    first: str = write_parquet(tmp_path / "a.parquet", pa.table({"u": ["a", "b"], "v": ["p", "p"]}))
+    second: str = write_parquet(tmp_path / "b.parquet", pa.table({"u": ["b", "c", "d"], "v": ["q", "r", "s"]}))
+    encoder: LabelEncoder = LabelEncoder(columns=["u"]).fit([first], threads=1)
+    pipeline: Pipeline = Pipeline([("enc", encoder), ("labelencoder", LabelEncoder(columns=["v"]))])
+    record: dict[str, object] = {"u": "b", "v": "q"}
+    alone: list[object] = [{"u": 2, "v": "q"}, {"u": 2, "v": "q"}, {"u": {"a": 1, "b": 2}}, 3]
+    held: list[object] = [
+        "LabelEncoder was fitted as part of a Pipeline; call transform on that pipeline",
+        "LabelEncoder is not fitted",
+        {"u": {"b": 1, "c": 2, "d": 3}},
+        4,
+    ]
+
+    def outcome(read: Callable[[], object]) -> object:
+        try:
+            return read()
+        except (RuntimeError, KeyError, TypeError) as error:
+            return str(error)
+
+    def race(fits: list[Callable[[], object]], allowed: list[list[object]]) -> list[object]:
+        stop: threading.Event = threading.Event()
+
+        def reader() -> list[object]:
+            wrong: list[object] = []
+            while not stop.is_set() and len(wrong) < 10:
+                answers: list[object] = [
+                    outcome(lambda: encoder.transform_dict(record)),
+                    outcome(lambda: copy.copy(encoder).transform_dict(record)),
+                    outcome(lambda: encoder.label_maps_),
+                    outcome(lambda: encoder.vocab_size("u")),
+                ]
+                wrong.extend(answer for answer, legal in zip(answers, allowed, strict=True) if answer not in legal)
+            return wrong
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            readers = [pool.submit(reader) for _ in range(2)]
+            try:
+                for fit in fits:
+                    fit()
+            finally:
+                stop.set()
+            return [answer for future in readers for answer in future.result()]
+
+    def refit() -> object:
+        return encoder.fit([first], threads=1)
+
+    def fit_held() -> object:
+        return pipeline.fit([second], threads=1)
+
+    assert race([refit] * 1000, [[answer] for answer in alone]) == []
+    assert race([fit_held, refit] * 500, [[old, new] for old, new in zip(alone, held, strict=True)]) == []
 
 
 @settings(max_examples=60, deadline=None)

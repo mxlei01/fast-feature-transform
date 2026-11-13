@@ -228,6 +228,12 @@ def _optional_columns(columns: object, what: str) -> list[str] | None:
     return None if columns is None else _column_list(columns, what)
 
 
+# A transformer's view of one fit: the fitted C++ pipeline, the transformer's
+# dotted stage name in it, and whether the transformer owns that pipeline
+# outright (standalone) or is one step of a Pipeline.
+_Binding = tuple[_core.FittedPipeline, str, bool]
+
+
 class Transformer:
     """Base transformer: declares a kernel and its parameters; execution lives in C++.
 
@@ -238,10 +244,16 @@ class Transformer:
 
     kernel_id: ClassVar[str]
 
-    _handle: _core.FittedPipeline | None = None
-    _stage: str | None = None
-    _standalone: bool = False
-    _state_cache: dict[str, Any] | None = None
+    # None until the first fit. A fit publishes the whole binding in one
+    # assignment and each reader takes everything it uses from one read of
+    # it, so a thread that uses this transformer while another fits it again
+    # sees the old fit or the new one, never the handle of one fit with the
+    # stage name or the ownership of the other.
+    _binding: _Binding | None = None
+    # The fitted state, with the binding it was read from. A read that a
+    # refit overtakes stores the old fit's state after the refit cleared the
+    # cache; the next read finds that binding replaced and reads again.
+    _state_cache: tuple[_Binding, dict[str, Any]] | None = None
 
     def params(self) -> dict[str, Any]:
         """Kernel parameters, serialized into the plan and the manifest.
@@ -263,7 +275,9 @@ class Transformer:
         """Fit this transformer standalone by wrapping it in a one-stage pipeline.
 
         A transformer is a view of one fit at a time: fitting it again, or
-        fitting a Pipeline that holds it, rebinds it to the newest fit.
+        fitting a Pipeline that holds it, rebinds it to the newest fit in one
+        step, so a thread that uses it meanwhile sees the old fit or the new
+        one.
 
         Fit reads Parquet in batches. Steps that need every value (exact
         medians, quantiles, k-means and power fits) keep those values within a
@@ -292,8 +306,13 @@ class Transformer:
         """
         from fast_feature_transform.pipeline import Pipeline
 
-        Pipeline([(type(self).__name__.lower(), self)]).fit(X, y, threads=threads, temp_dir=temp_dir)
-        self._standalone = True
+        # REGRESSION: a standalone fit binds this transformer once, as
+        # standalone. It used to fit a one-step Pipeline, which bound it as a
+        # pipeline step first, so a thread that used it before it was marked
+        # standalone was refused, and a copy taken then was unfitted.
+        stage: str = type(self).__name__.lower()
+        plan: str = json.dumps(Pipeline([(stage, self)])._to_tree())
+        self._bind(_fit_engine(threads, temp_dir).fit(plan, _source_paths(X)), stage, standalone=True)
         return self
 
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
@@ -315,10 +334,10 @@ class Transformer:
         # The record path: a record costs a couple of hundred nanoseconds, and
         # the two frames _standalone_handle adds are a large share of that. A
         # transformer that is not ready still goes through it, for the error.
-        handle: _core.FittedPipeline | None = self._handle
-        if handle is None or self._stage is None or not self._standalone:
-            handle = self._standalone_handle()
-        return handle.transform_row(X)
+        binding: _Binding | None = self._binding
+        if binding is not None and binding[2]:
+            return binding[0].transform_row(X)
+        return self._standalone_handle().transform_row(X)
 
     def transform_parquet(self, X: Sequence[str | Path], *, output_dir: str | Path | None = None) -> list[Path]:
         """Transform Parquet files through this standalone-fitted transformer.
@@ -422,8 +441,8 @@ class Transformer:
             RuntimeError: If unfitted, or fitted as part of a Pipeline.
 
         """
-        handle: _core.FittedPipeline = self._require_handle()
-        if not self._standalone:
+        handle, _, standalone = self._require_binding()
+        if not standalone:
             raise RuntimeError(
                 f"{type(self).__name__} was fitted as part of a Pipeline; call transform on that pipeline"
             )
@@ -441,11 +460,12 @@ class Transformer:
             this transformer owns its handle.
 
         """
-        transient: tuple[str, ...] = ("_handle", "_stage", "_standalone", "_state_cache")
+        transient: tuple[str, ...] = ("_binding", "_state_cache")
         state: dict[str, Any] = {key: value for key, value in self.__dict__.items() if key not in transient}
-        if self._handle is not None and self._standalone:
-            state["_manifest"] = _cached_manifest(self._handle)
-            state["_stage_name"] = self._stage
+        binding: _Binding | None = self._binding
+        if binding is not None and binding[2]:
+            state["_manifest"] = _cached_manifest(binding[0])
+            state["_stage_name"] = binding[1]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -470,10 +490,24 @@ class Transformer:
             standalone: Whether this transformer owns the handle outright.
 
         """
-        self._handle = handle
-        self._stage = stage
-        self._standalone = standalone
-        self._state_cache = None
+        self._binding = (handle, stage, standalone)
+        self._state_cache = None  # releases the old fit's state
+
+    def _require_binding(self) -> _Binding:
+        """Return the binding, read once, or raise if this transformer is unfitted.
+
+        Returns:
+            The fitted C++ pipeline, this transformer's stage name in it, and
+            whether this transformer owns it outright.
+
+        Raises:
+            RuntimeError: If the transformer has not been fitted.
+
+        """
+        binding: _Binding | None = self._binding
+        if binding is None:
+            raise RuntimeError(f"{type(self).__name__} is not fitted")
+        return binding
 
     def _require_handle(self) -> _core.FittedPipeline:
         """Return the fitted handle or raise if this transformer is unfitted.
@@ -485,9 +519,7 @@ class Transformer:
             RuntimeError: If the transformer has not been fitted.
 
         """
-        if self._handle is None or self._stage is None:
-            raise RuntimeError(f"{type(self).__name__} is not fitted")
-        return self._handle
+        return self._require_binding()[0]
 
     def _state(self) -> dict[str, Any]:
         """Read this transformer's fitted state from the C++ core (once per binding).
@@ -496,11 +528,14 @@ class Transformer:
             The fitted state as a plain dict.
 
         """
-        if self._state_cache is None:
-            handle = self._require_handle()
-            assert self._stage is not None
-            self._state_cache = json.loads(handle.stage_state(self._stage))
-        return self._state_cache
+        cached: tuple[_Binding, dict[str, Any]] | None = self._state_cache
+        if cached is not None and cached[0] is self._binding:
+            return cached[1]
+        binding: _Binding = self._require_binding()
+        handle, stage, _ = binding
+        state: dict[str, Any] = json.loads(handle.stage_state(stage))
+        self._state_cache = (binding, state)
+        return state
 
 
 class Select(Transformer):
@@ -587,13 +622,12 @@ class LabelEncoder(Transformer):
             RuntimeError: If the encoder is not fitted.
 
         """
-        handle = self._require_handle()
-        assert self._stage is not None
+        handle, stage, _ = self._require_binding()
         if not isinstance(column, str):
             # Preserve Python dict key semantics for unusual invalid arguments.
             return self._state()["vocab_sizes"][column]
         try:
-            return handle.vocab_size(self._stage, column)
+            return handle.vocab_size(stage, column)
         except _core.EngineError:
             # A column this encoder does not encode raises KeyError, as its
             # docstring says, from a lookup in the materialized state.

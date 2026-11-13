@@ -8,9 +8,11 @@ import pickle
 import subprocess  # nosec B404
 import sys
 import tempfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, ClassVar, override
 
 import numpy as np
 import pyarrow as pa
@@ -447,13 +449,173 @@ def test_nested_pipeline_pickle_stores_the_manifest_once(train_files: list[str])
 
 def test_ownership_is_known_without_parsing_the_manifest(train_files: list[str]) -> None:
     standalone: LabelEncoder = LabelEncoder(columns=["device"]).fit(train_files)
-    assert standalone._standalone is True
+    assert standalone._require_binding()[2] is True
     bound = _nested().fit(train_files)["encode"]
     assert isinstance(bound, LabelEncoder)
-    assert bound._standalone is False
+    assert bound._require_binding()[2] is False
     restored: LabelEncoder = pickle.loads(pickle.dumps(standalone))
-    assert restored._standalone is True
+    assert restored._require_binding()[2] is True
     assert restored.transform_dict({"device": "mob"}) == {"device": MOB_INDEX}
+
+
+class _Interleaved(LabelEncoder):
+    """A LabelEncoder that calls ``hook`` before each attribute write and ``after`` after it.
+
+    Another thread can run between any two attribute writes, and between a
+    write and the code that follows it. The hooks run there in the writing
+    thread, so the interleaving is forced rather than hoped for. They are
+    class attributes, so copies and pickles carry none of them, and both
+    are off while either runs.
+    """
+
+    hook: ClassVar[Callable[[str, Any], None] | None] = None
+    after: ClassVar[Callable[[str, Any], None] | None] = None
+
+    @override
+    def __setattr__(self, name: str, value: Any) -> None:
+        cls = type(self)
+        hook, after = cls.hook, cls.after
+        cls.hook = cls.after = None
+        try:
+            if hook is not None:
+                hook(name, value)
+            super().__setattr__(name, value)
+            if after is not None:
+                after(name, value)
+        finally:
+            cls.hook, cls.after = hook, after
+
+
+def _outcome(read: Callable[[], object]) -> object:
+    try:
+        return read()
+    except (RuntimeError, KeyError) as error:
+        return f"{type(error).__name__}: {error}"
+
+
+@pytest.mark.parametrize(
+    ("first", "then"),
+    [("alone", "alone"), ("alone", "held"), ("held", "alone"), ("held", "held"), ("alone", "beside")],
+    ids=[
+        "standalone refit",
+        "standalone to a pipeline step",
+        "pipeline step to standalone",
+        "pipeline refit",
+        "standalone to a pipeline whose other step has its stage name",
+    ],
+)
+def test_a_thread_sees_the_old_fit_or_the_new_one_between_any_two_writes_of_a_refit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str, then: str
+) -> None:
+    old: Path = tmp_path / "old.parquet"
+    new: Path = tmp_path / "new.parquet"
+    pq.write_table(pa.table({"u": ["a", "b"], "v": ["p", "p"]}), old)
+    pq.write_table(pa.table({"u": ["b", "c"], "v": ["q", "r"]}), new)
+    record: dict[str, object] = {"u": "b", "v": "q"}
+    encoder: _Interleaved = _Interleaved(columns=["u"])
+    owners: dict[str, Pipeline | _Interleaved] = {
+        "alone": encoder,
+        "held": Pipeline([("enc", encoder)]),
+        # Standalone, the stage name is the class name: "_interleaved".
+        "beside": Pipeline([("enc", encoder), ("_interleaved", LabelEncoder(columns=["v"]))]),
+    }
+    owners[first].fit([old])
+
+    def read() -> list[object]:
+        twin: LabelEncoder = copy.copy(encoder)
+        deep: LabelEncoder = copy.deepcopy(encoder)
+        restored: LabelEncoder = pickle.loads(pickle.dumps(encoder))
+        return [
+            _outcome(lambda: encoder.transform_dict(record)),
+            _outcome(lambda: twin.transform_dict(record)),
+            _outcome(lambda: deep.transform_dict(record)),
+            _outcome(lambda: restored.transform_dict(record)),
+            _outcome(lambda: encoder.label_maps_),
+            _outcome(lambda: encoder.vocab_size("u")),
+        ]
+
+    before: list[object] = read()
+    seen: list[list[object]] = []
+    monkeypatch.setattr(_Interleaved, "hook", lambda name, value: seen.append(read()))
+    owners[then].fit([new])
+    monkeypatch.setattr(_Interleaved, "hook", None)
+    assert encoder._state_cache is None  # the refit released the state the probes read
+    after: list[object] = read()
+    assert before[4] == {"u": {"a": 1, "b": 2}}
+    assert after[4] == {"u": {"b": 1, "c": 2}}
+    assert seen
+    for answers in seen:
+        for answer, old_answer, new_answer in zip(answers, before, after, strict=True):
+            assert answer in (old_answer, new_answer)
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["standalone", "held by a pipeline"])
+@pytest.mark.parametrize("when", ["while the state is read", "before the read stores it", "after the read stores it"])
+def test_a_fitted_attribute_read_that_a_refit_overtakes_leaves_no_stale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: bool, when: str
+) -> None:
+    old: Path = tmp_path / "old.parquet"
+    new: Path = tmp_path / "new.parquet"
+    pq.write_table(pa.table({"u": ["a", "b"]}), old)
+    pq.write_table(pa.table({"u": ["b", "c"]}), new)
+    encoder: _Interleaved = _Interleaved(columns=["u"])
+    owner: Pipeline | _Interleaved = Pipeline([("enc", encoder)]) if held else encoder
+    owner.fit([old])
+    refits: list[str] = []
+
+    def refit() -> None:
+        if not refits:
+            refits.append(when)
+            owner.fit([new])
+
+    if when == "while the state is read":
+        # The C++ core lets other threads run while it reads the state.
+        handle, stage, standalone = encoder._require_binding()
+
+        def stage_state(name: str) -> str:
+            refit()
+            return handle.stage_state(name)
+
+        reading: Any = SimpleNamespace(stage_state=stage_state)
+        encoder._bind(reading, stage, standalone=standalone)
+    else:
+
+        def refit_at_the_store(name: str, value: Any) -> None:
+            if name == "_state_cache" and value is not None:
+                refit()
+
+        monkeypatch.setattr(
+            _Interleaved, "hook" if when == "before the read stores it" else "after", refit_at_the_store
+        )
+    # The read began before the refit, so it answers for the old fit; the
+    # next one answers for the new fit.
+    assert encoder.label_maps_ == {"u": {"a": 1, "b": 2}}
+    assert refits
+    assert encoder.label_maps_ == {"u": {"b": 1, "c": 2}}
+
+
+def test_a_fitted_attribute_read_that_binding_the_next_step_overtakes_leaves_no_stale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One transformer can be two steps of a pipeline: the fit binds it to the
+    # first step, then to the second, on the same handle.
+    path: Path = tmp_path / "u.parquet"
+    pq.write_table(pa.table({"u": ["a", "b"]}), path)
+    encoder: _Interleaved = _Interleaved(columns=["u"])
+    Pipeline([("first", encoder), ("text", Cast({"u": "utf8"})), ("second", encoder)]).fit([path])
+    handle: _core.FittedPipeline = encoder._require_handle()
+    encoder._bind(handle, "first", standalone=False)  # as the fit leaves it between the two steps
+    binds: list[str] = []
+
+    def bind_the_second_step_before_the_read_stores(name: str, value: Any) -> None:
+        if name == "_state_cache" and value is not None and not binds:
+            binds.append(name)
+            encoder._bind(handle, "second", standalone=False)
+
+    monkeypatch.setattr(_Interleaved, "hook", bind_the_second_step_before_the_read_stores)
+    assert encoder.label_maps_ == {"u": {"a": 1, "b": 2}}
+    assert binds
+    assert encoder.label_maps_ == {"u": {"1": 1, "2": 2}}
 
 
 def test_generator_steps_are_materialized_before_validation() -> None:
@@ -515,7 +677,7 @@ def test_shallow_copy_shares_the_handle_and_leaves_the_original_bound(train_file
     assert clone._handle is pipeline._handle
     encoder = pipeline["encode"]
     assert isinstance(encoder, LabelEncoder)
-    assert encoder._handle is pipeline._handle
+    assert encoder._require_handle() is pipeline._handle
 
 
 def test_numpy_integers_are_accepted_for_counts_and_threads(train_files: list[str]) -> None:
