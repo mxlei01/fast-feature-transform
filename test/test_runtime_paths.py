@@ -546,21 +546,50 @@ def test_concurrent_artifact_saves_publish_one_complete_manifest(tmp_path: Path,
 
 
 @pytest.fixture(scope="module")
-def large_artifact(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Save a pipeline whose artifact takes tens of milliseconds to write or parse.
+def large_keys(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Write 200,000 distinct keys, which take tens of milliseconds to fit or encode.
 
     Args:
         tmp_path_factory: pytest's session-wide temporary directory factory.
 
     Returns:
+        The Parquet file.
+
+    """
+    source = tmp_path_factory.mktemp("large") / "keys.parquet"
+    pq.write_table(pa.table({"key": [f"key-{i:07d}" for i in range(200_000)]}), source)
+    return source
+
+
+@pytest.fixture(scope="module")
+def large_artifact(large_keys: Path) -> Path:
+    """Save a pipeline whose artifact takes tens of milliseconds to write or parse.
+
+    Args:
+        large_keys: The keys the pipeline is fitted on.
+
+    Returns:
         The artifact directory.
 
     """
-    root = tmp_path_factory.mktemp("large")
-    source = root / "keys.parquet"
-    pq.write_table(pa.table({"key": [f"key-{i:07d}" for i in range(200_000)]}), source)
-    Pipeline([("encode", LabelEncoder(columns=["key"]))]).fit([source]).save(root / "artifact")
-    return root / "artifact"
+    Pipeline([("encode", LabelEncoder(columns=["key"]))]).fit([large_keys]).save(large_keys.parent / "artifact")
+    return large_keys.parent / "artifact"
+
+
+@pytest.fixture(scope="module")
+def large_numbers(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Write 2,000,000 i64 zeros, a file of about 9 kB whose memmap holds 16 MB.
+
+    Args:
+        tmp_path_factory: pytest's session-wide temporary directory factory.
+
+    Returns:
+        The Parquet file.
+
+    """
+    source = tmp_path_factory.mktemp("numbers") / "numbers.parquet"
+    pq.write_table(pa.table({"code": np.zeros(2_000_000, dtype=np.int64)}), source)
+    return source
 
 
 def _longest_pause_during(call: Callable[[], object]) -> tuple[float, float]:
@@ -599,27 +628,84 @@ def _longest_pause_during(call: Callable[[], object]) -> tuple[float, float]:
     return max(later - earlier for earlier, later in itertools.pairwise(inside)) * 1e3, (end - start) * 1e3
 
 
+def _first_that_lets_threads_run(measure: Callable[[], tuple[float, float]]) -> tuple[float, float]:
+    """Measure up to three times, and stop at the first call whose longest pause is under half of it.
+
+    One late wakeup on a loaded machine can take half of a call that lasts
+    tens of milliseconds. A call that holds the GIL fails every try, because
+    the other thread sleeps through each whole call.
+
+    Args:
+        measure: Makes the call afresh and measures it with _longest_pause_during.
+
+    Returns:
+        The first measurement under the bound, or the third.
+
+    """
+    longest, duration = measure()
+    for _ in range(2):
+        if longest < duration / 2:
+            break
+        longest, duration = measure()
+    return longest, duration
+
+
 @pytest.mark.parametrize("operation", ["save", "load", "pickle.dumps", "pickle.loads", "stages_state"])
 def test_artifact_calls_let_other_threads_run(large_artifact: Path, tmp_path: Path, operation: str) -> None:
     # On the standard build these calls stopped every other thread for their
     # whole duration: 1.2 s for a 2,000,000-category save. A free-threaded
     # build passes trivially; the Standard-CPython CI job is where it can fail.
-    pipeline = Pipeline.load(large_artifact)  # fresh: no manifest cached on its handle yet
-    payload = pickle.dumps(Pipeline.load(large_artifact))
-    calls: dict[str, Callable[[], object]] = {
-        "save": lambda: pipeline.save(tmp_path / "copy"),
-        "load": lambda: Pipeline.load(large_artifact),
-        "pickle.dumps": lambda: pickle.dumps(pipeline),
-        "pickle.loads": lambda: pickle.loads(payload).transform_dict({"key": "key-0000001"}),
-        "stages_state": pipeline.stages_state,
-    }
-    longest, duration = _longest_pause_during(calls[operation])
+    def measure() -> tuple[float, float]:
+        pipeline = Pipeline.load(large_artifact)  # fresh: no manifest cached on its handle yet
+        payload = pickle.dumps(Pipeline.load(large_artifact))
+        calls: dict[str, Callable[[], object]] = {
+            "save": lambda: pipeline.save(tmp_path / "copy"),
+            "load": lambda: Pipeline.load(large_artifact),
+            "pickle.dumps": lambda: pickle.dumps(pipeline),
+            "pickle.loads": lambda: pickle.loads(payload).transform_dict({"key": "key-0000001"}),
+            "stages_state": pipeline.stages_state,
+        }
+        return _longest_pause_during(calls[operation])
+
+    longest, duration = _first_that_lets_threads_run(measure)
     # Holding the GIL keeps the other thread asleep for the whole call.
     # Releasing it lets that thread wake every 1.3 ms at most on an idle
     # machine (measured on an Apple M4). A loaded machine stretches the
     # sleeps: a macOS release runner woke only 22 times in a 622 ms save, one
     # per 28 ms. So the bound is half the call, which a call that holds the
     # GIL cannot meet however fast or slow the machine is.
+    assert longest < duration / 2, f"{operation}: another thread slept {longest:.0f} ms of a {duration:.0f} ms call"
+
+
+@pytest.mark.parametrize(
+    "operation", ["fit", "transform_parquet", "transform_memmap", "parquet_to_memmap", "stage_state"]
+)
+def test_batch_calls_let_other_threads_run(
+    large_keys: Path, large_artifact: Path, large_numbers: Path, tmp_path: Path, operation: str
+) -> None:
+    # The check and the bound of the test above, for the calls that read or
+    # write data. A free-threaded build passes trivially here too, unless
+    # PYTHON_GIL=1 turns its GIL on. Each call reads its input three times, on
+    # one thread so that more cores do not shorten it: 37 to 52 ms, against 36
+    # to 44 ms for save and stage_state (Apple M4). One read takes 16 to 29 ms,
+    # and a late wakeup on a loaded machine is a larger share of a shorter
+    # call. stage_state is measured on the handle: a fitted attribute also
+    # parses the state with json.loads, which holds the GIL, 27 ms against
+    # stage_state's 38 ms for these 200,000 keys (Apple M4), too close to the
+    # bound.
+    pipeline = Pipeline.load(large_artifact, threads=1)
+    handle = pipeline._handle
+    assert handle is not None
+    keys = [large_keys] * 3
+    numbers = [large_numbers] * 3
+    calls: dict[str, Callable[[], object]] = {
+        "fit": lambda: Pipeline([("encode", LabelEncoder(columns=["key"]))]).fit(keys, threads=1),
+        "transform_parquet": lambda: pipeline.transform_parquet(keys, output_dir=tmp_path / "parquet"),
+        "transform_memmap": lambda: pipeline.transform_memmap(keys, output_dir=tmp_path / "memmap"),
+        "parquet_to_memmap": lambda: parquet_to_memmap(numbers, output_dir=tmp_path / "memmap", threads=1),
+        "stage_state": lambda: handle.stage_state("encode"),
+    }
+    longest, duration = _first_that_lets_threads_run(lambda: _longest_pause_during(calls[operation]))
     assert longest < duration / 2, f"{operation}: another thread slept {longest:.0f} ms of a {duration:.0f} ms call"
 
 

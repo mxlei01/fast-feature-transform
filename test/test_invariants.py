@@ -779,6 +779,18 @@ def test_a_record_of_128_fields_or_more_gives_its_batch_row_whatever_order_its_k
             assert pipeline.transform_dict(record) == expected[row]
 
 
+def test_the_installed_package_holds_the_marker_and_the_tracked_stub() -> None:
+    # The release runs this suite against each wheel it builds, with the
+    # package imported from the wheel, so a wheel without the py.typed marker
+    # or the module's stub, or with a stub other than the tracked one, fails
+    # here.
+    repo: Path = Path(__file__).resolve().parent.parent
+    package: Path = Path(fast_feature_transform.__file__).parent
+    assert (package / "py.typed").is_file()
+    assert (package / "_core.pyi").is_file()
+    assert (package / "_core.pyi").read_text() == (repo / "fast_feature_transform" / "_core.pyi").read_text()
+
+
 def test_tracked_stub_matches_the_generated_one(tmp_path: Path) -> None:
     # Regenerate with: python -m nanobind.stubgen -m fast_feature_transform._core -o fast_feature_transform/_core.pyi,
     # then ruff check --select PYI009 --fix and ruff format on it (the same normalization applied here).
