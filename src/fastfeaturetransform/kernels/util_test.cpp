@@ -75,6 +75,17 @@ Partials partials_of(const std::vector<double>& values) {
   return sum;
 }
 
+// The terms of the oracle's sum, as ExactSum::terms() defines them: the
+// rounded sum, then the rounded sum of what it leaves, until nothing is left.
+std::vector<double> terms_of(Partials rest) {
+  std::vector<double> all;
+  for (double top = rest.value(); top != 0.0; top = rest.value()) {
+    all.push_back(top);
+    REQUIRE(rest.add(-top));
+  }
+  return all;
+}
+
 fft::ExactSum sum_of(const std::vector<double>& values) {
   fft::ExactSum sum;
   for (double value : values) REQUIRE(sum.add(value));
@@ -572,7 +583,9 @@ TEST_CASE("ExactSum::Adder writes its terms back, to be opened again or moved to
   Partials oracle;
   uint64_t state = 99;
   // Several Adders in turn on one sum, with spills to the partials inside
-  // each, and plain adds between them.
+  // each, and plain adds between them. The terms are compared as well as the
+  // value: a term an Adder drops as it opens a sum seldom moves the rounded
+  // sum.
   for (int round = 0; round < 20; ++round) {
     {
       fft::ExactSum::Adder adder(sum);
@@ -583,6 +596,7 @@ TEST_CASE("ExactSum::Adder writes its terms back, to be opened again or moved to
       }
     }
     REQUIRE(bits(sum.value()) == bits(oracle.value()));
+    REQUIRE(bits(sum.terms()) == bits(terms_of(oracle)));
     const double value = full(state, between(state, -200, 200));
     REQUIRE(oracle.add(value));
     REQUIRE(sum.add(value));
@@ -612,6 +626,7 @@ TEST_CASE("ExactSum::Adder writes its terms back, to be opened again or moved to
       if (to != on) {
         adder.move_to(sums[to]);
         REQUIRE(bits(sums[on].value()) == bits(oracles[on].value()));
+        REQUIRE(bits(sums[on].terms()) == bits(terms_of(oracles[on])));
         on = to;
       }
       const double value = full(state, -60 * between(state, 0, 4));
@@ -622,5 +637,6 @@ TEST_CASE("ExactSum::Adder writes its terms back, to be opened again or moved to
   for (std::size_t k = 0; k < sums.size(); ++k) {
     CAPTURE(k);
     REQUIRE(bits(sums[k].value()) == bits(oracles[k].value()));
+    REQUIRE(bits(sums[k].terms()) == bits(terms_of(oracles[k])));
   }
 }

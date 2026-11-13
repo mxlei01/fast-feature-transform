@@ -20,3 +20,16 @@ race:ComputeFingerprint
 race:arrow::*()::result
 race:arrow::TypeTraits
 race:parquet::ApplicationVersion
+
+# A type singleton is a heap block that std::make_shared allocates inside the
+# static's initializer, so a report on one names that block, which the entries
+# above do not match, and the constructor that wrote it, which this one does.
+# A type that this package makes and hands to another thread without
+# synchronization is still reported, on the std::shared_ptr that carries it;
+# the race on the type's own fields is not.
+race:arrow::DataType::DataType
+
+# Parquet's default reader and writer properties, first-use statics as well:
+# parquet::default_reader_properties(), default_writer_properties(),
+# default_arrow_reader_properties() and default_arrow_writer_properties().
+race:parquet::default_

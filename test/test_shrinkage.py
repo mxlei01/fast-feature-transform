@@ -97,6 +97,30 @@ def test_james_stein_shrinks_by_the_model(events: list[str]) -> None:
     assert id_like.values_["device"] == {"a": 3.0, "b": 3.0, "c": 3.0, "d": 3.0}
 
 
+# When every category mean is the prior, every category keeps it. Three of
+# these fits reach a quotient of zeros, which the code guards: 0 / 0 in the
+# independent model on a constant target, 1 * 0 / 0 in the pooled one, and
+# 0 * variance / 0 in the pooled one over three categories whose means equal
+# the prior. The quotient itself is NaN, which fails the fit with EngineError.
+@pytest.mark.parametrize("model", ["independent", "pooled"])
+def test_james_stein_keeps_the_prior_when_every_mean_is_the_prior(tmp_path: Path, model: str) -> None:
+    constant: str = write_parquet(
+        tmp_path / "constant.parquet", pa.table({"color": ["amber", "blue", "cyan", "delta"] * 2, "clicks": [5.0] * 8})
+    )
+    encoder: JamesSteinEncoder = JamesSteinEncoder(columns=["color"], target="clicks", model=model).fit([constant])
+    assert encoder.prior_ == 5.0
+    assert encoder.values_ == {"color": {"amber": 5.0, "blue": 5.0, "cyan": 5.0, "delta": 5.0}}
+
+    # amber is 1 and 3, blue 0 and 4, cyan 2 and 2: each mean is 2, the prior.
+    equal: str = write_parquet(
+        tmp_path / "equal.parquet",
+        pa.table({"color": ["amber", "blue", "cyan"] * 2, "clicks": [1.0, 0.0, 2.0, 3.0, 4.0, 2.0]}),
+    )
+    encoder = JamesSteinEncoder(columns=["color"], target="clicks", model=model).fit([equal])
+    assert encoder.prior_ == 2.0
+    assert encoder.values_ == {"color": {"amber": 2.0, "blue": 2.0, "cyan": 2.0}}
+
+
 def test_shrinkage_null_and_unknown_options(events: list[str], tmp_path: Path) -> None:
     keep_null: LeaveOneOutEncoder = LeaveOneOutEncoder(
         columns=["device"], target="clicks", handle_missing="return_nan"
