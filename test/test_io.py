@@ -16,6 +16,7 @@ from pyarrow.parquet import encryption
 from fast_feature_transform import EngineError
 from fast_feature_transform.pipeline import Pipeline
 from fast_feature_transform.transformers import (
+    Cast,
     GroupAgg,
     HashingEncoder,
     LabelEncoder,
@@ -589,6 +590,106 @@ def test_files_that_store_one_nested_string_column_differently_are_read_together
     assert pq.read_table(tmp_path / "out").equals(pa.concat_tables([table] * len(sources)))
 
 
+@pytest.mark.parametrize("leaf", [pa.large_string(), pa.string_view()], ids=str)
+@pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY"])
+@pytest.mark.parametrize("order", [(0, 1, 2), (2, 1, 0)], ids=["dictionary first", "delta first"])
+def test_files_that_store_large_or_view_strings_differently_are_read_together(
+    tmp_path: Path, leaf: pa.DataType, encoding: str, order: tuple[int, ...]
+) -> None:
+    # REGRESSION: a column of large_string or string_view leaves is one column
+    # however a file's writer encoded it. Dictionary and plain pages are read
+    # as a dictionary of string whatever the stored layout, and delta pages
+    # as the stored layout, so a list, large list or struct of them in delta
+    # pages was refused beside the same column in dictionary or plain pages.
+    words: list[str | None] = ["a", None, "a string of more than 12 bytes", "b"] * 50
+    tags: list[list[str | None] | None] = [["a", "b"], ["c", None], [], None, ["a string of more than 12 bytes"]] * 40
+    table: pa.Table = pa.table(
+        {
+            "tags": pa.array(tags, pa.list_(leaf)),
+            "big": pa.array(tags, pa.large_list(leaf)),
+            "pair": pa.array(
+                [{"name": word, "v": row} for row, word in enumerate(words)],
+                pa.struct([("name", leaf), ("v", pa.int64())]),
+            ),
+            "word": pa.array(words, leaf),
+            "x": np.arange(200, dtype=np.float64),
+        }
+    )
+    leaves: list[str] = ["tags.list.element", "big.list.element", "pair.name", "word"]
+    delta: str = write_parquet(
+        tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding=dict.fromkeys(leaves, encoding)
+    )
+    assert pq.read_schema(delta).equals(table.schema, check_metadata=False)
+    assert all(encoding in _first_chunk(Path(delta), leaf).encodings for leaf in leaves)
+    files: list[str] = [
+        write_parquet(tmp_path / "dictionary.parquet", table),
+        write_parquet(tmp_path / "plain.parquet", table, use_dictionary=False),
+        delta,
+    ]
+    sources: list[str] = [files[i] for i in order]
+    pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["x"], with_mean=False, with_std=False))])
+    parts: list[Path] = pipeline.fit(sources).transform_parquet(sources, output_dir=tmp_path / "out")
+    assert len(parts) == len(sources)
+    # A part stores no Arrow schema, so pyarrow reads every string back as
+    # string and every list as a list.
+    written: pa.Schema = pa.schema(
+        [
+            ("tags", pa.list_(pa.string())),
+            ("big", pa.list_(pa.string())),
+            ("pair", pa.struct([("name", pa.string()), ("v", pa.int64())])),
+            ("word", pa.string()),
+            ("x", pa.float64()),
+        ]
+    )
+    assert pq.read_table(tmp_path / "out").equals(pa.concat_tables([table.cast(written)] * len(sources)))
+
+
+@pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY"])
+def test_a_string_view_column_in_delta_pages_is_utf8_to_string_steps_and_cast(tmp_path: Path, encoding: str) -> None:
+    # REGRESSION: a string_view column is utf8 whichever pages its file stores
+    # it in. From delta pages it used to keep the type string_view: string
+    # steps and Cast refused it, and a pipeline fitted on the same column in
+    # dictionary pages could not transform it.
+    views: pa.Table = pa.table(
+        {
+            "word": pa.array(["b", None, "a string of more than 12 bytes", "a", "b"] * 40, pa.string_view()),
+            "n": pa.array(["7", None, "-12", "300000000000", "0"] * 40, pa.string_view()),
+        }
+    )
+    dictionary: str = write_parquet(tmp_path / "dictionary.parquet", views)
+    # Delta pages, then an empty row group.
+    delta: Path = tmp_path / "delta.parquet"
+    with pq.ParquetWriter(
+        delta, views.schema, use_dictionary=False, column_encoding={"word": encoding, "n": encoding}
+    ) as writer:
+        writer.write_table(views)
+        writer.write_table(views.schema.empty_table())
+    assert pq.read_schema(delta).field("word").type == pa.string_view()
+    assert encoding in _first_chunk(delta, "word").encodings
+    # The same values as string in dictionary pages, which every step reads.
+    strings: str = write_parquet(
+        tmp_path / "strings.parquet", views.cast(pa.schema([("word", pa.string()), ("n", pa.string())]))
+    )
+
+    def run(fit: str, transform: str) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
+        pipeline: Pipeline = Pipeline([("cast", Cast({"n": "i64"})), ("ordinal", OrdinalEncoder(columns=["word"]))])
+        pipeline.fit([fit])
+        parts: list[Path] = pipeline.transform_parquet(
+            [transform], output_dir=tmp_path / f"{Path(fit).stem}-{Path(transform).stem}"
+        )
+        rows: list[dict[str, Any]] = pa.concat_tables([pq.read_table(part) for part in parts]).to_pylist()
+        assert rows == [pipeline.transform_dict(row) for row in views.to_pylist()]
+        encoder = pipeline["ordinal"]
+        assert isinstance(encoder, OrdinalEncoder)
+        return encoder.categories_, rows
+
+    expected: tuple[dict[str, list[str]], list[dict[str, Any]]] = run(strings, strings)
+    assert [row["n"] for row in expected[1]] == [None if n is None else int(n) for n in views.column("n").to_pylist()]
+    assert run(str(delta), str(delta)) == expected
+    assert run(dictionary, str(delta)) == expected
+    assert run(str(delta), dictionary) == expected
+
+
 def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: Path) -> None:
     strings: str = write_parquet(tmp_path / "strings.parquet", pa.table({"tags": pa.array([["a"], ["b"]])}))
     numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"tags": pa.array([[1], [2]])}))
@@ -605,6 +706,45 @@ def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: P
         EngineError, match=r"column 'tags' is large_list<element: string> but .* has list<element: string>$"
     ):
         Select(columns=["tags"]).fit([strings, large])
+
+
+def test_files_whose_large_or_view_string_columns_differ_in_type_are_still_refused(tmp_path: Path) -> None:
+    def delta(name: str, column: str, values: pa.Array, leaf: str) -> str:
+        table: pa.Table = pa.table({column: values})
+        return write_parquet(tmp_path / name, table, use_dictionary=False, column_encoding={leaf: "DELTA_BYTE_ARRAY"})
+
+    views: str = delta(
+        "views.parquet", "tags", pa.array([["a"], ["b"]], pa.list_(pa.string_view())), "tags.list.element"
+    )
+    large: str = delta(
+        "large.parquet", "tags", pa.array([["a"], ["b"]], pa.large_list(pa.large_string())), "tags.list.element"
+    )
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"tags": pa.array([[1], [2]])}))
+    # Every string layout is named string, and every other difference stays.
+    with pytest.raises(
+        EngineError,
+        match=r"numbers\.parquet: column 'tags' is list<element: int64> but .*views\.parquet has list<element: string>$",
+    ):
+        Select(columns=["tags"]).fit([views, numbers])
+    with pytest.raises(
+        EngineError,
+        match=r"large\.parquet: column 'tags' is large_list<element: string> but .*views\.parquet has "
+        r"list<element: string>$",
+    ):
+        Select(columns=["tags"]).fit([views, large])
+    blobs: str = write_parquet(tmp_path / "blobs.parquet", pa.table({"tags": pa.array([[b"a"], [b"b"]])}))
+    with pytest.raises(
+        EngineError,
+        match=r"blobs\.parquet: column 'tags' is list<element: binary> but .*views\.parquet has list<element: string>$",
+    ):
+        Select(columns=["tags"]).fit([views, blobs])
+    word: str = delta("word.parquet", "word", pa.array(["a", "b"], pa.string_view()), "word")
+    integers: str = write_parquet(tmp_path / "integers.parquet", pa.table({"word": [1, 2]}))
+    with pytest.raises(EngineError, match=r"integers\.parquet: column 'word' is i64 but .*word\.parquet has utf8$"):
+        Select(columns=["word"]).fit([word, integers])
+    raw: str = write_parquet(tmp_path / "raw.parquet", pa.table({"word": pa.array([b"a", b"b"])}))
+    with pytest.raises(EngineError, match=r"raw\.parquet: column 'word' is binary but .*word\.parquet has utf8$"):
+        Select(columns=["word"]).fit([word, raw])
 
 
 def test_schema_mismatch_messages_name_the_column(tmp_path: Path) -> None:

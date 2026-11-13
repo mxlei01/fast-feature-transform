@@ -55,13 +55,18 @@ arrow::FieldVector fields_without_dictionaries(const arrow::DataType& type) {
 }
 
 // A list, struct or map type with every dictionary inside it replaced by the
-// type of its values; null for any other type. Whether a string is read as a
-// dictionary follows from how its file stored it (dictionary_readable below),
-// so a tag that kept the dictionary would name the storage.
+// type of its values, and every large_string or string_view inside it by
+// string; null for any other type. Whether a string is read as a dictionary
+// follows from how its file stored it (dictionary_readable below), and that
+// read gives a dictionary of string whichever of the three a file stores, so
+// a tag that kept the dictionary or the stored string type would name the
+// storage. A top-level column of any of the three is tagged utf8.
 // REGRESSION: two files that hold the same list of strings, one in
 // dictionary pages and one in delta pages, have one tag and are read
-// together. The tag used to be the Arrow type's own name, dictionary and
-// all, and the second file was refused as holding another type.
+// together, whether the files store string, large_string or string_view. The
+// tag used to be the Arrow type's own name, dictionary and all, and the
+// second file was refused as holding another type; once the dictionary was
+// left out, a list of large_string or string_view still was.
 std::shared_ptr<arrow::DataType> nested_without_dictionaries(const arrow::DataType& type) {
   switch (type.id()) {
     case arrow::Type::LIST:
@@ -85,6 +90,7 @@ std::shared_ptr<arrow::DataType> without_dictionaries(const std::shared_ptr<arro
   if (type->id() == arrow::Type::DICTIONARY) {
     return without_dictionaries(static_cast<const arrow::DictionaryType&>(*type).value_type());
   }
+  if (type->id() == arrow::Type::LARGE_STRING || type->id() == arrow::Type::STRING_VIEW) return arrow::utf8();
   std::shared_ptr<arrow::DataType> nested = nested_without_dictionaries(*type);
   return nested ? nested : type;
 }
@@ -95,6 +101,7 @@ std::string type_tag(const arrow::DataType& type) {
       return type_tag(*static_cast<const arrow::DictionaryType&>(type).value_type());
     case arrow::Type::STRING:
     case arrow::Type::LARGE_STRING:
+    case arrow::Type::STRING_VIEW:  // read as large_string: see strings_from_views
       return "utf8";
     case arrow::Type::BOOL:
       return "bool";
@@ -533,6 +540,39 @@ std::shared_ptr<arrow::Array> trim_dictionary(const std::shared_ptr<arrow::Array
   return arrow::MakeArray(data);
 }
 
+// A string_view column as large_string, which every kernel and cast read.
+// Parquet's reader gives string_view only for a column whose file stores that
+// type in pages it cannot read as a dictionary, such as delta pages; from
+// dictionary or plain pages the same column comes as a dictionary of string
+// (dictionary_readable). 64-bit offsets hold the bytes of any batch of views.
+// A column inside a list, struct or map keeps its views: no kernel reads one,
+// and the Parquet writer stores views and strings alike.
+std::shared_ptr<arrow::Array> strings_from_views(const std::shared_ptr<arrow::Array>& column, const std::string& name) {
+  if (column->type_id() != arrow::Type::STRING_VIEW) return column;
+  const auto& views = static_cast<const arrow::StringViewArray&>(*column);
+  const bool nulls = views.null_count() != 0;
+  int64_t bytes = 0;
+  for (int64_t row = 0; row < views.length(); ++row) {
+    if (!(nulls && views.IsNull(row))) bytes += static_cast<int64_t>(views.GetView(row).size());
+  }
+  arrow::LargeStringBuilder builder;
+  arrow::Status status = builder.Reserve(views.length());
+  if (status.ok()) status = builder.ReserveData(bytes);
+  std::shared_ptr<arrow::Array> strings;
+  if (status.ok()) {
+    for (int64_t row = 0; row < views.length(); ++row) {
+      if (nulls && views.IsNull(row)) {
+        builder.UnsafeAppendNull();
+      } else {
+        builder.UnsafeAppend(views.GetView(row));
+      }
+    }
+    status = builder.Finish(&strings);
+  }
+  if (!status.ok()) throw Error("column '" + name + "': " + status.ToString());
+  return strings;
+}
+
 }  // namespace
 
 Schema schema_from_arrow(const arrow::Schema& schema, const std::string& where) {
@@ -548,7 +588,7 @@ Batch batch_from_arrow(const arrow::RecordBatch& input) {
   for (int i = 0; i < input.num_columns(); ++i) {
     const std::string& name = input.column_name(i);
     batch.names.push_back(name);
-    batch.cols.push_back(epoch_microseconds(trim_dictionary(input.column(i), name), name));
+    batch.cols.push_back(epoch_microseconds(trim_dictionary(strings_from_views(input.column(i), name), name), name));
   }
   return batch;
 }
@@ -717,14 +757,9 @@ class ParquetSource::Reader final : public TaskReader {
       consume(batch_from_arrow(*batch));
     }
     if (!emitted) {
-      Batch empty;
-      for (const auto& field : (*stream)->schema()->fields()) {
-        auto column = arrow::MakeEmptyArray(field->type());
-        if (!column.ok()) throw Error(where + ": " + column.status().ToString());
-        empty.names.push_back(field->name());
-        empty.cols.push_back(epoch_microseconds(*column, field->name()));
-      }
-      consume(std::move(empty));
+      auto empty = arrow::RecordBatch::MakeEmpty((*stream)->schema());
+      if (!empty.ok()) throw Error(where + ": " + empty.status().ToString());
+      consume(batch_from_arrow(**empty));
     }
   }
 
