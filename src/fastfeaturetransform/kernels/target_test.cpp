@@ -8,8 +8,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <utility>
+#include <vector>
 
 #include "fastfeaturetransform/kernel.hpp"
 #include "fastfeaturetransform/kernels/dictionary_test_support.hpp"
@@ -179,11 +181,58 @@ TEST_CASE("woe_encode needs a binary target and zeroes a category seen once") {
   REQUIRE_THROWS_WITH(
       fit_blend("woe_encode", {{"columns", {"c"}}, {"target", "y"}, {"regularization", 5e-324}}, kSchema, {split}),
       ContainsSubstring("column 'c' has a category whose weight of evidence is not finite; check 'regularization'"));
-  // upstream's binary check also takes -1 and 2, which can make a share negative.
-  const fft::Batch wide =
-      make_batch({"c", "y"}, {utf8_column({"a", "a", "b", "b"}), numeric_column<arrow::Int64Type>({-1, -1, 2, 2})});
-  REQUIRE_THROWS_WITH(fit_blend("woe_encode", {{"columns", {"c"}}, {"target", "y"}}, kSchema, {wide}),
-                      ContainsSubstring("weight of evidence is not finite; woe_encode needs a target of 0s and 1s"));
+  // upstream's binary check also takes -1 and 2, 0 and 2, or -1 and 1, and
+  // each pair can make a share negative. A target that holds 0 or 1 but not
+  // both is not a target of 0s and 1s either.
+  using Pair = std::pair<int64_t, int64_t>;
+  for (const auto& [low, high] : {Pair{-1, 2}, Pair{0, 2}, Pair{-1, 1}}) {
+    const fft::Batch wide = make_batch(
+        {"c", "y"}, {utf8_column({"a", "a", "b", "b"}), numeric_column<arrow::Int64Type>({low, low, high, high})});
+    REQUIRE_THROWS_WITH(fit_blend("woe_encode", {{"columns", {"c"}}, {"target", "y"}}, kSchema, {wide}),
+                        ContainsSubstring("weight of evidence is not finite; woe_encode needs a target of 0s and 1s"));
+  }
+}
+
+// REGRESSION: woe_encode compares an integer target's values as integers.
+// It used to compare their f64s, where 2^62 and 2^62 + 1 are one value, so a
+// target of 0, 2^62 and 2^62 + 1 fitted as binary.
+TEST_CASE("woe_encode counts a target's distinct values over every batch, an integer target's as integers") {
+  const int64_t big = int64_t{1} << 62;
+  const nlohmann::json params{{"columns", {"c"}}, {"target", "y"}};
+  auto batch = [](int64_t first, int64_t second) {
+    return make_batch({"c", "y"}, {utf8_column({"a", "b"}), numeric_column<arrow::Int64Type>({first, second})});
+  };
+  // Each batch holds two of the three values, so only the merged probe holds
+  // all three.
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, kSchema, {batch(0, big), batch(big + 1, 0)}),
+                      ContainsSubstring("must be binary, but it holds more than two distinct values"));
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, kSchema, {batch(big + 1, 0), batch(0, big)}),
+                      ContainsSubstring("must be binary, but it holds more than two distinct values"));
+  // A float target's probes merge the same way.
+  const fft::Schema floats{{{"c", "utf8"}, {"y", "f64"}}};
+  auto float_batch = [](double first, double second) {
+    return make_batch({"c", "y"}, {utf8_column({"a", "b"}), numeric_column<arrow::DoubleType>({first, second})});
+  };
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, floats, {float_batch(0.0, 2.0), float_batch(1.0, 0.0)}),
+                      ContainsSubstring("must be binary, but it holds more than two distinct values"));
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, floats, {float_batch(1.0, 0.0), float_batch(0.0, 2.0)}),
+                      ContainsSubstring("must be binary, but it holds more than two distinct values"));
+  // Two integers that differ by one near 2^62 are two values, and the target
+  // is refused for the value it lacks, as category_encoders refuses it.
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, kSchema, {batch(big, big), batch(big + 1, big + 1)}),
+                      ContainsSubstring("must be binary with values 0 and 1; no value 0 was found"));
+  REQUIRE_THROWS_WITH(fit_blend("woe_encode", params, kSchema, {batch(-big, -big), batch(-big - 1, -big - 1)}),
+                      ContainsSubstring("must be binary with values 0 and 1; no value 1 was found"));
+  // 0 and 2^62 + 1 are a binary target, split either way. Each category
+  // holds one of each, so its odds are the fit's and its weight of evidence
+  // is 0; the prior is 2^63 + 2 rounded to an f64, over 4.
+  const std::vector<std::vector<fft::Batch>> splits{{batch(0, big + 1), batch(big + 1, 0)},
+                                                    {batch(big + 1, big + 1), batch(0, 0)}};
+  for (const std::vector<fft::Batch>& batches : splits) {
+    auto kernel = fit_blend("woe_encode", params, kSchema, batches);
+    REQUIRE(kernel->state().at("prior").get<double>() == 0x1p61);
+    REQUIRE(kernel->state().at("values").at("c") == nlohmann::json({{"a", 0.0}, {"b", 0.0}}));
+  }
 }
 
 TEST_CASE("the target-mean kernels keep a null category and skip a null target") {
