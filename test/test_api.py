@@ -8,6 +8,7 @@ import importlib.metadata
 import inspect
 import json
 import math
+import operator
 import os
 import pickle
 import re
@@ -546,6 +547,69 @@ def test_an_option_given_as_an_enum_of_strings_is_taken_as_its_value(
     assert json.dumps(given.params()) == json.dumps(plain.params())
 
 
+class _UnhashableText(str):
+    """A str that cannot be hashed."""
+
+    __slots__ = ()
+    __hash__ = None
+
+
+class _ArrayEquality:
+    """A value that hashes as a string does and compares as an array of two elements, which has no truth value."""
+
+    def __init__(self, text: str) -> None:
+        """Take the string whose hash this value shares.
+
+        Args:
+            text: The string.
+
+        """
+        self.text: str = text
+
+    def __hash__(self) -> int:
+        """Hash as the string does.
+
+        Returns:
+            The string's hash.
+
+        """
+        return hash(self.text)
+
+    def __eq__(self, other: object) -> Any:
+        """Compare as numpy compares an array of two elements.
+
+        Args:
+            other: The object compared with.
+
+        Returns:
+            An array of two elements.
+
+        """
+        return np.array([True, False])
+
+
+@pytest.mark.parametrize(
+    ("transformer", "arguments", "option"),
+    _STRING_OPTIONS,
+    ids=[f"{transformer.__name__}-{option}" for transformer, _, option in _STRING_OPTIONS],
+)
+def test_an_option_given_a_value_it_cannot_hash_or_compare_raises_its_own_error(
+    transformer: type[Transformer], arguments: dict[str, Any], option: str
+) -> None:
+    # REGRESSION: an option reads a str by its text, and refuses any other
+    # value with its own ValueError, which names the option. A value that
+    # cannot be hashed, or whose comparison with a string has no truth value,
+    # used to raise the TypeError of hashing it or numpy's ValueError about
+    # an array's truth value, neither of which names the option.
+    accepted: str = arguments[option]
+    for value in ([accepted], np.array([accepted, accepted]), _ArrayEquality(accepted)):
+        with pytest.raises(ValueError, match=f"^{transformer.__name__}: {option} must be "):
+            transformer(**{**arguments, option: value})
+    given: Transformer = transformer(**{**arguments, option: _UnhashableText(accepted)})
+    assert type(getattr(given, option)) is str
+    assert getattr(given, option) == accepted
+
+
 def test_type_tags_and_aggregates_given_as_an_enum_of_strings_are_taken_as_their_values() -> None:
     tag: Any = enum.Enum("Tag", {"NAME": "f64"}, type=str).NAME
     aggregate: Any = enum.Enum("Aggregate", {"NAME": "mean"}, type=str).NAME
@@ -555,6 +619,20 @@ def test_type_tags_and_aggregates_given_as_an_enum_of_strings_are_taken_as_their
     group: GroupAgg = GroupAgg(key="k", aggs={"x": [aggregate]})
     assert [type(value) for value in group.aggs["x"]] == [str]
     assert group.params() == GroupAgg(key="k", aggs={"x": ["mean"]}).params()
+
+
+def test_type_tags_and_aggregates_that_cannot_be_hashed_are_read_by_their_text() -> None:
+    # REGRESSION: a type tag or an aggregate is read by its text, as every
+    # string option is. One that could not be hashed used to raise the bare
+    # TypeError of hashing it.
+    cast: Cast = Cast({"x": _UnhashableText("f64")})
+    assert [type(value) for value in cast.types.values()] == [str]
+    assert cast.params() == Cast({"x": "f64"}).params()
+    group: GroupAgg = GroupAgg(key="k", aggs={"x": [_UnhashableText("mean"), "max"]})
+    assert [type(value) for value in group.aggs["x"]] == [str, str]
+    assert group.params() == GroupAgg(key="k", aggs={"x": ["mean", "max"]}).params()
+    with pytest.raises(ValueError, match="GroupAgg: column 'x' lists an aggregate more than once"):
+        GroupAgg(key="k", aggs={"x": [_UnhashableText("mean"), "mean"]})
 
 
 def test_an_encoder_whose_option_is_an_enum_fits_like_one_given_the_string(tmp_path: Path) -> None:
@@ -1058,6 +1136,37 @@ def test_pipeline_indexing_length_and_repr(train_files: list[str]) -> None:
     assert repr(Select(columns=["a"])) == "Select(columns=['a'])"
     assert repr(LabelEncoder()) == "LabelEncoder(columns=None, min_count=1)"
     assert repr(pipeline).startswith("Pipeline(steps=[('features', Pipeline(steps=[('select', Select(")
+
+
+class _Position:
+    """A value that operator.index reads as 1 and that is not an int."""
+
+    def __index__(self) -> int:
+        """Read the value as an index.
+
+        Returns:
+            1.
+
+        """
+        return 1
+
+
+def test_a_pipeline_takes_any_value_operator_index_takes_as_an_index() -> None:
+    # REGRESSION: a pipeline's index is any value that operator.index takes,
+    # read as a list reads it. Only an int used to be one: a numpy integer was
+    # looked up as a step name and raised KeyError.
+    pipeline: Pipeline = Pipeline([(name, Select(columns=["a"])) for name in ("first", "second", "third")])
+    steps: list[Any] = [step for _, step in pipeline.steps]
+    # A bool is an index as before, so True is the second step.
+    for key in (np.int64(0), np.int8(-1), np.uint64(2), np.array(1), _Position(), True, False):
+        assert pipeline[key] is steps[operator.index(key)], key
+    with pytest.raises(IndexError):
+        pipeline[np.int64(3)]
+    # numpy's bool, a float and an array of integers are refused by
+    # operator.index, and so are neither an index nor a step name.
+    for not_an_index in (np.True_, 1.0, np.array([0, 1])):
+        with pytest.raises(KeyError):
+            pipeline[not_an_index]  # ty: ignore[invalid-argument-type]
 
 
 def test_nested_pipeline_pickle_stores_the_manifest_once(train_files: list[str]) -> None:

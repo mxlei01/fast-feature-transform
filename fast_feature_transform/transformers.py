@@ -6,6 +6,7 @@ read-only views of it.
 """
 
 import contextlib
+import fractions
 import itertools
 import json
 import math
@@ -15,7 +16,7 @@ import os
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Self, overload, override
+from typing import Any, ClassVar, Self, TypeGuard, overload, override
 
 from fast_feature_transform import _core
 
@@ -818,11 +819,15 @@ class Cast(Transformer):
             raise TypeError("Cast: types must be a non-empty mapping of column name to type tag")
         plain: bool = True
         for column, tag in types.items():
+            text: str = tag
             if type(column) is not str or type(tag) is not str:
                 if not isinstance(column, str) or not isinstance(tag, str):
                     raise TypeError(f"Cast: types must map column names to type tags, got {column!r}: {tag!r}")
                 plain = False
-            if tag not in TYPE_TAGS:
+                text = str.__str__(tag)
+            # A tag is read by its text, as _is_one_of reads an option, here
+            # without a call per pair.
+            if text not in TYPE_TAGS:
                 raise ValueError(
                     f"Cast: unsupported type {tag!r} for column {column!r}; choose one of {sorted(TYPE_TAGS)}"
                 )
@@ -839,6 +844,27 @@ class Cast(Transformer):
         return {"types": self.types}
 
 
+def _is_one_of(value: object, allowed: frozenset[str] | set[str]) -> TypeGuard[str]:
+    """Tell whether an option's value is one of the strings a kernel accepts.
+
+    Only a str is, read as the plain string it holds, which is what the
+    kernel receives: a str subclass, such as an Enum with a str mixin, is
+    read as its text, as ``_column_list`` reads a column name. So no hash or
+    comparison of the value's own runs, and a value that cannot be hashed,
+    such as a list, or whose comparison with a string has no truth value,
+    such as a numpy array, is simply not one of them.
+
+    Args:
+        value: The value passed for the option.
+        allowed: The accepted values.
+
+    Returns:
+        Whether the value is a str whose text ``allowed`` holds.
+
+    """
+    return isinstance(value, str) and str.__str__(value) in allowed
+
+
 def _one_of(value: object, allowed: frozenset[str] | set[str], what: str, option: str) -> str:
     """Validate a string option against the values a kernel accepts.
 
@@ -852,18 +878,21 @@ def _one_of(value: object, allowed: frozenset[str] | set[str], what: str, option
         The value, as a plain ``str``.
 
     Raises:
-        ValueError: If the value is not one of the accepted ones.
+        ValueError: If the value is not a str whose text is one of the
+            accepted values.
 
     """
-    if value not in allowed:
+    # The value is read by its text, as _is_one_of reads it, here without the
+    # call. A str subclass, such as an Enum with a str mixin, prints as
+    # something other than its text, and the kernel takes the text.
+    if not isinstance(value, str) or (text := str.__str__(value)) not in allowed:
         raise ValueError(f"{what}: {option} must be one of {sorted(allowed)}, got {value!r}")
-    # A str subclass, such as an Enum with a str mixin, equals an accepted
-    # value and prints as something else. The kernel takes the value itself.
-    return str.__str__(value) if isinstance(value, str) else str(value)
+    return text
 
 
 _HANDLE_UNKNOWN: frozenset[str] = frozenset({"value", "return_nan", "error"})
 _HANDLE_MISSING: frozenset[str] = frozenset({"value", "return_nan", "error"})
+_FORCE: frozenset[str] = frozenset({"force"})  # CountEncoder's combine_min_nan_groups, beside True and False
 
 AGGREGATES: frozenset[str] = frozenset({"count", "sum", "mean", "min", "max", "median"})
 
@@ -917,15 +946,16 @@ class GroupAgg(Transformer):
             if isinstance(names, str) or not isinstance(names, (list, tuple)) or not names:
                 raise TypeError(f"GroupAgg: aggregates for column {column!r} must be a non-empty list, got {names!r}")
             for name in names:
-                if not isinstance(name, str) or name not in AGGREGATES:
+                if not _is_one_of(name, AGGREGATES):
                     raise ValueError(
                         f"GroupAgg: unknown aggregate {name!r} for column {column!r}; choose from {sorted(AGGREGATES)}"
                     )
-            if len(set(names)) != len(names):
-                raise ValueError(f"GroupAgg: column {column!r} lists an aggregate more than once")
             # A name or aggregate given as a str subclass, such as an Enum
             # with a str mixin, is stored as the plain string it equals.
-            validated[str.__str__(column)] = [str.__str__(name) for name in names]
+            aggregates: list[str] = [str.__str__(name) for name in names]
+            if len(set(aggregates)) != len(aggregates):
+                raise ValueError(f"GroupAgg: column {column!r} lists an aggregate more than once")
+            validated[str.__str__(column)] = aggregates
         self.key: str = str.__str__(key)
         self.aggs: dict[str, list[str]] = validated
 
@@ -1051,13 +1081,14 @@ class CountEncoder(Transformer):
         size: float | None = None if min_group_size is None else _group_size(min_group_size)
         if min_group_name is not None and not isinstance(min_group_name, str):
             raise TypeError(f"CountEncoder: min_group_name must be a string, got {min_group_name!r}")
-        if not isinstance(combine_min_nan_groups, bool) and combine_min_nan_groups != "force":
+        force: bool = not isinstance(combine_min_nan_groups, bool)
+        if force and not _is_one_of(combine_min_nan_groups, _FORCE):
             raise ValueError(
                 f"CountEncoder: combine_min_nan_groups must be True, False or 'force', got {combine_min_nan_groups!r}"
             )
         unknown: str | int
-        if isinstance(handle_unknown, str) and handle_unknown in _HANDLE_UNKNOWN:
-            unknown = _one_of(handle_unknown, _HANDLE_UNKNOWN, "CountEncoder", "handle_unknown")
+        if _is_one_of(handle_unknown, _HANDLE_UNKNOWN):
+            unknown = str.__str__(handle_unknown)
         else:
             try:
                 unknown = _integer(handle_unknown, "CountEncoder: handle_unknown")
@@ -1067,14 +1098,12 @@ class CountEncoder(Transformer):
                     f"got {handle_unknown!r}"
                 ) from None
         handle_missing = _one_of(handle_missing, _HANDLE_MISSING, "CountEncoder", "handle_missing")
-        if combine_min_nan_groups == "force" and handle_missing == "return_nan":
+        if force and handle_missing == "return_nan":
             raise ValueError("CountEncoder: combine_min_nan_groups='force' needs handle_missing 'value' or 'error'")
         self.normalize: bool = normalize
         self.min_group_size: float | None = size
         self.min_group_name: str | None = None if min_group_name is None else str.__str__(min_group_name)
-        self.combine_min_nan_groups: bool | str = (
-            combine_min_nan_groups if isinstance(combine_min_nan_groups, bool) else "force"
-        )
+        self.combine_min_nan_groups: bool | str = "force" if force else combine_min_nan_groups
         self.handle_unknown: str | int = unknown
         self.handle_missing: str = handle_missing
 
@@ -1536,6 +1565,7 @@ class PolynomialEncoder(_Contrast):
 
 
 MAX_COMPONENTS: int = 4096
+_HASH_METHODS: frozenset[str] = frozenset({"md5"})
 
 
 class HashingEncoder(Transformer):
@@ -1586,7 +1616,7 @@ class HashingEncoder(Transformer):
         self.n_components: int = _integer(n_components, "HashingEncoder: n_components")
         if not 1 <= self.n_components <= MAX_COMPONENTS:
             raise ValueError(f"HashingEncoder: n_components must be between 1 and {MAX_COMPONENTS}, got {n_components}")
-        if hash_method != "md5":
+        if not _is_one_of(hash_method, _HASH_METHODS):
             raise ValueError(f"HashingEncoder: hash_method must be 'md5', got {hash_method!r}")
         self.hash_method: str = "md5"
 
@@ -1976,6 +2006,7 @@ class _ShrinkageEncoder(Transformer):
 
 
 JAMES_STEIN_MODELS: frozenset[str] = frozenset({"independent", "pooled", "beta"})
+_JAMES_STEIN_BINARY: frozenset[str] = frozenset({"binary"})  # category_encoders' model this package refuses
 
 
 class JamesSteinEncoder(_ShrinkageEncoder):
@@ -2039,7 +2070,7 @@ class JamesSteinEncoder(_ShrinkageEncoder):
 
         """
         super().__init__(columns, target, handle_unknown, handle_missing)
-        if model == "binary":
+        if _is_one_of(model, _JAMES_STEIN_BINARY):
             raise ValueError(
                 "JamesSteinEncoder: model='binary' reads its estimate from a module global that category_encoders' "
                 "optimizer leaves behind, so it is not reproducible from the formula and not portable; "
@@ -2453,6 +2484,29 @@ def _finite(value: object, what: str, key: str) -> float:
     return number
 
 
+def _exact(value: Any) -> fractions.Fraction:
+    """Read a finite number that ``_real`` accepted as the exact value it holds.
+
+    An integer is read through ``operator.index``, as ``_real`` reads it, and
+    any other number through ``fractions.Fraction``, which reads a float, a
+    ``Fraction`` and a numpy float exactly. A number that ``Fraction`` cannot
+    read is taken as its nearest f64.
+
+    Args:
+        value: A finite number that ``_real`` accepted.
+
+    Returns:
+        The number as a fraction.
+
+    """
+    with contextlib.suppress(TypeError):
+        return fractions.Fraction(operator.index(value))
+    try:
+        return fractions.Fraction(value)
+    except TypeError:
+        return fractions.Fraction(float(value))
+
+
 class _Scaler(Transformer):
     """Shared base for the three fitted scalers: a numeric column list and its row count.
 
@@ -2624,8 +2678,8 @@ class MinMaxScaler(_Scaler):
             TypeError: If columns is a bare string, feature_range is not a
                 pair of numbers, or clip is not a bool.
             ValueError: If columns is empty, feature_range is not two finite
-                numbers with the first below the second, or a bound is
-                outside the range of f64.
+                numbers whose f64 values have the first below the second, or
+                a bound is outside the range of f64.
 
         """
         super().__init__(columns)
@@ -2634,6 +2688,14 @@ class MinMaxScaler(_Scaler):
         low: float = _finite(feature_range[0], "MinMaxScaler", "feature_range")
         high: float = _finite(feature_range[1], "MinMaxScaler", "feature_range")
         if low >= high:
+            # Bounds in order that round to one f64, such as 2**53 and
+            # 2**53 + 1, get a message of their own: low is below high as
+            # given, and only the rounding makes the two equal.
+            if low == high and _exact(feature_range[0]) < _exact(feature_range[1]):
+                raise ValueError(
+                    f"MinMaxScaler: feature_range bounds {feature_range[0]!r} and {feature_range[1]!r} both round to "
+                    f"the f64 {low!r}, so low is not below high; give bounds that differ as f64 values"
+                )
             raise ValueError(f"MinMaxScaler: feature_range must be (low, high) with low < high, got {feature_range!r}")
         self.feature_range: tuple[float, float] = (low, high)
         self.clip: bool = _flag(clip, "MinMaxScaler", "clip")

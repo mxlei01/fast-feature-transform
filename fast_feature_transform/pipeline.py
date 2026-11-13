@@ -9,10 +9,11 @@ path, and a list of Parquet paths takes the batch path.
 """
 
 import json
+import operator
 import threading
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Self, overload
+from typing import Any, Self, SupportsIndex, overload
 
 from fast_feature_transform import _core
 from fast_feature_transform.transformers import (
@@ -519,23 +520,31 @@ class Pipeline:
         """
         return cls._from_handle(_core.FittedPipeline.load(_directory_path(path, "path"), _check_threads(threads)))
 
-    def __getitem__(self, key: int | str) -> Transformer | Pipeline:
+    def __getitem__(self, key: SupportsIndex | str) -> Transformer | Pipeline:
         """Look up a step by name or position.
 
         Args:
-            key: The step name given at construction, or its index.
+            key: The step name given at construction, or its index as a list
+                reads one: an int, a numpy integer, or any other value that
+                ``operator.index`` takes. A bool is such a value, so ``True``
+                is index 1.
 
         Returns:
             The step's transformer or nested pipeline.
 
         Raises:
             IndexError: If the index is out of range.
-            KeyError: If no step has the given name.
+            KeyError: If no step has the given name, or the key is neither a
+                str nor a value that ``operator.index`` takes.
 
         """
         steps: list[Step] = self.steps
-        if isinstance(key, int):
-            return steps[key][1]
+        if not isinstance(key, str):
+            try:
+                index: int = operator.index(key)
+            except TypeError:
+                raise KeyError(key) from None
+            return steps[index][1]
         for step_name, step in steps:
             if step_name == key:
                 return step

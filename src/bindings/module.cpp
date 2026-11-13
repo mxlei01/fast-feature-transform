@@ -80,14 +80,31 @@ const std::unordered_map<std::string, std::pair<int64_t, int64_t>> kMicroseconds
                                                                                         {"fs", {1, 1'000'000'000}},
                                                                                         {"as", {1, 1'000'000'000'000}}};
 
+// A value's attribute, or an empty object when the value has none, as
+// Python's hasattr tells it: an AttributeError means none, and any other
+// error the lookup raises propagates. nb::hasattr instead hands such an
+// error to sys.unraisablehook and answers false.
+//
+// The record path fetches every attribute it calls with into an object
+// first, with this or nb::getattr. nanobind converts a call's arguments in a
+// function that cannot throw, so a lookup passed to a call as
+// value.attr(name) that fails there ends the process.
+nb::object optional_attr(nb::handle value, const char* attribute) {
+  PyObject* found = nullptr;
+  if (PyObject_GetOptionalAttrString(value.ptr(), attribute, &found) < 0) throw nb::python_error();
+  return nb::steal(found);
+}
+
 // A numpy.datetime64 (or a pandas Timestamp's asm8) from its stored count,
-// rescaled exactly: numpy's own cast to microseconds can overflow on a value
-// that fits. Finer units floor, as numpy and the batch path do; NaT, which
-// numpy stores as INT64_MIN, becomes null.
-std::optional<int64_t> numpy_epoch_microseconds(nb::handle value, const std::string& name) {
-  const auto count = nb::cast<int64_t>(value.attr("astype")("int64").attr("item")());
+// which its astype reads, and its unit, which its dtype holds, rescaled
+// exactly: numpy's own cast to microseconds can overflow on a value that
+// fits. Finer units floor, as numpy and the batch path do; NaT, which numpy
+// stores as INT64_MIN, becomes null.
+std::optional<int64_t> numpy_epoch_microseconds(const nb::object& astype, const nb::object& dtype,
+                                                const std::string& name) {
+  const auto count = nb::cast<int64_t>(astype("int64").attr("item")());
   if (count == std::numeric_limits<int64_t>::min()) return std::nullopt;
-  const nb::object unit_and_step = nb::module_::import_("numpy").attr("datetime_data")(value.attr("dtype"));
+  const nb::object unit_and_step = nb::module_::import_("numpy").attr("datetime_data")(dtype);
   const auto unit = nb::cast<std::string>(unit_and_step[0]);
   const auto step = nb::cast<int64_t>(unit_and_step[1]);
   const auto per_unit = kMicrosecondsPerUnit.find(unit);
@@ -192,13 +209,26 @@ Row row_from_dict(const nb::dict& record) {
       };
       double real = 0.0;
       if (PyDateTime_Check(value.ptr()) || type == "datetime64") {
-        // A pandas Timestamp, NaT included, is a datetime whose fields cannot be
-        // trusted: they read 0001-01-01 for NaT and hold a stand-in year outside
-        // 1 to 9999. Its asm8 is its true count (the UTC instant when aware).
-        const std::optional<int64_t> micros = !PyDateTime_Check(value.ptr()) ? numpy_epoch_microseconds(value, name)
-                                              : nb::hasattr(value, "asm8")
-                                                  ? numpy_epoch_microseconds(value.attr("asm8"), name)
-                                                  : std::optional<int64_t>(epoch_microseconds(value.ptr(), name));
+        std::optional<int64_t> micros;
+        if (!PyDateTime_Check(value.ptr())) {
+          // A value of another type named datetime64 that has no astype or no
+          // dtype is not numpy's, and so not a supported type.
+          const nb::object astype = optional_attr(value, "astype");
+          const nb::object dtype = optional_attr(value, "dtype");
+          if (!astype.is_valid() || !dtype.is_valid()) throw unsupported();
+          micros = numpy_epoch_microseconds(astype, dtype, name);
+        } else if (const nb::object asm8 = optional_attr(value, "asm8"); asm8.is_valid()) {
+          // A pandas Timestamp, NaT included, is a datetime whose fields
+          // cannot be trusted: they read 0001-01-01 for NaT and hold a
+          // stand-in year outside 1 to 9999. Its asm8 is its true count (the
+          // UTC instant when aware), and an asm8 without astype or dtype
+          // raises the AttributeError of the one it lacks.
+          const nb::object astype = nb::getattr(asm8, "astype");
+          const nb::object dtype = nb::getattr(asm8, "dtype");
+          micros = numpy_epoch_microseconds(astype, dtype, name);
+        } else {
+          micros = epoch_microseconds(value.ptr(), name);
+        }
         if (micros) {
           row.emplace_back(std::move(name), *micros);
         } else {
@@ -208,7 +238,7 @@ Row row_from_dict(const nb::dict& record) {
         const int truth = PyObject_IsTrue(value.ptr());
         if (truth < 0) throw nb::python_error();  // the error its __bool__ raised
         row.emplace_back(std::move(name), truth == 1);
-      } else if (nb::hasattr(value, "__index__")) {  // integer-like: fits int64 or fails, never widens
+      } else if (optional_attr(value, "__index__").is_valid()) {  // integer-like: fits int64 or fails, never widens
         nb::object index = nb::steal(PyNumber_Index(value.ptr()));
         if (!index.is_valid()) {
           // A TypeError is __index__ refusing it (a float or non-scalar
