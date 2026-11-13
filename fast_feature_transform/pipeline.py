@@ -54,6 +54,7 @@ from fast_feature_transform.transformers import (
     WOEEncoder,
     _cached_manifest,
     _check_threads,
+    _directory_path,
     _fit_engine,
     _output_directory,
     _source_paths,
@@ -131,8 +132,11 @@ def parquet_to_memmap(X: Sequence[str | Path], *, output_dir: str | Path | None 
         EngineError: If the input cannot be read or holds a string column, a
             null, a list column whose rows differ in length or are empty, or
             a type a memmap cannot store.
-        TypeError: If X is a single path instead of a list of paths.
-        ValueError: If threads is not an integer from 0 to 2**32 - 1.
+        TypeError: If X is a single path instead of a list of paths, or
+            output_dir is not None and is neither a str nor an os.PathLike
+            that gives a str.
+        ValueError: If threads is not an integer from 0 to 2**32 - 1, or
+            output_dir is empty or holds a NUL character.
 
     """
     sources: list[str] = _source_paths(X)
@@ -271,9 +275,12 @@ class Pipeline:
 
         Raises:
             EngineError: If the input cannot be read or a step's columns are missing or mistyped.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                temp_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
             ValueError: If threads is not an integer from 0 to 2**32 - 1, or
-                temp_dir is not an existing directory.
+                temp_dir holds a NUL character or is not an existing
+                directory.
 
         """
         plan: str = json.dumps(self._to_tree())
@@ -325,7 +332,10 @@ class Pipeline:
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                output_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
         handle: _core.FittedPipeline = self._require_handle()
@@ -349,10 +359,15 @@ class Pipeline:
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                output_dir is neither a str nor an os.PathLike that gives a
+                str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
-        return Path(self._require_handle().transform_memmap(_source_paths(X), str(output_dir)))
+        return Path(
+            self._require_handle().transform_memmap(_source_paths(X), _directory_path(output_dir, "output_dir"))
+        )
 
     @overload
     def transform(self, X: dict[str, Any]) -> dict[str, Any]: ...
@@ -377,7 +392,10 @@ class Pipeline:
         Raises:
             EngineError: If the engine rejects the input.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
-            TypeError: If X is neither a dict nor a list of paths.
+            TypeError: If X is neither a dict nor a list of paths, or
+                output_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
         if isinstance(X, dict):
@@ -409,7 +427,19 @@ class Pipeline:
         Returns:
             The list of written part-file paths.
 
+        Raises:
+            EngineError: If fit or transform_parquet raises it.
+            TypeError: If X is a single path instead of a list of paths, or
+                temp_dir or output_dir is not None and is neither a str nor an
+                os.PathLike that gives a str.
+            ValueError: If threads is not an integer from 0 to 2**32 - 1,
+                output_dir is empty, temp_dir or output_dir holds a NUL
+                character, or temp_dir is not an existing directory. Both
+                directories are checked before the fit starts.
+
         """
+        if output_dir is not None:
+            output_dir = _directory_path(output_dir, "output_dir")
         return self.fit(X, y, threads=threads, temp_dir=temp_dir).transform_parquet(X, output_dir=output_dir)
 
     def save(self, path: str | Path) -> None:
@@ -422,9 +452,11 @@ class Pipeline:
         Raises:
             EngineError: If the directory or manifest cannot be written.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            TypeError: If path is neither a str nor an os.PathLike that gives a str.
+            ValueError: If path is empty or holds a NUL character.
 
         """
-        self._require_handle().save(str(path))
+        self._require_handle().save(_directory_path(path, "path"))
 
     def stages_json(self) -> str:
         """Describe the fitted steps in execution order, as JSON text.
@@ -480,10 +512,12 @@ class Pipeline:
         Raises:
             EngineError: If the manifest is missing or invalid, or its layout
                 (``schema_version``) is one this build does not read.
-            ValueError: If threads is not an integer from 0 to 2**32 - 1.
+            TypeError: If path is neither a str nor an os.PathLike that gives a str.
+            ValueError: If path is empty or holds a NUL character, or
+                threads is not an integer from 0 to 2**32 - 1.
 
         """
-        return cls._from_handle(_core.FittedPipeline.load(str(path), _check_threads(threads)))
+        return cls._from_handle(_core.FittedPipeline.load(_directory_path(path, "path"), _check_threads(threads)))
 
     def __getitem__(self, key: int | str) -> Transformer | Pipeline:
         """Look up a step by name or position.

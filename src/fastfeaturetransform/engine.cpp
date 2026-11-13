@@ -772,15 +772,22 @@ void FittedPipeline::save(const std::string& dir) const {
   std::lock_guard<std::mutex> directory_lock(*directory_mutex);
   const std::string path = dir + "/manifest.json";
   const std::string temp = path + ".tmp";
+  // REGRESSION: only a temporary this call opened is removed again. A failed
+  // open leaves alone what its name reaches, such as a directory in the
+  // temporary's place, or the directory that a NUL in dir cuts the name to.
+  // The cleanup used to run after a failed open too, and removed such a
+  // directory when it was empty.
+  bool opened = false;
   try {
     std::ofstream file(temp);
     if (!file) throw Error(temp + ": cannot write");
+    opened = true;
     write_manifest(file);
     file.close();
     if (!file) throw Error(temp + ": failed writing");
     flush_to_disk(temp, false);
   } catch (...) {
-    std::filesystem::remove(temp, ec);
+    if (opened) std::filesystem::remove(temp, ec);
     throw;
   }
   std::filesystem::rename(temp, path, ec);
