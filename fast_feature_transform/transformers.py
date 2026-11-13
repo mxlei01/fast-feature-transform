@@ -146,6 +146,38 @@ def _source_paths(X: object) -> list[str]:
     return paths
 
 
+def _directory_path(path: object, what: str) -> str:
+    """Turn a directory argument into the str the engine takes, through os.fspath.
+
+    str() turns None, bytes and an os.PathLike other than pathlib.Path into
+    text that names another directory. The operating system ends a path at
+    its first NUL character, so a path that holds one names a place other
+    than the one the caller wrote, and an empty path names none.
+
+    Args:
+        path: The caller's value.
+        what: The argument's name, for the error message.
+
+    Returns:
+        The path as a str.
+
+    Raises:
+        TypeError: If path is neither a str nor an os.PathLike that gives a str.
+        ValueError: If path is empty or holds a NUL character.
+
+    """
+    text: object = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
+    if isinstance(text, bytes):
+        raise TypeError(f"{what} must be a str path, got bytes; decode it with os.fsdecode")
+    if not isinstance(text, str):
+        raise TypeError(f"{what} must be a str or os.PathLike, got {type(path).__name__}")
+    if not text:
+        raise ValueError(f"{what} must not be empty; pass '.' for the current directory")
+    if "\0" in text:
+        raise ValueError(f"{what} must not hold a NUL character, got {text!r}")
+    return text
+
+
 @contextlib.contextmanager
 def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
     """Give a batch call the directory it writes into.
@@ -157,9 +189,14 @@ def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
         The directory's path. A temporary directory made here is removed
         again if the call raises and leaves it empty.
 
+    Raises:
+        TypeError: If output_dir is not None and is neither a str nor an
+            os.PathLike that gives a str.
+        ValueError: If output_dir is empty or holds a NUL character.
+
     """
     if output_dir is not None:
-        yield str(output_dir)
+        yield _directory_path(output_dir, "output_dir")
         return
     created: str = tempfile.mkdtemp(prefix="fast_feature_transform_")
     try:
@@ -201,24 +238,28 @@ def _fit_engine(threads: int, temp_dir: str | Path | None) -> _core.Engine:
 
     Args:
         threads: Worker count, or zero for all cores.
-        temp_dir: Parent directory for private spill files; None uses the
-            system temporary directory.
+        temp_dir: Parent directory for private spill files; None or an empty
+            string uses the system temporary directory.
 
     Returns:
         The native engine.
 
     Raises:
-        TypeError: If temp_dir is not a string path.
-        ValueError: If threads is invalid, or temp_dir is not an existing
-            directory. The engine opens temp_dir only when the fit first
-            spills, so a typo would otherwise pass on small data.
+        TypeError: If temp_dir is not None and is neither a str nor an
+            os.PathLike that gives a str.
+        ValueError: If threads is invalid, or temp_dir holds a NUL character
+            or is not an existing directory. The engine opens
+            temp_dir only when the fit first spills, so a typo would
+            otherwise pass on small data.
 
     """
-    directory = os.fspath(temp_dir) if temp_dir is not None else ""
-    if not isinstance(directory, str):
-        raise TypeError("temp_dir must be a string path")
-    if directory and not os.path.isdir(directory):
-        raise ValueError(f"temp_dir must be an existing directory, got {directory!r}")
+    directory: str = ""
+    # An empty string has always meant the system temporary directory, as
+    # None does, so it is not refused here as an empty output directory is.
+    if temp_dir is not None and temp_dir != "":
+        directory = _directory_path(temp_dir, "temp_dir")
+        if not os.path.isdir(directory):
+            raise ValueError(f"temp_dir must be an existing directory, got {directory!r}")
     return _core.Engine(_check_threads(threads), directory)
 
 
@@ -381,9 +422,12 @@ class Transformer:
 
         Raises:
             EngineError: If the input cannot be read or a column is missing or mistyped.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                temp_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
             ValueError: If threads is not an integer from 0 to 2**32 - 1, or
-                temp_dir is not an existing directory.
+                temp_dir holds a NUL character or is not an existing
+                directory.
 
         """
         from fast_feature_transform.pipeline import Pipeline
@@ -440,7 +484,10 @@ class Transformer:
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
             RuntimeError: If unfitted, or fitted as part of a Pipeline.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                output_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
         handle: _core.FittedPipeline = self._standalone_handle()
@@ -464,10 +511,15 @@ class Transformer:
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
             RuntimeError: If this transformer does not own a fitted pipeline.
-            TypeError: If X is a single path instead of a list of paths.
+            TypeError: If X is a single path instead of a list of paths, or
+                output_dir is neither a str nor an os.PathLike that gives a
+                str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
-        return Path(self._standalone_handle().transform_memmap(_source_paths(X), str(output_dir)))
+        return Path(
+            self._standalone_handle().transform_memmap(_source_paths(X), _directory_path(output_dir, "output_dir"))
+        )
 
     @overload
     def transform(self, X: dict[str, Any]) -> dict[str, Any]: ...
@@ -494,7 +546,10 @@ class Transformer:
         Raises:
             EngineError: If the engine rejects the input.
             RuntimeError: If unfitted, or fitted as part of a Pipeline.
-            TypeError: If X is neither a dict nor a list of paths.
+            TypeError: If X is neither a dict nor a list of paths, or
+                output_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character.
 
         """
         if isinstance(X, dict):

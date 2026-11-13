@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -307,6 +308,65 @@ TEST_CASE("a failed save leaves nothing new behind") {
   std::filesystem::create_directories(dir.path / "artifact" / "manifest.json");  // a directory in the way
   REQUIRE_THROWS_AS(loaded.save((dir.path / "artifact").string()), fft::Error);
   REQUIRE_FALSE(std::filesystem::exists(dir.path / "artifact" / "manifest.json.tmp"));
+}
+
+// REGRESSION: a save whose temporary cannot be opened removes nothing. Its
+// cleanup used to remove what the temporary's name reached when that was an
+// empty directory: one in the temporary's place, or the directory a NUL in
+// the path cuts the name to, which the caller did not name.
+TEST_CASE("a save that cannot open its temporary removes no directory") {
+  TempDir dir;
+  fft::FittedPipeline loaded = fft::FittedPipeline::load_json(kManifest);
+  SECTION("a directory in the temporary's place") {
+    const std::filesystem::path in_place = dir.path / "artifact" / "manifest.json.tmp";
+    std::filesystem::create_directories(in_place);
+    REQUIRE_THROWS_WITH(loaded.save((dir.path / "artifact").string()), ContainsSubstring("cannot write"));
+    REQUIRE(std::filesystem::is_directory(in_place));
+  }
+  SECTION("a NUL in the path") {
+    const std::filesystem::path kept = dir.path / "kept";
+    std::filesystem::create_directory(kept);
+    const std::string cut = kept.string() + std::string(1, '\0') + "junk";
+    REQUIRE_THROWS_AS(loaded.save(cut), fft::Error);  // what() ends at the NUL
+    REQUIRE(std::filesystem::is_directory(kept));
+  }
+}
+
+// A save whose write fails after its temporary opened removes the temporary
+// and publishes nothing. A file size limit of 16 bytes stages a disk that
+// refuses the write; the signal sent with the refusal is ignored meanwhile.
+// Nothing is asserted while the limit holds, because it also binds a file
+// that Catch2 reports to.
+TEST_CASE("a save whose write fails removes its temporary") {
+  TempDir dir;
+  fft::FittedPipeline loaded = fft::FittedPipeline::load_json(kManifest);
+  const std::filesystem::path artifact = dir.path / "artifact";
+  std::filesystem::create_directory(artifact);
+  rlimit original{};
+  REQUIRE(getrlimit(RLIMIT_FSIZE, &original) == 0);
+  std::string message = "the file size limit could not be set";
+  {
+    struct Restore {
+      rlimit limit;
+      void (*handler)(int);
+      ~Restore() {
+        setrlimit(RLIMIT_FSIZE, &limit);
+        std::signal(SIGXFSZ, handler);
+      }
+    } restore{original, std::signal(SIGXFSZ, SIG_IGN)};
+    rlimit lowered = original;
+    lowered.rlim_cur = 16;
+    if (setrlimit(RLIMIT_FSIZE, &lowered) == 0) {
+      message = "save did not throw";
+      try {
+        loaded.save(artifact.string());
+      } catch (const fft::Error& error) {
+        message = error.message;
+      }
+    }
+  }
+  REQUIRE(message == (artifact / "manifest.json.tmp").string() + ": failed writing");
+  REQUIRE(std::filesystem::is_empty(artifact));
 }
 
 TEST_CASE("save writes atomically and load names a missing manifest") {

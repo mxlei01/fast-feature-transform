@@ -8,8 +8,10 @@ import importlib.metadata
 import inspect
 import json
 import math
+import os
 import pickle
 import re
+import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -216,6 +218,181 @@ def test_an_interrupt_removes_the_temporary_directory_only_while_it_is_empty(
     with pytest.raises(KeyboardInterrupt):
         _interrupted_call(made, wrote=True)
     assert [path.name for path in made[1].iterdir()] == ["part-00000.parquet"]
+
+
+class _PathLike:
+    """An os.PathLike that is not a pathlib.Path, so str() of it is not its path."""
+
+    def __init__(self, path: str | bytes) -> None:
+        """Hold the path.
+
+        Args:
+            path: What __fspath__ gives.
+
+        """
+        self.path: str | bytes = path
+
+    def __fspath__(self) -> str | bytes:
+        """Give the path.
+
+        Returns:
+            The path given at construction.
+
+        """
+        return self.path
+
+
+# Every public call that takes a directory. None is refused only where the
+# call needs a directory; elsewhere it means a temporary directory, or the
+# system's temporary directory for temp_dir.
+_PATH_CALLS: list[str] = [
+    "Pipeline.transform_parquet",
+    "Pipeline.transform",
+    "Pipeline.fit_transform",
+    "Pipeline.transform_memmap",
+    "Transformer.transform_parquet",
+    "Transformer.transform",
+    "Transformer.transform_memmap",
+    "parquet_to_memmap",
+    "Pipeline.save",
+    "Pipeline.load",
+    "Pipeline.fit temp_dir",
+    "Pipeline.fit_transform temp_dir",
+    "Transformer.fit temp_dir",
+]
+
+
+def _path_call(
+    call: str, source: Path, unfitted: Pipeline, standalone: Select
+) -> tuple[str, bool, Callable[[Any], Any]]:
+    """Make one of _PATH_CALLS.
+
+    Args:
+        call: The name in _PATH_CALLS.
+        source: A Parquet file with the f64 column x.
+        unfitted: A pipeline that only the fit calls fit.
+        standalone: A transformer that only the fit calls fit.
+
+    Returns:
+        The argument's name, whether None is refused, and a function that
+        makes the call with a value for the argument.
+
+    """
+    fitted: Pipeline = Pipeline([("select", Select(columns=["x"]))]).fit([source])
+    selected: Select = Select(columns=["x"]).fit([source])
+    calls: dict[str, tuple[str, bool, Callable[[Any], Any]]] = {
+        "Pipeline.transform_parquet": ("output_dir", False, lambda v: fitted.transform_parquet([source], output_dir=v)),
+        "Pipeline.transform": ("output_dir", False, lambda v: fitted.transform([source], output_dir=v)),
+        "Pipeline.fit_transform": ("output_dir", False, lambda v: unfitted.fit_transform([source], output_dir=v)),
+        "Pipeline.transform_memmap": ("output_dir", True, lambda v: fitted.transform_memmap([source], output_dir=v)),
+        "Transformer.transform_parquet": (
+            "output_dir",
+            False,
+            lambda v: selected.transform_parquet([source], output_dir=v),
+        ),
+        "Transformer.transform": ("output_dir", False, lambda v: selected.transform([source], output_dir=v)),
+        "Transformer.transform_memmap": (
+            "output_dir",
+            True,
+            lambda v: selected.transform_memmap([source], output_dir=v),
+        ),
+        "parquet_to_memmap": ("output_dir", False, lambda v: parquet_to_memmap([source], output_dir=v)),
+        "Pipeline.save": ("path", True, fitted.save),
+        "Pipeline.load": ("path", True, Pipeline.load),
+        "Pipeline.fit temp_dir": ("temp_dir", False, lambda v: unfitted.fit([source], temp_dir=v)),
+        "Pipeline.fit_transform temp_dir": ("temp_dir", False, lambda v: unfitted.fit_transform([source], temp_dir=v)),
+        "Transformer.fit temp_dir": ("temp_dir", False, lambda v: standalone.fit([source], temp_dir=v)),
+    }
+    return calls[call]
+
+
+def _listing(*roots: Path) -> list[str]:
+    return sorted(str(path) for root in roots for path in root.rglob("*"))
+
+
+@pytest.mark.parametrize("call", _PATH_CALLS)
+def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
+    call: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # REGRESSION: None where a directory is needed, bytes, an empty string and
+    # a NUL are refused before anything is written. An output_dir and the path
+    # of save and load used to go through str(): None wrote into ./None and
+    # bytes into ./b'tgt'. With a NUL, a batch call created the directory that
+    # the text before it names and then failed, and save removed that
+    # directory when it was empty. load('') read /manifest.json.
+    source: Path = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), source)
+    temporary: Path = tmp_path / "temporary"
+    temporary.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+    work: Path = tmp_path / "work"
+    (work / "kept").mkdir(parents=True)
+    monkeypatch.chdir(work)
+    unfitted: Pipeline = Pipeline([("select", Select(columns=["x"]))])
+    standalone: Select = Select(columns=["x"])
+    what, needs_directory, run = _path_call(call, source, unfitted, standalone)
+    refused: list[tuple[Any, type[Exception], str]] = [
+        (7, TypeError, "must be a str or os.PathLike, got int"),
+        (b"tgt", TypeError, "must be a str path, got bytes; decode it with os.fsdecode"),
+        (_PathLike(b"tgt"), TypeError, "must be a str path, got bytes; decode it with os.fsdecode"),
+        ("new\0junk", ValueError, "must not hold a NUL character, got 'new\\x00junk'"),
+        ("kept\0junk", ValueError, "must not hold a NUL character, got 'kept\\x00junk'"),
+    ]
+    if what != "temp_dir":
+        # An empty temp_dir means the system temporary directory, as None does.
+        refused.append(("", ValueError, "must not be empty; pass '.' for the current directory"))
+    if needs_directory:
+        refused.append((None, TypeError, "must be a str or os.PathLike, got NoneType"))
+    before: list[str] = _listing(work, temporary)
+    assert before == [str(work / "kept")]
+    for value, error, message in refused:
+        with pytest.raises(error, match=f"^{re.escape(f'{what} {message}')}$"):
+            run(value)
+        assert _listing(work, temporary) == before, value
+    # A refused directory is refused before a fit starts.
+    assert unfitted._handle is None
+    assert standalone._binding is None
+
+
+@pytest.mark.parametrize("call", _PATH_CALLS)
+def test_a_path_is_read_through_os_fspath(call: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # REGRESSION: an output_dir and the path of save and load are read through
+    # os.fspath, as temp_dir and X are. str() of an os.PathLike other than
+    # pathlib.Path is not its path: these calls used to write into a new
+    # directory named after its repr, ./<_PathLike object at 0x...>, and
+    # return, and load refused the path.
+    source: Path = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), source)
+    temporary: Path = tmp_path / "temporary"
+    temporary.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+    work: Path = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    unfitted: Pipeline = Pipeline([("select", Select(columns=["x"]))])
+    what, _, run = _path_call(call, source, unfitted, Select(columns=["x"]))
+    written: dict[str, list[str]] = {
+        "output_dir": ["data.mmap", "index.json"] if "memmap" in call else ["part-00000.parquet"],
+        "path": ["manifest.json"],
+        "temp_dir": [],
+    }
+    expected: list[str] = written[what]
+    for kind in ("str", "Path", "PathLike", "DirEntry"):
+        shutil.rmtree(work / "tgt", ignore_errors=True)
+        (work / "tgt").mkdir()
+        if call == "Pipeline.load":
+            Pipeline([("select", Select(columns=["x"]))]).fit([source]).save("tgt")
+        with os.scandir(".") as entries:
+            entry: os.DirEntry[str] = next(entry for entry in entries if entry.name == "tgt")
+        value: Any = {"str": "tgt", "Path": Path("tgt"), "PathLike": _PathLike("tgt"), "DirEntry": entry}[kind]
+        result: Any = run(value)
+        assert sorted(path.name for path in work.iterdir()) == ["tgt"], kind
+        assert sorted(path.name for path in (work / "tgt").iterdir()) == expected, kind
+        if call == "Pipeline.load":
+            assert result.transform_dict({"x": 2.0}) == {"x": 2.0}, kind
+        elif what == "output_dir":
+            paths: list[Any] = result if isinstance(result, list) else [result]
+            assert {Path(path).resolve().parent for path in paths} == {(work / "tgt").resolve()}, kind
 
 
 def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str]) -> None:
@@ -856,6 +1033,17 @@ def test_fit_refuses_a_temp_dir_that_does_not_exist(train_files: list[str], tmp_
     with pytest.raises(ValueError, match="temp_dir must be an existing directory"):
         _nested().fit(train_files, temp_dir=tmp_path / "missing")
     assert _nested().fit(train_files, temp_dir=tmp_path).transform_dict({"device": "tab", "source": "b"})
+
+
+def test_an_empty_temp_dir_means_the_system_temporary_directory(train_files: list[str]) -> None:
+    # An empty string for temp_dir fits as None does, in a Pipeline and in a
+    # transformer alone: only a directory that is named has to exist.
+    record: dict[str, Any] = {"device": "tab", "source": "b"}
+    expected: dict[str, Any] = _nested().fit(train_files).transform_dict(record)
+    assert _nested().fit(train_files, temp_dir="").transform_dict(record) == expected
+    column: dict[str, Any] = {"device": "tab"}
+    alone: dict[str, Any] = LabelEncoder(columns=["device"]).fit(train_files).transform_dict(column)
+    assert LabelEncoder(columns=["device"]).fit(train_files, temp_dir="").transform_dict(column) == alone
 
 
 def test_pipeline_indexing_length_and_repr(train_files: list[str]) -> None:
