@@ -265,6 +265,10 @@ TEST_CASE("quantile_encode load_state rejects a malformed table") {
   broken([](nlohmann::json& state) { state["categories"]["color"] = 5; }, "must be a list of category names");
   broken([](nlohmann::json& state) { state["encodings"]["color"] = {1.0}; }, "one value per category");
   broken([](nlohmann::json& state) { state["encodings"]["color"] = {1.0, "two"}; }, "must hold finite numbers");
+  // REGRESSION: every output has an entry in nulls, null when its column had
+  // no null category, as every saved pipeline writes. A state that lacked
+  // one used to load with no null category for that output.
+  broken([](nlohmann::json& state) { state["nulls"].erase("color"); }, "encode: nulls has no entry for column 'color'");
 }
 
 TEST_CASE("quantile dictionary fits exclude null targets while still enforcing missing errors") {

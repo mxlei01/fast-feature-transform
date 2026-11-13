@@ -297,8 +297,11 @@ TEST_CASE("count_encode load_state rejects a malformed table") {
     kernel->stage = "counts";
     return kernel;
   };
-  const nlohmann::json good{
-      {"columns", {"c"}}, {"counts", {{"c", {{"x", 2}}}}}, {"null_counts", {{"c", nullptr}}}, {"rows", 2}};
+  const nlohmann::json good{{"columns", {"c"}},
+                            {"counts", {{"c", {{"x", 2}}}}},
+                            {"null_counts", {{"c", nullptr}}},
+                            {"groups", nlohmann::json::object()},
+                            {"rows", 2}};
   REQUIRE_NOTHROW(fresh()->load_state(good));
   auto broken = [&](auto mutate, const std::string& message) {
     nlohmann::json state = good;
@@ -313,6 +316,19 @@ TEST_CASE("count_encode load_state rejects a malformed table") {
   broken([](nlohmann::json& state) { state["counts"].erase("c"); },
          "state 'columns' does not name the same columns as the fitted table");
   broken([](nlohmann::json& state) { state.erase("columns"); }, "state must hold a 'columns' list");
+  // REGRESSION: null_counts and groups are required, as every saved pipeline
+  // holds them. A state without one, or with its key misspelled, used to load
+  // with no null category or with no folded groups.
+  broken([](nlohmann::json& state) { state.erase("null_counts"); }, "counts: state must hold a 'null_counts' object");
+  broken([](nlohmann::json& state) { state.erase("groups"); }, "counts: state must hold a 'groups' object");
+  broken(
+      [](nlohmann::json& state) {
+        state["group"] = nlohmann::json::object();
+        state.erase("groups");
+      },
+      "counts: state must hold a 'groups' object");
+  broken([](nlohmann::json& state) { state["null_counts"] = nullptr; }, "counts: 'null_counts' must be an object");
+  broken([](nlohmann::json& state) { state["groups"] = nullptr; }, "counts: 'groups' must be an object");
   // REGRESSION: load_state refuses a mangled null_counts or groups, which used
   // to be read as a legitimate default: a typo'd null count deleted the null
   // category, a negative one became a negative 'count', and a group pointing

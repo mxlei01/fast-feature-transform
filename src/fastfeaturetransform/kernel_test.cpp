@@ -340,7 +340,9 @@ TEST_CASE("label_encode validates its params") {
 TEST_CASE("label_encode load_state validates the label maps and keeps explicit column order") {
   auto good = fft::make_kernel("label_encode", {{"columns", {"b", "a"}}, {"min_count", 1}});
   good->stage = "enc";
-  good->load_state({{"columns", {"b", "a"}}, {"label_maps", {{"a", {{"x", 1}}}, {"b", {{"y", 2}, {"z", 1}}}}}});
+  good->load_state({{"columns", {"b", "a"}},
+                    {"label_maps", {{"a", {{"x", 1}}}, {"b", {{"y", 2}, {"z", 1}}}}},
+                    {"vocab_sizes", {{"a", 2}, {"b", 3}}}});
   REQUIRE(good->params().at("columns") == nlohmann::json({"b", "a"}));
   REQUIRE(good->inputs == std::vector<std::string>{"b", "a"});
 
@@ -359,6 +361,17 @@ TEST_CASE("label_encode load_state validates the label maps and keeps explicit c
   REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", 5}}}})), ContainsSubstring("must be an object"));
   REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", {{"x", 1}}}}}, {"vocab_sizes", {{"a", 7}}}})),
                       ContainsSubstring("vocab_sizes disagrees"));
+  // REGRESSION: vocab_sizes is required, as every saved pipeline holds it. A
+  // state without it, or with the key misspelled, used to load unchecked.
+  REQUIRE_NOTHROW(load({{"label_maps", {{"a", {{"x", 1}}}}}, {"vocab_sizes", {{"a", 2}}}}));
+  REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", {{"x", 1}}}}}})),
+                      Equals("enc: state must hold a 'vocab_sizes' object"));
+  REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", {{"x", 1}}}}}, {"vocab_size", {{"a", 2}}}})),
+                      Equals("enc: state must hold a 'vocab_sizes' object"));
+  REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", {{"x", 1}}}}}, {"vocab_sizes", nullptr}})),
+                      Equals("enc: 'vocab_sizes' must be an object"));
+  REQUIRE_THROWS_WITH((load({{"label_maps", {{"a", {{"x", 1}}}}}, {"vocab_sizes", {{"b", 2}}}})),
+                      Equals("enc: vocab_sizes has no entry for column 'a'"));
   REQUIRE_THROWS_WITH(load(nlohmann::json::object()), ContainsSubstring("label_maps"));
   // REGRESSION: the state's column order is the authority. Params that name a
   // different list, or a different order, make a manifest that describes two

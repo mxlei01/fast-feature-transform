@@ -504,8 +504,8 @@ class TargetBlend final : public Kernel {
     const nlohmann::json& values = state.at("values");
     load_fitted_columns(state, stage, columns_, explicit_columns_, &values);
     // The null category is the entry a hand-edited manifest is likeliest to
-    // mangle, so a wrong shape there is an error rather than a default.
-    const nlohmann::json* null_values = optional_per_column_object(state, "null_values", columns_, stage);
+    // mangle, so a missing or wrong one is an error rather than a default.
+    const nlohmann::json& null_values = *per_column_object(state, "null_values", columns_, stage);
     tables_.clear();
     for (const std::string& name : columns_) {
       if (!values.contains(name) || !values.at(name).is_object()) {
@@ -519,8 +519,8 @@ class TargetBlend final : public Kernel {
         table.values.emplace(key, value.get<double>());
       }
       table.short_values.index(table.values);
-      if (null_values != nullptr && !null_values->at(name).is_null()) {
-        const nlohmann::json& value = null_values->at(name);
+      if (!null_values.at(name).is_null()) {
+        const nlohmann::json& value = null_values.at(name);
         if (!value.is_number() || !std::isfinite(value.get<double>())) {
           throw Error(stage + ": null_values['" + name + "'] must be a finite number or null");
         }
