@@ -183,6 +183,25 @@ void collect_leaves(const parquet::arrow::SchemaField& field, std::vector<int>& 
   for (const auto& child : field.children) collect_leaves(child, out);
 }
 
+// Arrow's reader fills the null rows of a fixed-size list by concatenating
+// pieces of its child array. For a child read as a dictionary, that merges
+// the pieces' dictionaries and renumbers every index through a table it reads
+// without a bounds check: a corrupt index is looked up outside the table
+// before check_dictionary_indices sees the batch, and the number found there
+// names a wrong entry, which passes the check when it lies inside the merged
+// dictionary. Strings at any depth inside a fixed-size list are therefore
+// read plain: Arrow's decoder refuses such an index itself, and the reader
+// names the column it fails on (undecodable_column).
+void read_plain_inside_fixed_size_lists(const parquet::arrow::SchemaField& field, bool inside,
+                                        parquet::ArrowReaderProperties& properties) {
+  inside = inside || field.field->type()->id() == arrow::Type::FIXED_SIZE_LIST;
+  if (field.is_leaf()) {
+    if (inside) properties.set_read_dictionary(field.column_index, false);
+    return;
+  }
+  for (const auto& child : field.children) read_plain_inside_fixed_size_lists(child, inside, properties);
+}
+
 std::unique_ptr<parquet::arrow::FileReader> make_reader(const std::string& path,
                                                         std::unique_ptr<parquet::ParquetFileReader> raw,
                                                         const parquet::ArrowReaderProperties& properties) {
@@ -261,26 +280,34 @@ void require_parquet(const std::string& path) {
 }
 
 // Arrow's Parquet reader decodes dictionary indices without checking them
-// against the dictionary, and the kernels index their caches and the
-// dictionary with them unchecked, so a corrupt file would be read outside
-// both. One pass per batch here covers every kernel. The reader's indices
-// are int32, and their largest value read as unsigned (a negative one is
-// then too large) settles almost every batch in a tenth of the time Arrow's
-// check takes. Null slots count in that maximum, and Parquet leaves zeros
-// there; when the maximum is out of range, Arrow's check, which skips null
-// slots, decides.
-void check_dictionary_indices(const arrow::Array& column, const std::string& where, const std::string& name) {
-  if (column.type_id() != arrow::Type::DICTIONARY) return;
-  const auto& dictionary = static_cast<const arrow::DictionaryArray&>(column);
-  const arrow::ArrayData& indices = *dictionary.indices()->data();
-  const auto entries = static_cast<uint64_t>(dictionary.dictionary()->length());
-  if (indices.type->id() == arrow::Type::INT32) {
-    const int32_t* values = indices.GetValues<int32_t>(1);
+// against the dictionary. The kernels index their caches and the dictionary
+// with them unchecked, and Arrow's Parquet writer indexes the dictionary of a
+// column passed through, so a corrupt file would be read outside both. Strings
+// are read as a dictionary at the top of a column and inside a list, large
+// list, struct or map, where a child array holds them, so the check visits
+// every child: one pass per batch here covers every kernel and the writer.
+// Strings inside a fixed-size list are read plain instead (see
+// read_plain_inside_fixed_size_lists). The reader's indices are int32, and
+// their largest value read as unsigned (a negative one is then too large)
+// settles almost every batch in a tenth of the time Arrow's check takes. Null
+// slots count in that maximum, and Parquet leaves zeros there; when the
+// maximum is out of range, Arrow's check, which skips null slots, decides.
+void check_dictionary_indices(const arrow::ArrayData& column, const std::string& where, const std::string& name) {
+  for (const std::shared_ptr<arrow::ArrayData>& child : column.child_data) {
+    check_dictionary_indices(*child, where, name);
+  }
+  if (column.type->id() != arrow::Type::DICTIONARY) return;
+  const arrow::DataType& index_type = *static_cast<const arrow::DictionaryType&>(*column.type).index_type();
+  const auto entries = static_cast<uint64_t>(column.dictionary->length);
+  if (index_type.id() == arrow::Type::INT32) {
+    const int32_t* values = column.GetValues<int32_t>(1);
     uint32_t largest = 0;
-    for (int64_t row = 0; row < indices.length; ++row) largest = std::max(largest, static_cast<uint32_t>(values[row]));
+    for (int64_t row = 0; row < column.length; ++row) largest = std::max(largest, static_cast<uint32_t>(values[row]));
     if (largest < entries) return;
   }
-  const arrow::Status status = arrow::internal::CheckIndexBounds(arrow::ArraySpan(indices), entries);
+  arrow::ArraySpan indices(column);
+  indices.type = &index_type;
+  const arrow::Status status = arrow::internal::CheckIndexBounds(indices, entries);
   if (!status.ok()) {
     throw Error(where + ": column '" + name + "' has a dictionary index outside its dictionary: " + status.message());
   }
@@ -564,6 +591,9 @@ ParquetSource::ParquetSource(const std::vector<std::string>& files, unsigned wor
       std::vector<int> leaves;
       collect_leaves(field, leaves);
       file.leaves.push_back(std::move(leaves));
+      // The schema above is the same either way: a column's tag names the
+      // type of its strings, not whether they come as a dictionary.
+      read_plain_inside_fixed_size_lists(field, false, file.properties);
     }
 
     return {std::move(file), std::move(tagged), std::move(sources), std::move(list_elements), {}};
@@ -675,10 +705,12 @@ class ParquetSource::Reader final : public TaskReader {
     for (;;) {
       std::shared_ptr<arrow::RecordBatch> batch;
       const auto status = (*stream)->ReadNext(&batch);
-      if (!status.ok()) throw Error(where + ": " + status.ToString());
+      if (!status.ok()) {
+        throw Error(where + ": " + undecodable_column(file, task.row_group, *(*stream)->schema()) + status.ToString());
+      }
       if (!batch) break;
       for (int i = 0; i < batch->num_columns(); ++i) {
-        check_dictionary_indices(*batch->column(i), where, batch->schema()->field(i)->name());
+        check_dictionary_indices(*batch->column_data(i), where, batch->schema()->field(i)->name());
       }
       emitted = true;
       consume(batch_from_arrow(*batch));
@@ -696,6 +728,29 @@ class ParquetSource::Reader final : public TaskReader {
   }
 
  private:
+  // Arrow's reader does not name the column of a page it cannot decode, so
+  // after a failure the row group's columns are read again one at a time,
+  // and the first that fails on its own is named. A failure that no column
+  // repeats on its own keeps Arrow's text alone.
+  std::string undecodable_column(const File& file, int row_group, const arrow::Schema& read) {
+    for (const std::shared_ptr<arrow::Field>& field : read.fields()) {
+      std::size_t position = 0;
+      while (position < source_.schema_.cols.size() && source_.schema_.cols[position].first != field->name()) {
+        ++position;
+      }
+      if (position == source_.schema_.cols.size()) continue;
+      auto stream = reader_->GetRecordBatchReader({row_group}, file.leaves[position]);
+      bool failed = !stream.ok();
+      while (!failed) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        failed = !(*stream)->ReadNext(&batch).ok();
+        if (!batch) break;
+      }
+      if (failed) return "column '" + field->name() + "' cannot be decoded: ";
+    }
+    return "";
+  }
+
   const ParquetSource& source_;
   std::shared_ptr<const Projection> projection_;
   std::size_t file_ = 0;
