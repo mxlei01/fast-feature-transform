@@ -583,7 +583,16 @@ class Pipeline:
             State dict holding the steps, manifest JSON, and stage prefix.
 
         """
-        manifest: str | None = self._manifest if self._handle is None else _cached_manifest(self._handle)
+        # REGRESSION: the manifest is read before the handle. Binding an
+        # unpickled pipeline sets the handle and then clears the manifest, so
+        # a pickle that finds the manifest cleared finds the handle set. It
+        # used to read the handle first, and a first use on another thread
+        # that bound the pipeline between the two reads left the pickle with
+        # neither, so it restored unfitted.
+        manifest: str | None = self._manifest
+        handle: _core.FittedPipeline | None = self._handle
+        if handle is not None:
+            manifest = _cached_manifest(handle)
         return {"steps": self._steps, "manifest": manifest, "prefix": self._prefix}
 
     def __setstate__(self, state: dict[str, Any]) -> None:

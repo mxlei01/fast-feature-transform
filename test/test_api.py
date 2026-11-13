@@ -1283,6 +1283,43 @@ def test_unpickled_root_binds_safely_under_concurrent_first_use(train_files: lis
         assert features._handle is restored._handle
 
 
+class _BindsAtARead(Pipeline):
+    """A Pipeline whose next read of the attribute named by ``bind_at`` binds it.
+
+    The read returns the value from before the bind, as a read does when
+    another thread binds the pipeline right after it, so the interleaving is
+    forced rather than hoped for. ``bind_at`` is a class attribute, so a
+    pickle carries none of it, and the read clears it before it binds.
+    """
+
+    bind_at: ClassVar[str | None] = None
+
+    @override
+    def __getattribute__(self, name: str) -> Any:
+        value: Any = super().__getattribute__(name)
+        cls = type(self)
+        if name == cls.bind_at:
+            cls.bind_at = None
+            self._ensure_bound()
+        return value
+
+
+@pytest.mark.parametrize("bind_at", ["_manifest", "_handle", "_steps", "_prefix"])
+def test_a_pickle_of_an_unpickled_pipeline_stays_fitted_whichever_read_its_first_use_binds_it_at(
+    train_files: list[str], bind_at: str
+) -> None:
+    restored = pickle.loads(pickle.dumps(_BindsAtARead(_nested().steps).fit(train_files)))
+    assert isinstance(restored, _BindsAtARead)
+    _BindsAtARead.bind_at = bind_at
+    try:
+        payload: bytes = pickle.dumps(restored)
+    finally:
+        _BindsAtARead.bind_at = None
+    assert restored._manifest is None  # the read bound it
+    again = pickle.loads(payload)
+    assert again.transform_dict({"device": "mob", "source": "a"}) == {"device": MOB_INDEX, "source": 1}
+
+
 def test_pickle_after_refit_serializes_the_current_fit(train_files: list[str], tmp_path: Path) -> None:
     outer: Pipeline = _nested().fit(train_files)
     inner = outer["features"]
