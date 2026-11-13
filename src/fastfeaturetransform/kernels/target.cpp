@@ -179,7 +179,7 @@ void note_distinct(std::vector<double>& smallest, double& largest, double value)
 
 // ---------------------------------------------------------------------------
 // target_encode / m_estimate_encode / woe_encode / james_stein_encode /
-// leave_one_out_encode / cat_boost_encode — categorical utf8 -> a number
+// leave_one_out_encode / cat_boost_encode: categorical utf8 -> a number
 // learned from a target column, in place.
 // params: {"columns": [...] | null, "target": column,
 //          "handle_unknown": "value" | "return_nan" | "error",

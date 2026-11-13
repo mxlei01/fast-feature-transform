@@ -29,9 +29,6 @@ vcpkg_installed/
 .nvim.lua
 nvim.log
 
-# Local-only
-CLAUDE.md
-
 # Secrets: credentials never belong in the repository
 *.token
 .*-token*

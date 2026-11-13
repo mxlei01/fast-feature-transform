@@ -38,11 +38,14 @@
 namespace fastfeaturetransform {
 namespace {
 
-// Versions the manifest file format, not the code: bump only when the JSON
-// layout itself changes (a new required field, restructured state), never on
-// releases. Readers accept exactly this version: a fitted pipeline should be
-// served by the release that fitted it, so any other format is refused with
-// a message to refit.
+// Versions the manifest file format, not the code: bump only when a reader
+// of this version can no longer read the JSON layout (a new required field,
+// state that only the newer layout holds), never on releases. A layout that
+// the reader accepts beside the old one keeps the version: count_encode's
+// groups have two under this one, and a reader that knows only the older
+// refuses the newer by its state check. Readers accept exactly this version:
+// a fitted pipeline should be served by the release that fitted it, so any
+// other format is refused with a message to refit.
 //
 // Every fitted state that resolves its own column list stores it as
 // 'columns', in fit order, and loading requires it: rebuilding the order from

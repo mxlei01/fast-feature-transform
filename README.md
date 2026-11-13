@@ -90,7 +90,9 @@ make cpp-sanitize  # the C++ tests under AddressSanitizer and UndefinedBehaviorS
   Homebrew to install `bison` and `pkg-config`, which Arrow's build needs. The triplets in `triplets/` are vcpkg's own
   plus two settings: Parquet encryption is off, which keeps OpenSSL out of the extension, and macOS builds target macOS
   26. Changing a triplet rebuilds every dependency.
-- **The extension** links its own static Arrow and exports a single symbol, so it can share a process with pyarrow.
+- **The extension** links its own static Arrow and keeps it private, so it can share a process with pyarrow. On macOS
+  it exports one symbol. On Linux it exports that one and weak instances of libstdc++ and Arrow header templates,
+  which nothing in pyarrow imports.
 
 ### Pinned versions
 
@@ -100,7 +102,9 @@ make cpp-sanitize  # the C++ tests under AddressSanitizer and UndefinedBehaviorS
   to 0.16, so edit those pins first.
 - **Build tools** (scikit-build-core, nanobind, setuptools-scm, CMake, ninja, and hatch-fancy-pypi-readme, which
   rewrites the README's links for PyPI) are pinned by `build-constraint-dependencies` in `pyproject.toml`; run
-  `uv lock` and `make release-requirements` after changing one.
+  `uv lock` and `make release-requirements` after changing one. scikit-build-core builds with a CMake or ninja it
+  finds on the machine when that one is new enough, so those two pins hold in CI and on a machine that has neither;
+  a release runner that has its own builds with it.
 - **Release tools:** `release.yaml` installs cibuildwheel, the tools cibuildwheel installs for itself (pip, build,
   virtualenv and delocate), the build tools, the wheel tests' packages and twine from the lists in
   `.github/requirements`, each pinned to one version with its hashes. `make release-requirements` compiles the lists

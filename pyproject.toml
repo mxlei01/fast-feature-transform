@@ -142,8 +142,8 @@ cache-keys = [
 addopts = "-rf --strict-config --strict-markers"
 testpaths = ["test"]
 # A warning fails the run: with the dev tools locked, a new deprecation from
-# pyarrow, numpy or scikit-learn appears when the lock is upgraded, which is
-# when to act on it.
+# pyarrow or numpy appears when the lock is upgraded, which is when to act on
+# it.
 filterwarnings = ["error"]
 
 [tool.ruff]

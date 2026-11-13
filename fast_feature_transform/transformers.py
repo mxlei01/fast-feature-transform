@@ -211,7 +211,7 @@ def _column_list(columns: object, what: str) -> list[str]:
 
 
 def _optional_columns(columns: object, what: str) -> list[str] | None:
-    """Validate a ``columns`` argument that may be None.
+    """Validate a ``columns`` argument that can be None.
 
     Args:
         columns: The value passed for ``columns``; None leaves the choice to the fit.

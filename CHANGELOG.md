@@ -8,8 +8,8 @@ Timings are from an Apple M4 on one thread.
 Faster:
 
 - Fits that sum floats take a half to a sixth of the time: `StandardScaler` 42.3 -> 6.5 ms per million rows, and
-  `TargetEncoder`, `JamesSteinEncoder`, `LeaveOneOutEncoder`, `CatBoostEncoder`, `GroupAgg`, `PowerTransformer` and
-  k-means bins with it.
+  `TargetEncoder`, `JamesSteinEncoder`, `LeaveOneOutEncoder`, `CatBoostEncoder`, `GroupAgg` and `PowerTransformer`
+  with it. k-means bins take about 0.6 of the time.
 - `transform_parquet` writes each part through a buffer and ends a dictionary of distinct integers at 248 KiB: an id
   and two floats take 60.3 -> 48.0 ms per million rows.
 - A string column stored in plain pages passes through in bytes that grow with its rows, not with their square: a
@@ -24,14 +24,26 @@ Faster:
 
 Changed:
 
-- A step given no columns takes the columns known when the fit starts. The columns an expanding encoder such as
-  `OneHotEncoder` generates never join them, whichever pass the step fits in.
+- A step given no columns takes the columns known when the fit starts. Columns whose number is known only after a
+  fit, such as those `OneHotEncoder` generates, never join them, whichever pass the step fits in.
 - A parameter name a kernel does not know is an error at fit and at load. 0.0.1 ignored it and used the default.
-- Parquet output has another layout where it is very wide or holds distinct integers: fewer and larger row groups,
-  and plain pages after 248 KiB of dictionary. The values are the same. An integer column with 32,000 to 55,000
-  distinct values in a row group is written up to 13% larger.
-- A string option given as an `Enum` with a `str` mixin works in every transformer.
-- 0.0.1 cannot load a pipeline saved by this version whose `CountEncoder` folded a group.
+  Params that are not a JSON object are an error at load too.
+- Parquet output has another layout where it is very wide, from about 170 float columns, or holds distinct
+  integers: fewer and larger row groups, and plain pages after 248 KiB of dictionary. The values are the same. An
+  integer column with 31,744 to about 55,000 distinct values in a row group is written up to 13% larger when its
+  values are in random order, and up to 54% larger when its distinct values come first.
+- While a very wide output is written, up to five more batches wait in memory for each thread: about 130 MiB for
+  each thread with 1,000 float columns and one string of 20,000 characters in each row.
+- A string option given as a subclass of `str`, such as an `Enum` with a `str` mixin, fits in every transformer and
+  is stored as the plain string. Four options keep the value as given, so a pickle of the transformer needs its
+  class: the type tags of `Cast`, the aggregates of `GroupAgg`, `hash_method` of `HashingEncoder` and
+  `combine_min_nan_groups` of `CountEncoder`.
+- A `CountEncoder` that folds rare categories reports and saves its groups as `{group name: [members]}`, in
+  `stages_state()`, the manifest and pickles. 0.0.1 cannot load a pipeline saved by this version whose
+  `CountEncoder` folded a group.
+- Three calls take longer. A record that `Cast` refuses takes about 1.2 times as long to raise. A record of 30
+  names of 23 bytes takes about 10% longer when its keys are not in the step's order. `Pipeline.load` of a `Cast`
+  over 20,000 columns takes 1.3 times as long.
 
 Fixed:
 
