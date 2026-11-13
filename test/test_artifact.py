@@ -1,14 +1,16 @@
 """Tests for artifact integrity: provenance, validation on load, and how engine errors surface."""
 
+import datetime
 import importlib.metadata
 import inspect
+import itertools
 import json
 import math
 import pickle
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pyarrow as pa
@@ -408,10 +410,157 @@ def test_transform_dict_rejects_unconvertible_values_by_name(source: str) -> Non
     non_str_key: dict[Any, Any] = {"device": "ios", 1: 1}
     with pytest.raises(EngineError, match="record keys must be str"):
         pipeline.transform_dict(non_str_key)
+    with pytest.raises(EngineError, match="record keys must be str"):
+        pipeline.transform_dict({"device": "ios", "\ud800": 1})
     with pytest.raises(EngineError, match="'device' is not encodable as UTF-8"):
         pipeline.transform_dict({"device": "\ud800"})
     with pytest.raises(EngineError, match="'blob' must be str, int, float, bool, datetime, or None \\(got bytes\\)"):
         pipeline.transform_dict({"device": "ios", "blob": b"x"})
+
+
+class _OwnHash(str):
+    """A str whose hash is not its text's, so a dict keeps it beside a str of the same text."""
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        """Hash the text, then flip the lowest bit.
+
+        Returns:
+            A hash that differs from the text's.
+
+        """
+        return hash(str.__str__(self)) ^ 1
+
+
+class _OwnEquality(str):
+    """A str that equals only its own kind, so a dict keeps it beside a str of the same text."""
+
+    __slots__ = ()
+    __hash__ = str.__hash__
+
+    def __eq__(self, other: object) -> bool:
+        """Compare as text, with another _OwnEquality only.
+
+        Args:
+            other: The object compared with.
+
+        Returns:
+            Whether other is an _OwnEquality of the same text.
+
+        """
+        return type(other) is _OwnEquality and str.__eq__(self, other)
+
+
+def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -> None:
+    # REGRESSION: a record whose keys hold one text twice is an error that
+    # names the text. A step used to read one of the two fields, which one
+    # depending on the order of the keys, the width of the record and the
+    # step, and the output dict kept the value of the later field.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    # Each record holds "device" and then one to three keys, of every text and
+    # kind in every order; one text is not ASCII. A str and a numpy.str_ of
+    # one text are one key of a dict; each of the other kinds is a key of its
+    # own beside a str.
+    kinds: list[type[str]] = [str, np.str_, _OwnHash, _OwnEquality]
+    keys: list[str] = [kind(text) for text in ("a", "é", "device") for kind in kinds]
+    refused_records: int = 0
+    for count in (1, 2, 3):
+        for chosen in itertools.product(keys, repeat=count):
+            record: dict[str, Any] = {"device": "ios"}
+            for index, key in enumerate(chosen):
+                record[key] = f"v{index}"
+            texts: list[str] = [str.__str__(key) for key in record]
+            repeated: set[str] = {text for text in texts if texts.count(text) > 1}
+            if not repeated:
+                plain: dict[str, Any] = {str.__str__(key): value for key, value in record.items()}
+                assert pipeline.transform_dict(record) == pipeline.transform_dict(plain), chosen
+                continue
+            refused_records += 1
+            with pytest.raises(EngineError) as refused:
+                pipeline.transform_dict(record)
+            assert str(refused.value) in {f"record holds the key '{text}' twice" for text in repeated}, chosen
+    assert refused_records > 0
+
+
+def _move_device(record: dict[str, Any], grow: int) -> None:
+    """Take the key "device" out of a record and store it again, last.
+
+    Args:
+        record: The record.
+        grow: How many keys to add in between; enough of them rebuild the
+            dict's table.
+
+    """
+    device: Any = record.pop("device")
+    for index in range(grow):
+        record[f"g{index}"] = index
+    record["device"] = device
+
+
+class _MovesOnIndex:
+    """An integer-like value whose __index__ moves the key "device" of its record."""
+
+    def __init__(self, record: dict[str, Any], grow: int) -> None:
+        """Hold the record to change.
+
+        Args:
+            record: The record this value is in.
+            grow: Passed to _move_device.
+
+        """
+        self.record: dict[str, Any] = record
+        self.grow: int = grow
+
+    def __index__(self) -> int:
+        """Move the key, then answer.
+
+        Returns:
+            1.
+
+        """
+        _move_device(self.record, self.grow)
+        return 1
+
+
+class _MovesOnAsm8(datetime.datetime):
+    """A datetime that moves the key "device" of the record in `record` when asked for a pandas Timestamp's asm8."""
+
+    record: ClassVar[dict[str, Any]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        """Move the key, then refuse the attribute.
+
+        Args:
+            name: The attribute asked for.
+
+        Raises:
+            AttributeError: Always.
+
+        """
+        if name == "asm8":
+            _move_device(type(self).record, 0)
+        raise AttributeError(name)
+
+
+@pytest.mark.parametrize("mover", ["index", "index_grown", "asm8"])
+def test_transform_dict_refuses_a_record_whose_value_moves_a_key_while_it_is_read(source: str, mover: str) -> None:
+    # REGRESSION: a value whose own code, run while the record is read, takes
+    # a key that was read out of the record and stores it again is an error
+    # that names the key. The read used to reach the key a second time, at
+    # its new place, and gave the steps a record that held it twice.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    record: dict[str, Any] = {"device": "ios"}
+    if mover == "asm8":
+        _MovesOnAsm8.record = record
+        record["t"] = _MovesOnAsm8(2021, 6, 1)
+    else:
+        record["n"] = _MovesOnIndex(record, 40 if mover == "index_grown" else 0)
+    with pytest.raises(EngineError) as refused:
+        pipeline.transform_dict(record)
+    assert str(refused.value) == "record holds the key 'device' twice"
+    # The key moved: the record holds it once, last.
+    assert list(record)[-1] == "device"
 
 
 def test_manifest_with_invalid_bytes_is_an_engine_error(tmp_path: Path) -> None:

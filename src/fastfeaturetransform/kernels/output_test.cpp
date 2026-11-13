@@ -765,6 +765,12 @@ Counts comparisons(CountedRecord& record, const std::vector<std::string>& names)
   return counts;
 }
 
+// find() moves the cursor, so a lookup that is const cannot find.
+template <typename Lookup>
+concept Finds = requires(Lookup lookup, const std::string& name) { lookup.find(name); };
+static_assert(Finds<fft::RecordLookup<fft::Row>&>);
+static_assert(!Finds<const fft::RecordLookup<fft::Row>&>);
+
 }  // namespace
 
 TEST_CASE("a record lookup compares one name for each field read in the record's order") {
@@ -846,7 +852,7 @@ TEST_CASE("a record lookup finds each field of a record whatever order they are 
     for (const std::size_t index : order) REQUIRE(lookup.find(record[index].first) == &record[index].second);
   } while (std::next_permutation(order.begin(), order.end()));
   // A step writes its result through what it finds.
-  const fft::RecordLookup lookup(record, 3);
+  fft::RecordLookup lookup(record, 3);
   REQUIRE(lookup.find("Price") == nullptr);
   *lookup.find("price") = int64_t{3};
   *lookup.find("prize") = std::monostate{};

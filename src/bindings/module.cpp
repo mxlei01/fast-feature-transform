@@ -6,11 +6,14 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 // After nanobind, which brings in Python.h.
+#include <ankerl/unordered_dense.h>
 #include <datetime.h>
 
 #include <chrono>
 #include <limits>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -102,13 +105,44 @@ std::optional<int64_t> numpy_epoch_microseconds(nb::handle value, const std::str
   return static_cast<int64_t>(micros);
 }
 
+// A record that holds one key twice is an error: a step reads one of the two
+// fields, and the output dict keeps the later one. A dict holds each key
+// once, yet two of its keys can have one text: a str subclass with its own
+// hash or equality beside a str. And code that runs while the record is read
+// can take a key out and store it again past the field being read, where the
+// walk reaches it a second time. So the names are checked only when a key is
+// not an exact str or a value's conversion can run Python code: a record of
+// exact str keys whose values are None, bools, ints, floats or strs,
+// subclasses included, is not checked.
+// Another thread that changes the record while this one waits for a str's
+// lock, on a free-threaded build, can repeat a key too; that race in the
+// caller's code is not checked, since checking it would cost every record
+// that holds a str that is not ASCII.
+void refuse_repeated_keys(const Row& row) {
+  ankerl::unordered_dense::set<std::string_view> names;
+  names.reserve(row.size());
+  for (const auto& field : row) {
+    if (!names.insert(field.first).second) {
+      throw fastfeaturetransform::Error("record holds the key '" + field.first + "' twice");
+    }
+  }
+}
+
 // Record values: str, int, float, bool, None, datetimes (as epoch
 // microseconds), plus numpy scalars (their integer and floating types convert
 // through __index__/__float__). Each refusal of a value names its key.
 Row row_from_dict(const nb::dict& record) {
   Row row;
   row.reserve(nb::len(record));
+  bool can_repeat = false;  // whether refuse_repeated_keys must look
   for (auto [key, value] : record) {
+    // A key is read with the calls nanobind's caster for std::string makes,
+    // without the string the caster builds and then moves, and the test for
+    // an exact str sits beside the test for a str. A record of 30 float
+    // fields through one Select step took a sixth less time than through
+    // nb::try_cast (an Apple M4, one thread).
+    if (!PyUnicode_Check(key.ptr())) throw fastfeaturetransform::Error("record keys must be str");
+    if (!PyUnicode_CheckExact(key.ptr())) can_repeat = true;
     // The record lends its keys and values, and its reference can be the
     // only one. Code that runs while a field is read can take the key or the
     // value out of the record and free it: a hook of the value or of its
@@ -119,11 +153,16 @@ Row row_from_dict(const nb::dict& record) {
     // to be read are held. Reading None, a bool, an int, a float or an ASCII
     // str does neither. On a free-threaded build the first UTF-8 conversion
     // of a str that is not ASCII locks the str, and can wait for that lock.
-    const bool key_can_wait = PyUnicode_Check(key.ptr()) && !PyUnicode_IS_ASCII(key.ptr());
+    const bool key_can_wait = !PyUnicode_IS_ASCII(key.ptr());
     const nb::object held_key = key_can_wait ? nb::borrow(key) : nb::object();
     nb::object held_value = key_can_wait ? nb::borrow(value) : nb::object();
-    std::string name;
-    if (!nb::try_cast(key, name)) throw fastfeaturetransform::Error("record keys must be str");
+    Py_ssize_t name_size = 0;
+    const char* const name_data = PyUnicode_AsUTF8AndSize(key.ptr(), &name_size);
+    if (name_data == nullptr) {  // a str with a lone surrogate has no UTF-8 form
+      PyErr_Clear();
+      throw fastfeaturetransform::Error("record keys must be str");
+    }
+    std::string name(name_data, static_cast<std::size_t>(name_size));
     if (value.is_none()) {
       row.emplace_back(std::move(name), std::monostate{});
     } else if (nb::isinstance<nb::bool_>(value)) {
@@ -145,6 +184,7 @@ Row row_from_dict(const nb::dict& record) {
       row.emplace_back(std::move(name), std::move(text));
     } else {
       held_value = nb::borrow(value);
+      can_repeat = true;
       const std::string type = python_type_name(value);
       const auto unsupported = [&] {
         return fastfeaturetransform::Error("record value for '" + name +
@@ -190,6 +230,7 @@ Row row_from_dict(const nb::dict& record) {
       }
     }
   }
+  if (can_repeat) refuse_repeated_keys(row);
   return row;
 }
 

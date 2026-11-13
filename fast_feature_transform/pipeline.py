@@ -293,7 +293,7 @@ class Pipeline:
             The transformed record.
 
         Raises:
-            EngineError: If a value cannot be converted or a required key is missing.
+            EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
 
         """

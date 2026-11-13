@@ -493,7 +493,7 @@ class QuantileEncode final : public Kernel {
 
   Row transform_row(Row row) const override {
     {
-      const RecordLookup lookup(row, columns_.size());
+      RecordLookup lookup(row, columns_.size());
       for (const std::string& name : columns_) {
         if (lookup.find(name) == nullptr) throw Error(stage + ": key '" + name + "' missing from record");
       }
