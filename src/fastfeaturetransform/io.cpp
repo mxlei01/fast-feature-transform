@@ -12,6 +12,7 @@
 #include <arrow/type_traits.h>
 #include <arrow/util/bit_run_reader.h>
 #include <arrow/util/bitmap_ops.h>
+#include <arrow/util/byte_size.h>
 #include <arrow/util/int_util.h>
 #include <fcntl.h>
 #include <parquet/arrow/reader.h>
@@ -863,14 +864,41 @@ bool indices_inside_dictionaries(const arrow::ArrayData& data) {
 
 }  // namespace
 
-// A batch of fewer than 4,096 rows waits for the ones after it: its row group
-// closes once it holds 4,096 rows or six batches. A batch holds fewer rows
-// the wider the output is, and every row group repeats each column's page
-// header, statistics and footer entry, so a row group per batch gives a very
-// wide output hundreds of row groups that are mostly those. A batch of 4,096
-// rows or more, which an output of up to 170 numeric columns has, is a row
-// group of its own, and no row group passes 65,536 rows unless one batch does.
-// Six bounds what a writer holds while the batches wait.
+// A batch of fewer than 4,096 rows waits for the ones after it. A batch holds
+// fewer rows the wider the output is, and every row group repeats each
+// column's page header, statistics and footer entry, so a row group per batch
+// gives a very wide output hundreds of row groups that are mostly those. The
+// row group closes once it holds 4,096 rows or six batches, or once one more
+// batch as large as its last would bring its buffers past 36 MiB. A batch of
+// 4,096 rows or more, which an output of up to 170 numeric columns has,
+// therefore closes the row group it joins, and is a row group of its own when
+// no batch waits. A batch that would bring the waiting rows past 65,536 goes
+// after them, so no row group passes 65,536 rows unless one batch does.
+//
+// Six batches and 36 MiB bound what a writer holds while batches wait. The
+// engine sizes a batch at 16/3 MiB by an estimate that counts a string as 32
+// bytes, so a batch of longer strings is larger: with 1,000 f64 columns and
+// a string of 20,000 characters in each row, a batch of 696 rows holds
+// 18.7 MiB. Passing 8,192 such rows through peaks at 578 to 585 MiB when
+// six batches wait, and at 436 to 453 MiB when each is written as it comes
+// (Apple M4, one thread). A batch of more than 18 MiB, half the bound,
+// therefore never waits. 36 MiB is six batches of 6 MiB, an eighth more than
+// the estimate, which leaves validity bitmaps out: a batch of 1,000 f64
+// columns read from Parquet holds 5,680,000 bytes where the estimate counts
+// 5,592,000. An output whose batches hold up to an eighth more than the
+// estimate keeps its row groups of six.
+//
+// A batch counts the whole of every buffer it refers to, because a slice
+// keeps its whole buffer alive. A column read as a dictionary from plain
+// pages refers to a slice of the dictionary the reader has built for the
+// row group so far. With 1,000 f64 columns beside distinct strings of 1,000
+// characters, in a row group of 32,768 rows, a late batch of 696 rows refers
+// to 6.4 MB and keeps 38.7 MB alive. Counted whole, such a batch is a row
+// group of its own: the transform's Arrow allocations peak at 706.2 MB where
+// they peak at 829.5 MB counting only the bytes referred to, and the output
+// takes 37 row groups instead of 10 and 1.1 to 1.2 times the time (Apple M4,
+// one thread). A buffer that two waiting batches share counts twice, which
+// only writes them sooner.
 //
 // Gathering the larger batches too, up to 65,536 rows a row group, was
 // measured and dropped: a worker then held five more batches for every
@@ -882,6 +910,7 @@ bool indices_inside_dictionaries(const arrow::ArrayData& data) {
 constexpr int64_t kRowGroupMinRows = 4096;
 constexpr int64_t kRowGroupRows = 65536;
 constexpr std::size_t kRowGroupBatches = 6;
+constexpr int64_t kRowGroupBytes = int64_t{36} << 20;
 
 struct PartWriter::Impl {
   std::string path, temp;
@@ -890,7 +919,7 @@ struct PartWriter::Impl {
   std::shared_ptr<arrow::io::OutputStream> output;  // the part file behind its write buffer
   std::unique_ptr<parquet::arrow::FileWriter> writer;
   std::vector<std::shared_ptr<arrow::Table>> pending;  // the batches of the row group being collected
-  int64_t pending_rows = 0;
+  int64_t pending_rows = 0, pending_bytes = 0;
   bool finished = false, abandoned = false, owns_temp = false;
 
   // Write the collected batches as one row group.
@@ -929,6 +958,7 @@ struct PartWriter::Impl {
     if (!status.ok()) throw Error(path + ": " + status.ToString());
     pending.clear();
     pending_rows = 0;
+    pending_bytes = 0;
   }
 };
 
@@ -1011,9 +1041,14 @@ void PartWriter::append(const Batch& batch) {
     }
     if (batch.rows > 0) {
       if (state.pending_rows + batch.rows > kRowGroupRows) state.write_pending();
+      const int64_t bytes = arrow::util::TotalBufferSize(*table);
       state.pending.push_back(std::move(table));
       state.pending_rows += batch.rows;
-      if (state.pending.size() == kRowGroupBatches || state.pending_rows >= kRowGroupMinRows) state.write_pending();
+      state.pending_bytes += bytes;
+      if (state.pending.size() == kRowGroupBatches || state.pending_rows >= kRowGroupMinRows ||
+          state.pending_bytes + bytes > kRowGroupBytes) {
+        state.write_pending();
+      }
     }
     state.rows += batch.rows;
   } catch (...) {
