@@ -148,7 +148,7 @@ def _validated_steps(steps: Iterable[Step]) -> list[Step]:
         steps: Ordered (name, transformer-or-pipeline) pairs.
 
     Returns:
-        The steps as a new list.
+        The steps as a new list, each name a plain ``str``.
 
     Raises:
         TypeError: If a step is not a (name, Transformer or Pipeline instance) pair.
@@ -157,10 +157,18 @@ def _validated_steps(steps: Iterable[Step]) -> list[Step]:
     """
     materialized: list[Step] = list(steps)  # a one-shot iterable must be consumed exactly once
     seen: set[str] = set()
+    plain: bool = True
     for step in materialized:
         if not (isinstance(step, tuple) and len(step) == 2 and isinstance(step[0], str)):
             raise TypeError(f"each step must be a (name, transformer) pair, got {step!r}")
         name, transformer = step
+        if type(name) is not str:
+            # A name given as a str subclass, such as an Enum with a str
+            # mixin, is stored as the plain string it equals. A nested step's
+            # stage name is built by formatting the step names, and such a
+            # member formats as "ClassName.MEMBER", which names no stage.
+            name = str.__str__(name)
+            plain = False
         if not isinstance(transformer, (Transformer, Pipeline)):
             raise TypeError(f"step {name!r} must be a Transformer or Pipeline instance, got {transformer!r}")
         if not name or "." in name:
@@ -168,7 +176,11 @@ def _validated_steps(steps: Iterable[Step]) -> list[Step]:
         if name in seen:
             raise ValueError(f"duplicate step name {name!r}")
         seen.add(name)
-    return materialized
+    # Steps whose names are all plain strings are kept as given rather than
+    # rebuilt pair by pair, which costs a new pair for every step.
+    if plain:
+        return materialized
+    return [(str.__str__(name), transformer) for name, transformer in materialized]
 
 
 class Pipeline:

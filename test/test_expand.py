@@ -3,6 +3,7 @@
 import json
 import math
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ from fast_feature_transform import (
     StandardScaler,
     _core,
 )
-from helpers import read_rows, write_parquet
+from helpers import NAME_KIND_IDS, NAME_KINDS, read_rows, write_parquet
 
 
 @pytest.fixture
@@ -180,6 +181,36 @@ def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_pat
     infinite: str = write_parquet(tmp_path / "inf.parquet", pa.table({"price": [math.inf], "height": [1.0]}))
     with pytest.raises(EngineError, match="is not finite"):
         expand.transform_parquet([infinite], output_dir=tmp_path / "inf-out")
+
+
+@pytest.mark.parametrize("name", NAME_KINDS, ids=NAME_KIND_IDS)
+def test_output_columns_name_the_columns_written_when_a_column_name_is_a_str_subclass(
+    name: Callable[[str], Any], numbers: list[str], tmp_path: Path
+) -> None:
+    # REGRESSION: a column name given as a str subclass is stored as the
+    # plain string it equals, so output_columns names the columns written. An
+    # Enum with a str mixin formats as "EnumName.price", and output_columns
+    # used to hold "EnumName.price^2" and "EnumName.price_sp_0" where price^2
+    # and price_sp_0 were written, so a later step that named them failed.
+    def expansions(make: Callable[[str], Any]) -> list[PolynomialFeatures | SplineTransformer]:
+        return [
+            PolynomialFeatures(columns=[make("price"), make("height")], degree=3),
+            SplineTransformer(columns=[make("price"), make("height")], n_knots=3, degree=2),
+        ]
+
+    for given, plain in zip(expansions(name), expansions(str), strict=True):
+        assert given.output_columns == plain.output_columns
+        given.fit(numbers)
+        assert list(given.transform_dict({"price": 2.0, "height": 11.0})) == given.output_columns
+        rows: list[dict[str, Any]] = read_rows(
+            given.transform_parquet(numbers, output_dir=tmp_path / type(given).__name__)
+        )
+        assert list(rows[0]) == ["device", *given.output_columns]
+    # A later step in the same pipeline can name them.
+    for expansion in expansions(name):
+        chained: Pipeline = Pipeline([("expand", expansion), ("pick", Select(columns=expansion.output_columns))])
+        chained.fit(numbers)
+        assert list(chained.transform_dict({"price": 2.0, "height": 11.0})) == expansion.output_columns
 
 
 def test_spline_transform_fits_knots_and_evaluates_the_basis(numbers: list[str], tmp_path: Path) -> None:
