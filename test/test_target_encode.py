@@ -124,13 +124,21 @@ def test_woe_encode_needs_a_binary_target_and_centres_on_zero(clicks: list[str],
         ([0, 1, 2, 0, 1, 2, 0, 1], "more than two distinct values"),
         ([1, 2, 1, 2, 1, 2, 1, 2], "no value 0 was found"),
         ([0, -1, 0, -1, 0, -1, 0, -1], "no value 1 was found"),
+        # 2^62 and 2^62 + 1 are two integers but one f64. category_encoders refuses these three the same way: the
+        # first two hold three distinct values, and the third holds two and no 0.
+        ([0, 2**62, 2**62 + 1, 0, 2**62, 0, 2**62 + 1, 2**62], "more than two distinct values"),
+        ([0, 2**62, 2**62 + 1, 0, 2**62, 0, 2**62 + 1, 0], "more than two distinct values"),
+        ([2**62, 2**62 + 1] * 4, "no value 0 was found"),
     ):
+        # A row group of two rows holds at most two distinct values, so a target of three is counted across row groups.
         path: str = write_parquet(
             tmp_path / "woe.parquet",
             pa.table({"city": ["ams", "ber", "cph", "dub"] * 2, "clicked": target}),
+            row_group_size=2,
         )
-        with pytest.raises(EngineError, match=message):
-            WOEEncoder(target="clicked", columns=["city"]).fit([path])
+        for threads in (1, 4):
+            with pytest.raises(EngineError, match=message):
+                WOEEncoder(target="clicked", columns=["city"]).fit([path], threads=threads)
 
 
 def test_a_null_category_is_learned_and_a_null_target_teaches_nothing(tmp_path: Path) -> None:

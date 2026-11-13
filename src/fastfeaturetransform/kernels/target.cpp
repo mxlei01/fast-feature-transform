@@ -14,7 +14,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -166,11 +165,12 @@ using AccMap = CategoryAccumulator<Acc>;
 // keeps: two say the target is binary, a third says it is not.
 constexpr std::size_t kDistinctProbe = 3;
 
-// Taking the smallest distinct values (plus the largest separately) keeps
-// the probe the same however the rows were split: the smallest three of a
-// union are the smallest three of the two smallest-three sets.
-void note_distinct(std::vector<double>& smallest, double& largest, double value) {
-  largest = std::max(largest, value);
+// Taking the smallest distinct values keeps the probe the same however the
+// rows were split: the smallest three of a union are the smallest three of
+// the two smallest-three sets. An integer target is probed as integers,
+// since 2^62 and 2^62 + 1 are two integers but one f64.
+template <typename T>
+void note_distinct(std::vector<T>& smallest, T value) {
   auto at = std::lower_bound(smallest.begin(), smallest.end(), value);
   if (at != smallest.end() && *at == value) return;
   smallest.insert(at, value);
@@ -361,9 +361,11 @@ class TargetBlend final : public Kernel {
 
   struct State final : AccState {
     std::unordered_map<std::string, Column> columns;
-    Acc total;                     // the fit-wide count and sum
-    std::vector<double> smallest;  // the smallest distinct target values
-    double largest = -std::numeric_limits<double>::infinity();
+    Acc total;  // the fit-wide count and sum
+    // woe_encode: the smallest distinct values of a float target, or of an
+    // integer one.
+    std::vector<double> smallest;
+    std::vector<int64_t> smallest_integers;
   };
 
   std::unique_ptr<AccState> make_state() const override { return std::make_unique<State>(); }
@@ -434,8 +436,8 @@ class TargetBlend final : public Kernel {
     totals.sum = sum_of(merged->total, target_family_);
     prior_ = totals.sum / static_cast<double>(totals.rows);
     if (formula_ == Formula::Woe) {
-      check_binary(*merged);
-      zero_one_target_ = merged->smallest.front() == 0.0 && merged->largest == 1.0;
+      zero_one_target_ =
+          target_family_ == Family::Integer ? check_binary(merged->smallest_integers) : check_binary(merged->smallest);
     }
     // Only james_stein_encode reads the variance, and only its bound keeps
     // the square of the sum inside f64.
@@ -605,7 +607,7 @@ class TargetBlend final : public Kernel {
         integers[slot] = value;
         present[slot] = true;
         add(state.total, value);
-        if (formula_ == Formula::Woe) note_distinct(state.smallest, state.largest, static_cast<double>(value));
+        if (formula_ == Formula::Woe) note_distinct(state.smallest_integers, value);
       });
       return;
     }
@@ -630,7 +632,7 @@ class TargetBlend final : public Kernel {
       doubles[slot] = value;
       present[slot] = true;
       add(state.total, value);
-      if (formula_ == Formula::Woe) note_distinct(state.smallest, state.largest, value);
+      if (formula_ == Formula::Woe) note_distinct(state.smallest, value);
     });
   }
 
@@ -651,8 +653,8 @@ class TargetBlend final : public Kernel {
 
   void merge_into(State& into, State& from) const {
     merge_acc(into.total, from.total);
-    for (double value : from.smallest) note_distinct(into.smallest, into.largest, value);
-    into.largest = std::max(into.largest, from.largest);
+    for (double value : from.smallest) note_distinct(into.smallest, value);
+    for (int64_t value : from.smallest_integers) note_distinct(into.smallest_integers, value);
     for (auto& [name, column] : from.columns) {
       Column& dest = into.columns[name];
       for (auto& [key, slot] : column.categories.slots) {
@@ -678,14 +680,18 @@ class TargetBlend final : public Kernel {
 
   // woe_encode's target must be binary, which upstream reads as: exactly two
   // distinct values, at least one of them 1 or more and at least one 0 or less.
-  void check_binary(const State& state) const {
+  // The probe keeps three, so a binary target's two are both in it. Returns
+  // whether the two are 0 and 1.
+  template <typename T>
+  bool check_binary(const std::vector<T>& smallest) const {
     const std::string where = stage + ": target column '" + target_ + "'";
-    if (state.smallest.size() != 2) {
+    if (smallest.size() != 2) {
       throw Error(where + " must be binary, but it holds " +
-                  (state.smallest.size() == 1 ? "only one distinct value" : "more than two distinct values"));
+                  (smallest.size() == 1 ? "only one distinct value" : "more than two distinct values"));
     }
-    if (state.largest < 1.0) throw Error(where + " must be binary with values 0 and 1; no value 1 was found");
-    if (state.smallest.front() > 0.0) throw Error(where + " must be binary with values 0 and 1; no value 0 was found");
+    if (smallest.back() < T{1}) throw Error(where + " must be binary with values 0 and 1; no value 1 was found");
+    if (smallest.front() > T{0}) throw Error(where + " must be binary with values 0 and 1; no value 0 was found");
+    return smallest.front() == T{0} && smallest.back() == T{1};
   }
 
   // The one place the six kernels differ: n rows summing to s in this
