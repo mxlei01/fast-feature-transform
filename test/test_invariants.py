@@ -1,6 +1,7 @@
 """Tests for the invariants the engine design rests on: pass scheduling, parity, merges, concurrency, column order."""
 
 import copy
+import shutil
 import subprocess  # nosec B404
 import sys
 import threading
@@ -312,6 +313,7 @@ def test_readers_see_the_old_fit_or_the_new_one_while_a_transformer_is_fitted_ag
 # runs in a child process.
 FIRST_FIT_COPY_CHILD: str = """
 import copy
+import shutil
 import pickle
 import sys
 import threading
@@ -811,3 +813,21 @@ def test_tracked_stub_matches_the_generated_one(tmp_path: Path) -> None:
     subprocess.run([*ruff, "check", *config, "--select", "PYI009", "--fix", str(generated)], check=True)  # nosec B603
     subprocess.run([*ruff, "format", *config, str(generated)], check=True)  # nosec B603
     assert generated.read_text() == (repo / "fast_feature_transform" / "_core.pyi").read_text()
+
+
+def test_extension_exports_only_the_module_initializer() -> None:
+    nm = shutil.which("nm")
+    if nm is None:
+        pytest.skip("nm is unavailable")
+    if sys.platform == "darwin":
+        flags = ["-gUj"]
+        expected = "_PyInit__core"
+    elif sys.platform.startswith("linux"):
+        flags = ["-D", "--defined-only", "--format=just-symbols"]
+        expected = "PyInit__core"
+    else:
+        pytest.skip("export rules apply to macOS and Linux")
+    result = subprocess.run(  # nosec B603
+        [nm, *flags, fast_feature_transform._core.__file__], check=True, capture_output=True, text=True
+    )
+    assert result.stdout.splitlines() == [expected]
