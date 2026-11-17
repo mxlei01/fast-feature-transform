@@ -117,6 +117,7 @@ double exact_sum(const SpillVector<double>& values, const std::string& where, F&
       if (!sum.add(fn(value))) throw Error(where + ": a sum over the fitted column left the range of f64");
     }
   });
+  if (sum.outside_range()) throw Error(where + ": a sum over the fitted column left the range of f64");
   return sum.value();
 }
 

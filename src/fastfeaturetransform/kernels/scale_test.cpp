@@ -431,7 +431,7 @@ TEST_CASE("standard_scale fits a column whose squares sum just under the largest
   // infinity: refused in either order, on both paths, and where two workers
   // each hold one value and only their merge passes.
   const std::string refused =
-      "scale: column 'a': its squares sum to the largest f64 or more (scale the column down first)";
+      "scale: column 'a': the sum of its squares rounds to infinity (scale the column down first)";
   const Doubles over{0x1.8fae0c15ad38ap+511, 0x1.4p511};
   for (const Doubles& order : {over, Doubles(over.rbegin(), over.rend())}) {
     Doubles with_null = order;
@@ -444,19 +444,14 @@ TEST_CASE("standard_scale fits a column whose squares sum just under the largest
     REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {first, second}), Equals(refused));
   }
 
-  // Within half a step of the largest double, on either side, the squares
-  // sum to it, and the order of the rows decides. These squares sum to 0.08
-  // of a step under it. With the smaller value first, the running sum stands
-  // 0.38 of a step past it once the larger square, rounded up, is added and
-  // before its rounding error is, and a step of the walk over the partials
-  // overflows there, as ExactSum describes. In the other order, or with one
-  // value for each of two workers, the column fits the exact statistics,
-  // which are scikit-learn's.
+  // These squares sum to 0.08 of a step below the largest double.
+  // REGRESSION: adding the larger rounded square before its residual used
+  // to overflow the partials in one order. Both orders fit the same state.
   const Doubles near{0x1.6a01f4e4a04bbp+511, 0x1.6a11d7beaa3e1p+511};
-  REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(near)})}),
-                      Equals(refused));
+  const auto forward = fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(near)})});
   const auto reversed =
       fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles({near[1], near[0]})})});
+  REQUIRE(forward->state() == reversed->state());
   REQUIRE(reversed->state().at("means").at("a").get<double>() == 0x1.6a09e651a544ep+511);
   REQUIRE(reversed->state().at("variances").at("a").get<double>() == 0x1.f8bd25bb58456p+995);
   const fft::Batch smaller = make_batch({"a"}, {doubles({near[0]})});
@@ -494,7 +489,7 @@ TEST_CASE("standard_scale block precomputation preserves first invalid and overf
       values[static_cast<std::size_t>(first_bad)] = overflow_first ? 1e200 : std::numeric_limits<double>::infinity();
       values[static_cast<std::size_t>(first_bad + 1)] =
           overflow_first ? std::numeric_limits<double>::quiet_NaN() : 1e200;
-      const std::string error = overflow_first ? "its squares sum to the largest f64 or more" : "is not finite";
+      const std::string error = overflow_first ? "the sum of its squares rounds to infinity" : "is not finite";
       const auto dense = doubles(values);
       values.push_back(std::nullopt);
       const auto scalar = doubles(values);
@@ -518,7 +513,7 @@ TEST_CASE("standard_scale block precomputation preserves first invalid and overf
   values.push_back(std::nullopt);
   for (const auto& input : {dense, doubles(values)}) {
     REQUIRE_THROWS_WITH(fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {input})}),
-                        ContainsSubstring("scale: column 'a': its squares sum to the largest f64 or more"));
+                        ContainsSubstring("scale: column 'a': the sum of its squares rounds to infinity"));
   }
 }
 

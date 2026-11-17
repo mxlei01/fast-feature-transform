@@ -2632,14 +2632,13 @@ class StandardScaler(_Scaler):
     every output value differs by 2.0. Every parity case matches
     scikit-learn bit for bit.
 
-    The squares of a column's values are summed exactly as well, and a
-    column whose squares sum to ``2**1024 - 2**970`` or more, half a step
-    past the largest f64 (about 1.8e308), is an error: n values with a root
-    mean square above about ``1.34e154 / sqrt(n)``. A sum within half a step
-    of the largest f64, on either side, rounds to it, and such a column can
-    be an error in one order or split of its rows and fit in another. With
-    several threads the split, and so the outcome, can change from one fit
-    of the same files to the next. scikit-learn fits these columns when
+    Each square contributes its rounded f64 value and its rounding error,
+    also rounded to f64. Errors at or below half the smallest subnormal in
+    magnitude round to zero. These terms are summed exactly. A square or sum
+    at or above ``2**1024 - 2**970``, halfway beyond the largest f64, rounds
+    to infinity and is an error. For n values the root mean square limit is
+    about ``1.34e154 / sqrt(n)``. The outcome is the same in every row order
+    and for every split between threads. scikit-learn fits such columns when
     their squared deviations from the mean sum within f64. No other column
     is an error for its magnitude.
     """
@@ -2938,13 +2937,10 @@ class Normalizer(Transformer):
     answer. A null is an error too, as scikit-learn's NaN is: a norm over a
     missing number has no value. Every listed column becomes f64.
 
-    The l1 and l2 sums are exact partials, so the norm does not depend on
-    the order the columns were listed in, except at the top of the range. A
-    row whose sum of absolute values (l1) or of squares rounded to f64 (l2)
+    The l1 and l2 sums are exact, so the norm is independent of column order.
+    A row whose sum of absolute values (l1) or of squares rounded to f64 (l2)
     is ``2**1024 - 2**970`` or more, half a step past the largest f64, is
-    an error in every order. A sum less than half a step past the largest
-    f64 rounds to it, and such a row of three or more columns can be an
-    error in one column order and normalized in another.
+    an error in every order.
     """
 
     kernel_id: ClassVar[str] = "normalize"
