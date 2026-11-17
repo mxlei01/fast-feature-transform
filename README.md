@@ -62,6 +62,8 @@ writing Parquet adds time on both sides, which narrows the gap where the transfo
 stays widest where the other library's transform is slow. Matching names don't always mean matching behavior:
 categories are sorted, output types are fixed at fit, and `PolynomialEncoder` differs from category_encoders by about
 1e-5 at 32 categories and by more than 0.5 from 40 to 128, because category_encoders' basis is the less accurate one.
+With `handle_missing="return_nan"`, `CountEncoder` keeps a null for every `handle_unknown` setting. category_encoders
+fills it with an integer `handle_unknown` and rejects it under `"error"`.
 
 ## Development
 

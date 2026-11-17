@@ -131,23 +131,19 @@ enum class Missing { Value, ReturnNan, Error };
 enum class Unknown { Value, ReturnNan, Error, Indicator };
 
 inline Missing missing_from(const nlohmann::json& params, const std::string& what) {
-  const std::string text = params.contains("handle_missing") && !params.at("handle_missing").is_null()
-                               ? params.at("handle_missing").get<std::string>()
-                               : "value";
-  if (text == "value") return Missing::Value;
-  if (text == "return_nan") return Missing::ReturnNan;
-  if (text == "error") return Missing::Error;
+  const auto it = params.find("handle_missing");
+  if (it == params.end() || it->is_null() || *it == "value") return Missing::Value;
+  if (*it == "return_nan") return Missing::ReturnNan;
+  if (*it == "error") return Missing::Error;
   throw Error(what + ": 'handle_missing' must be 'value', 'return_nan' or 'error'");
 }
 
 inline Unknown unknown_from(const nlohmann::json& params, const std::string& what, bool allow_indicator) {
-  const std::string text = params.contains("handle_unknown") && !params.at("handle_unknown").is_null()
-                               ? params.at("handle_unknown").get<std::string>()
-                               : "value";
-  if (text == "value") return Unknown::Value;
-  if (text == "return_nan") return Unknown::ReturnNan;
-  if (text == "error") return Unknown::Error;
-  if (text == "indicator" && allow_indicator) return Unknown::Indicator;
+  const auto it = params.find("handle_unknown");
+  if (it == params.end() || it->is_null() || *it == "value") return Unknown::Value;
+  if (*it == "return_nan") return Unknown::ReturnNan;
+  if (*it == "error") return Unknown::Error;
+  if (*it == "indicator" && allow_indicator) return Unknown::Indicator;
   throw Error(what + ": 'handle_unknown' must be 'value', 'return_nan'" + (allow_indicator ? ", 'indicator'" : "") +
               " or 'error'");
 }

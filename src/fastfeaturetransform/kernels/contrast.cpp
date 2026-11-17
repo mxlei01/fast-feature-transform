@@ -359,7 +359,8 @@ class ContrastEncode final : public Kernel {
         bool mostly_zero = false;
         if (names.size() >= 4 && !level_of.empty()) {
           std::size_t sampled = 0;
-          for (std::size_t i = 0; i < 64; ++i) sampled += level_of[i * level_of.size() / 64] == zero_row ? 1 : 0;
+          for (std::size_t i = 0; i < 64; ++i)
+            sampled += static_cast<std::size_t>(level_of[i * level_of.size() / 64] == zero_row);
           mostly_zero = sampled > (names.size() > 10 ? 56U : 60U);
         }
         std::vector<std::size_t> coded_rows;

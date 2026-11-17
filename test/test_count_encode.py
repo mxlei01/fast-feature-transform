@@ -71,6 +71,33 @@ def test_count_encode_null_and_unknown_options(events: list[str], tmp_path: Path
         CountEncoder(columns=["device"], handle_missing="error").fit([nulls])
 
 
+@pytest.mark.parametrize("unknown", [-1, "error"])
+def test_count_encode_keeps_nulls_under_return_nan(events: list[str], tmp_path: Path, unknown: int | str) -> None:
+    encoder = CountEncoder(columns=["device"], handle_missing="return_nan", handle_unknown=unknown).fit(events)
+    assert encoder.transform_dict({"device": None}) == {"device": None}
+    assert read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))[3]["device"] is None
+
+
+@pytest.mark.parametrize(
+    "options", [{"min_group_name": ""}, {"combine_min_nan_groups": False}, {"combine_min_nan_groups": "force"}]
+)
+def test_count_encode_group_options_require_a_threshold_at_fit(
+    events: list[str], tmp_path: Path, options: dict[str, Any]
+) -> None:
+    encoder = CountEncoder(columns=["device"], **options)
+    with pytest.raises(EngineError, match="require min_group_size"):
+        encoder.fit(events)
+
+    # Earlier versions saved these options and fitted ordinary counts.
+    saved = tmp_path / "saved"
+    Pipeline([("count", CountEncoder(columns=["device"]))]).fit(events).save(saved)
+    path = saved / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["ops"][0]["params"].update(options)
+    path.write_text(json.dumps(manifest))
+    assert Pipeline.load(saved).transform_dict({"device": "ios"}) == {"device": 3}
+
+
 def test_count_encode_folds_small_groups(tmp_path: Path) -> None:
     table: pa.Table = pa.table({"device": ["ios"] * 6 + ["web", "tv", "mob", "mob"]})
     path: str = write_parquet(tmp_path / "rare.parquet", table)
