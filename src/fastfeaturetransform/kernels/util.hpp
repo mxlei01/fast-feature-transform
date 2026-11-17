@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -318,22 +319,78 @@ inline const arrow::Array& column_array(const Batch& batch, const std::string& s
   return *batch.cols[static_cast<std::size_t>(idx)];
 }
 
-// An exact sum of doubles. add() and merge() lose no bit, so every order of
-// the same values, and every split of them across sums that are merged
-// later, gives the same sum when it takes them all, and value() rounds that
-// sum once, correctly. add() and merge() answer false when a value is not
-// finite or the exact sum reaches half a step past the largest double,
-// 2^1024 - 2^970, in magnitude, where it rounds to infinity. As in
-// math.fsum, whose partials these are, a step of the walk over the partials
-// can overflow while the exact sum is still in range, so they can also
-// answer false, in one order or split and not in another, for a sum that
-// rounds to a finite double: one that lies within half a step above the
-// largest double, or one reached by adding plus or minus the largest double
-// while the partials below the largest partial hold half a step or more of
-// that value's sign and the largest partial has the other sign. After a
-// false the sum holds nothing a caller can use until clear().
-//
-// The sum is the exact total of two parts.
+// Near the top of the double range, an intermediate sum can overflow even
+// when the final sum rounds to a finite value. Count units of the smallest
+// subnormal instead. A finite double occupies at most 2098 bits in these
+// units. Another 64 bits cover every row of a 64-bit input, plus a sign bit.
+class WideSum {
+ public:
+  void add(double x) {
+    const uint64_t bits = std::bit_cast<uint64_t>(x);
+    const unsigned exponent = static_cast<unsigned>(bits >> 52) & 0x7ffU;
+    uint64_t mantissa = bits & ((uint64_t{1} << 52) - 1);
+    if (exponent != 0) mantissa |= uint64_t{1} << 52;
+    const unsigned shift = exponent == 0 ? 0 : exponent - 1;
+    const unsigned offset = shift % 64;
+    const bool negative = bits >> 63 != 0;
+    add_word(shift / 64, mantissa << offset, negative);
+    if (offset != 0) add_word(shift / 64 + 1, mantissa >> (64 - offset), negative);
+  }
+
+  void merge(const WideSum& other) {
+    for (std::size_t i = 0; i < words_.size(); ++i) add_word(i, other.words_[i], false);
+  }
+
+  double value() const {
+    auto magnitude = words_;
+    const bool negative = magnitude.back() >> 63 != 0;
+    if (negative) {
+      bool carry = true;
+      for (auto& word : magnitude) {
+        word = ~word + static_cast<uint64_t>(carry);
+        carry = carry && word == 0;
+      }
+    }
+    std::size_t n = magnitude.size();
+    while (n > 0 && magnitude[n - 1] == 0) --n;
+    if (n == 0) return 0.0;
+    const auto width = 64 * (n - 1) + static_cast<unsigned>(64 - std::countl_zero(magnitude[n - 1]));
+    const auto shift = width > 53 ? width - 53 : 0;
+    const auto index = shift / 64;
+    const auto offset = shift % 64;
+    uint64_t significant = magnitude[index] >> offset;
+    if (offset != 0 && index + 1 < n) significant |= magnitude[index + 1] << (64 - offset);
+    if (shift != 0) {
+      const auto guard = shift - 1;
+      const uint64_t half = uint64_t{1} << (guard % 64);
+      const auto word = magnitude[guard / 64];
+      if ((word & half) != 0) {
+        bool round_up = (significant & 1) != 0 || (word & (half - 1)) != 0;
+        for (std::size_t i = 0; i < guard / 64 && !round_up; ++i) round_up = magnitude[i] != 0;
+        significant += static_cast<uint64_t>(round_up);
+      }
+    }
+    const double value = std::ldexp(static_cast<double>(significant), static_cast<int>(shift) - 1074);
+    return negative ? -value : value;
+  }
+
+ private:
+  void add_word(std::size_t index, uint64_t term, bool subtract) {
+    while (term != 0 && index < words_.size()) {
+      const uint64_t old = words_[index];
+      const uint64_t next = subtract ? old - term : old + term;
+      words_[index++] = next;
+      term = static_cast<uint64_t>(subtract ? old < term : next < old);
+    }
+  }
+
+  std::array<uint64_t, 34> words_{};
+};
+
+// An exact sum of finite doubles, rounded only when read. add() rejects
+// non-finite inputs. A finite running sum can exceed f64 and come back
+// inside it later. value() returns infinity when the completed sum rounds
+// past f64, and outside_range() tests this without rounding an ordinary sum.
 //
 // The three terms head_, carry_ and spare_. A value is added to head_, what
 // that addition rounds away is added to carry_, and what that one rounds
@@ -347,31 +404,26 @@ inline const arrow::Array& column_array(const Batch& batch, const std::string& s
 // (the algorithm of Python's math.fsum). They take what the third addition
 // drops, in a walk over every partial.
 //
-// One test after the three additions finds every value they cannot finish:
-//   * e3 != 0: the third addition dropped e3, which joins the partials. A
-//     NaN compares unequal too, and a NaN is what any of the three leaves in
-//     e3 after meeting a NaN, an infinity or an overflow.
-//   * |s| < 2^1023 fails: the new head is in f64's top binade or is not
-//     finite. A head up there can overflow at its next addition while the
-//     exact sum is still in range, and three terms that never overflow can
-//     total a sum that is out of range, which add() has to refuse. So the
-//     head never enters the top binade. From the value that would take it
-//     there the partials alone hold the sum, and Shewchuk's step answers
-//     false when its largest partial overflows. head_ is NaN from then on:
-//     every later value fails the test the same way, and value() and merge()
-//     see that the three terms no longer count.
-// A TwoSum is exact unless one of its operations overflows. The first cannot
-// while the head stays below 2^1023, before and after; an overflow in the
-// other two leaves a NaN in e3, which the partials refuse. So a sum whose
-// every add() answered true is exact.
+// A residual after the third addition joins the partials. If an addition
+// overflows or the head enters the top binade, all terms move to a wider
+// accumulator. From then on the NaN head routes every add to the cold path.
+// Ordinary additions still use only the three doubles and their partials.
 class ExactSum {
+  struct Storage {
+    std::vector<double> parts;
+    std::unique_ptr<WideSum> wide;
+    Storage() = default;
+    Storage(const Storage& other)
+        : parts(other.parts), wide(other.wide ? std::make_unique<WideSum>(*other.wide) : nullptr) {}
+  };
+
  public:
   class Adder;
 
   ExactSum() = default;
   // A copy has partials of its own.
   ExactSum(const ExactSum& other)
-      : partials_(other.partials_ ? std::make_unique<std::vector<double>>(*other.partials_) : nullptr),
+      : partials_(other.partials_ ? std::make_unique<Storage>(*other.partials_) : nullptr),
         head_(other.head_),
         carry_(other.carry_),
         spare_(other.spare_) {}
@@ -382,16 +434,27 @@ class ExactSum {
   [[nodiscard]] bool add(double x) { return add_to(*this, head_, carry_, spare_, x); }
 
   [[nodiscard]] bool merge(const ExactSum& other) {
+    if (this == &other) return merge(ExactSum(other));
     if (other.partials_) {
-      for (double partial : *other.partials_) {
+      if (other.partials_->wide) {
+        widen(head_, carry_, spare_);
+        partials_->wide->merge(*other.partials_->wide);
+        return true;
+      }
+      for (double partial : other.partials_->parts) {
         if (!add(partial)) return false;
       }
     }
     return std::isnan(other.head_) || (add(other.spare_) && add(other.carry_) && add(other.head_));
   }
 
+  bool outside_range() const { return std::isnan(head_) && !std::isfinite(partials_->wide->value()); }
+
   void clear() {
-    if (partials_) partials_->clear();
+    if (partials_) {
+      partials_->parts.clear();
+      partials_->wide.reset();
+    }
     head_ = carry_ = spare_ = 0.0;
   }
 
@@ -399,15 +462,16 @@ class ExactSum {
   // by Shewchuk's step, on the stack when the partials are few; the rounding
   // is CPython's, which rounds half to even across partials.
   double value() const {
+    if (partials_ && partials_->wide) return partials_->wide->value();
     std::array<double, 16> local;
     std::vector<double> heap;
     double* parts = local.data();
-    std::size_t n = partials_ ? partials_->size() : 0;
+    std::size_t n = partials_ ? partials_->parts.size() : 0;
     if (n + 3 > local.size()) {
       heap.resize(n + 3);
       parts = heap.data();
     }
-    if (partials_) std::copy(partials_->begin(), partials_->end(), parts);
+    if (partials_) std::copy(partials_->parts.begin(), partials_->parts.end(), parts);
     if (!std::isnan(head_)) {
       const double front[] = {spare_, carry_, head_};
       for (double term : front) n = grow(parts, n, term);
@@ -430,7 +494,7 @@ class ExactSum {
     return hi;
   }
 
-  // The sum as doubles that total it exactly and depend on its value alone:
+  // A finite rounded sum as doubles that total it exactly:
   // the first is value(), and each next one is value() of what the ones
   // before leave, until nothing is left. Each is at most 2^-53 of the one
   // before, so there are at most 40. The three terms and the partials do not
@@ -443,10 +507,9 @@ class ExactSum {
     ExactSum rest = *this;
     std::vector<double> all;
     for (double top = rest.value(); top != 0.0; top = rest.value()) {
+      if (!std::isfinite(top)) throw Error("exact sum terms exceed the range of f64");
       all.push_back(top);
-      // Taking the rounded sum away cannot fail, short of a sum that add()
-      // has refused, whose value is not finite.
-      if (!rest.add(-top)) break;
+      (void)rest.add(-top);
     }
     return all;
   }
@@ -497,23 +560,28 @@ class ExactSum {
   [[gnu::noinline, gnu::cold]] bool add_slowly(double x, double s, double c, double t, double e3, double head,
                                                double carry, double spare) {
     // Only the third addition dropped something.
-    if (std::fabs(s) < kTopBinade) {
+    if (std::fabs(s) < kTopBinade && std::isfinite(e3)) {
       head_ = s;
       carry_ = c;
       spare_ = t;
-      return join(e3);
+      join(e3);
+      return true;
     }
-    // The first value to take the head to the top binade or past it: the
-    // terms before it move to the partials, and so does every value from it.
-    if (!std::isnan(head)) {
-      head_ = std::numeric_limits<double>::quiet_NaN();
-      carry_ = spare_ = 0.0;
-      const double before[] = {spare, carry, head};
-      for (double term : before) {
-        if (!join(term)) return false;
-      }
-    }
-    return join(x);
+    if (!std::isfinite(x)) return false;
+    widen(head, carry, spare);
+    partials_->wide->add(x);
+    return true;
+  }
+
+  void widen(double head, double carry, double spare) {
+    if (!partials_) partials_ = std::make_unique<Storage>();
+    if (partials_->wide) return;
+    partials_->wide = std::make_unique<WideSum>();
+    for (double term : partials_->parts) partials_->wide->add(term);
+    partials_->parts.clear();
+    for (double term : {head, carry, spare}) partials_->wide->add(term);
+    head_ = std::numeric_limits<double>::quiet_NaN();
+    carry_ = spare_ = 0.0;
   }
 
   // Dekker's Fast2Sum, the step of math.fsum: the same pair in three
@@ -570,27 +638,23 @@ class ExactSum {
     return kept;
   }
 
-  // The same step on the partials themselves. False when the largest partial
-  // is not finite: x was a NaN or an infinity, the sum left f64's range, or
-  // a step of the walk overflowed in one of the two ways the class comment
-  // names. That partial is then dropped: a caller that goes on adding to a
-  // refused sum, as k-means does, would leave one more with every value, for
-  // each later value to walk.
-  bool join(double x) {
-    if (!partials_) partials_ = std::make_unique<std::vector<double>>();
-    std::vector<double>& parts = *partials_;
+  // A finite residual from the third TwoSum joins the partials here.
+  void join(double x) {
+    if (!partials_) partials_ = std::make_unique<Storage>();
+    std::vector<double>& parts = partials_->parts;
     parts.push_back(0.0);
     const std::size_t kept = grow(parts.data(), parts.size() - 1, x);
     parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(kept), parts.end());
-    if (parts.empty() || std::isfinite(parts.back())) return true;
-    parts.pop_back();
-    return false;
+    // Below 2^1023 the head loses at most 2^969 per add. Such an
+    // increment cannot move a carry past 2^1022, and the same argument
+    // bounds the spare by 2^1021. Bound the partials too, so even a long
+    // run of residuals of one sign cannot overflow the ordinary sum.
+    if (!parts.empty() && std::fabs(parts.back()) >= 0x1p1020) widen(head_, carry_, spare_);
   }
 
-  // Behind a pointer and absent until a value needs them, which almost none
-  // does: a sum is then 32 bytes, and 48 with them held inline.
-  std::unique_ptr<std::vector<double>> partials_;
-  double head_ = 0.0;  // NaN once the partials alone hold the sum
+  // Most sums need only the three inline terms.
+  std::unique_ptr<Storage> partials_;
+  double head_ = 0.0;  // NaN when wide holds the sum
   double carry_ = 0.0;
   double spare_ = 0.0;
 };

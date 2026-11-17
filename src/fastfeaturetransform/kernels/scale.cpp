@@ -261,12 +261,8 @@ std::unordered_map<std::string, Extrema> merge_extrema(const std::vector<std::st
 //     on the same bits, but a pathological column need not
 //   * a column whose squares sum half a step or more past the largest
 //     double is a fit-time error: n values with a root mean square above
-//     about 1.34e154 / sqrt(n). Within half a step of it, on either side,
-//     where the sum rounds to the largest double, the column can be an error
-//     in one order or split of the rows and fit in another, and with several
-//     threads the split can change from one fit to the next. sklearn fits
-//     these columns when their squared deviations from the mean sum within
-//     f64's range. No other column is refused for its magnitude
+//     about 1.34e154 / sqrt(n). sklearn fits these columns when their
+//     squared deviations from the mean sum within f64.
 //   * columns=null scales every integer or float column that reaches the
 //     step, and the output is f64 whatever the input width
 // ---------------------------------------------------------------------------
@@ -324,6 +320,10 @@ class StandardScale final : public Kernel {
     for (const std::string& name : columns_) {
       Accumulator& accumulator = state.columns[name];
       const arrow::Array& array = column_array(batch, stage, name);
+      const auto checked_number = [&](double value) {
+        if (!std::isfinite(value) && accumulator.squares.outside_range()) refuse_squares(name);
+        return finite_number(value, stage, name);
+      };
       // Precompute independent rounded squares and their deliberate FMA
       // residuals; the exact accumulation below still adds them in row order.
       const auto dense = [&]<typename Value>(const Value* input) {
@@ -355,7 +355,7 @@ class StandardScale final : public Kernel {
           if (inexact) {
             for (int64_t i = 0; i < count; ++i) {
               const auto slot = static_cast<std::size_t>(i);
-              const double number = finite_number(numbers[slot], stage, name);
+              const double number = checked_number(numbers[slot]);
               if (!sum.add(number) || !squares.add(products[slot]) || !squares.add(residuals[slot]))
                 refuse_squares(name);
               ++accumulator.count;
@@ -365,7 +365,7 @@ class StandardScale final : public Kernel {
           } else {
             for (int64_t i = 0; i < count; ++i) {
               const auto slot = static_cast<std::size_t>(i);
-              const double number = finite_number(numbers[slot], stage, name);
+              const double number = checked_number(numbers[slot]);
               if (!sum.add_short(number) || !squares.add_short(products[slot])) refuse_squares(name);
               ++accumulator.count;
               accumulator.low = std::min(accumulator.low, number);
@@ -384,7 +384,7 @@ class StandardScale final : public Kernel {
       }
       for_each_numeric(array, stage, name, [&](int64_t, bool is_null, double value) {
         if (is_null) return;
-        const double number = finite_number(value, stage, name);
+        const double number = checked_number(value);
         if (!accumulator.sum.add(number) || !add_product(accumulator.squares, number, number)) refuse_squares(name);
         ++accumulator.count;
         accumulator.low = std::min(accumulator.low, number);
@@ -410,6 +410,7 @@ class StandardScale final : public Kernel {
     tables_.clear();
     for (const std::string& name : columns_) {
       const Accumulator& accumulator = merged[name];
+      if (accumulator.squares.outside_range()) refuse_squares(name);
       if (accumulator.count == 0) {
         throw Error(stage + ": column '" + name + "' has no non-null values to learn from");
       }
@@ -524,18 +525,10 @@ class StandardScale final : public Kernel {
     int64_t count = 0;
   };
 
-  // The one limit on a column's magnitude: the exact sum of its squares
-  // rounds to the largest double or past it, which a column of n values
-  // does when their root mean square passes about 1.34e154 / sqrt(n). Past
-  // it by half a step or more the sum is refused in every order; within half
-  // a step of it, on either side, in some orders and splits, as ExactSum
-  // describes for a running sum, which here stands above the column's total
-  // while a square that rounded up waits for its rounding error. The sum of
-  // the values never fails first: it is at most sqrt(n) times the square
-  // root of the sum of the squares.
+  // A column's exact squares must sum to a finite rounded f64.
   [[noreturn]] void refuse_squares(const std::string& name) const {
     throw Error(stage + ": column '" + name +
-                "': its squares sum to the largest f64 or more (scale the column down first)");
+                "': the sum of its squares rounds to infinity (scale the column down first)");
   }
 
   // The population variance around a mean the caller has already rounded:
@@ -1080,12 +1073,8 @@ class Binarize final : public Kernel {
 //     rather than a quietly different answer
 //   * a null is an error, as sklearn's NaN is: a norm over a missing number
 //     has no value
-//   * the l1 and l2 sums are exact partials, so the norm does not depend on
-//     the order the columns were listed in, except at the top of the range:
-//     a row whose sum is half a step or more past the largest double is an
-//     error, and a row of three or more columns whose sum is less than half
-//     a step past it, which rounds to the largest double, can be an error in
-//     one column order, as ExactSum describes, and normalized in another
+//   * the l1 and l2 sums are exact. A row whose sum rounds to infinity
+//     is an error in every order of the columns
 //   * every listed column becomes f64 whatever the input width
 // ---------------------------------------------------------------------------
 class Normalize final : public Kernel {
@@ -1234,7 +1223,8 @@ class Normalize final : public Kernel {
         held = held && adder.add(norm_ == Norm::L1 ? std::fabs(value) : value * value);
       }
     }
-    if (!held) throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
+    if (!held || total.outside_range())
+      throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
     return handle_zeros(norm_ == Norm::L1 ? total.value() : std::sqrt(total.value()));
   }
 

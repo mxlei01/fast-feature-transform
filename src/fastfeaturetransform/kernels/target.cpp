@@ -771,6 +771,7 @@ class TargetBlend final : public Kernel {
     };
     for (const Acc& acc : column.categories.values) add_error(acc);
     if (column.nulls.count > 0) add_error(column.nulls);
+    if (errors.outside_range()) throw Error(stage + ": the squared category means overflow f64");
     const double sse = errors.value();
     if (sse <= 0) return 0.0;  // every mean is the prior already, so the weight cannot matter
     const auto levels = static_cast<double>(totals.levels);

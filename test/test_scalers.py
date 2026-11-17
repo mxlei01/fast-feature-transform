@@ -638,12 +638,24 @@ def test_standard_scaler_fits_a_column_whose_squares_sum_under_the_largest_f64(
         assert [scaler.transform_dict({"x": value}) for value in values] == rows
 
 
+def test_standard_scaler_checks_the_individual_square_at_the_overflow_boundary(tmp_path: Path) -> None:
+    largest = math.nextafter(2.0**512, 0.0)
+    threshold = 2**1024 - 2**970
+    assert Fraction(largest) ** 2 < threshold <= Fraction(2.0**512) ** 2
+    path = tmp_path / "square.parquet"
+    fitted = StandardScaler(columns=["x"]).fit([write_parquet(path, pa.table({"x": [largest]}))])
+    assert fitted.mean_ == {"x": largest}
+    assert fitted.var_ == {"x": 0.0}
+    with pytest.raises(EngineError, match="the sum of its squares rounds to infinity"):
+        StandardScaler(columns=["x"]).fit([write_parquet(path, pa.table({"x": [2.0**512]}))])
+
+
 def test_standard_scaler_refuses_a_column_whose_squares_sum_past_the_largest_f64(tmp_path: Path) -> None:
     """Half a step or more past the largest f64, a column's squares are an error that says so, in any row order."""
     values: list[float] = [float.fromhex("0x1.8fae0c15ad38ap+511"), float.fromhex("0x1.4p511")]
     assert sum(Fraction(value) ** 2 for value in values) >= Fraction(sys.float_info.max) + Fraction(2) ** 970
     message: str = (
-        r"^standardscaler: column 'x': its squares sum to the largest f64 or more \(scale the column down first\)$"
+        r"^standardscaler: column 'x': the sum of its squares rounds to infinity \(scale the column down first\)$"
     )
     for order in (values, values[::-1]):
         for rows_per_group, threads in ((2, 1), (1, 2)):
@@ -692,15 +704,10 @@ def test_normalizer_refuses_a_row_whose_norm_leaves_the_range_through_both_paths
     ],
     ids=["l1", "l2"],
 )
-def test_normalizer_answers_a_row_just_past_the_largest_f64_in_one_column_order_only(
+def test_normalizer_answers_a_row_just_past_the_largest_f64_in_every_column_order(
     tmp_path: Path, norm: str, small: str, large: str
 ) -> None:
-    """A row whose sum is under half a step past the largest f64 can be refused in one column order only.
-
-    The sum, of the values for l1 and of their squares for l2, rounds to the
-    largest f64. With the small value first, a step of the exact sum's walk
-    overflows, as in ``math.fsum``; with it last, the row is divided by the
-    norm of a sum at the largest f64.
+    """A sum less than halfway to overflow rounds to the largest f64 in every order.
 
     Args:
         tmp_path: pytest temporary directory.
@@ -715,20 +722,14 @@ def test_normalizer_answers_a_row_just_past_the_largest_f64_in_one_column_order_
     assert Fraction(largest) < sum(terms) < Fraction(largest) + Fraction(2) ** 970
     names: list[str] = ["a", "b", "c"]
     divisor: float = largest if norm == "l1" else math.sqrt(largest)
-    for order, refused in ((values, True), (values[1:] + values[:1], False)):
+    for index in range(3):
+        order = values[index:] + values[:index]
         row: dict[str, float] = dict(zip(names, order, strict=True))
         path: str = write_parquet(tmp_path / "top.parquet", pa.table({name: [value] for name, value in row.items()}))
         normalizer: Normalizer = Normalizer(columns=names, norm=norm).fit([path])
-        if refused:
-            message: str = rf"a row's {norm} norm leaves the range of f64$"
-            with pytest.raises(EngineError, match=message):
-                normalizer.transform_dict(row)
-            with pytest.raises(EngineError, match=message):
-                normalizer.transform_parquet([path], output_dir=tmp_path / "refused")
-        else:
-            expected: dict[str, float] = {name: value / divisor for name, value in row.items()}
-            assert normalizer.transform_dict(row) == expected
-            assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == [expected]
+        expected: dict[str, float] = {name: value / divisor for name, value in row.items()}
+        assert normalizer.transform_dict(row) == expected
+        assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / f"out{index}")) == [expected]
 
 
 def test_normalizer_divides_a_row_whose_norm_is_the_largest_f64(tmp_path: Path) -> None:

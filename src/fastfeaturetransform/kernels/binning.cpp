@@ -1327,6 +1327,7 @@ class KBinsDiscretize final : public Kernel {
     sorted.for_each([&](std::size_t, double value) {
       if (!total.add(value)) throw Error(stage + ": column '" + name + "' sums past the range of f64");
     });
+    if (total.outside_range()) throw Error(stage + ": column '" + name + "' sums past the range of f64");
     const double mean = total.value() / static_cast<double>(count);
     // Past 2^500 from the mean the squares, ||c||^2 - 2xc and the center
     // shifts would overflow, as sklearn's do. 1-D k-means is scale-invariant
