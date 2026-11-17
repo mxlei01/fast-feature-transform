@@ -1332,29 +1332,23 @@ class KBinsDiscretize final : public Kernel {
     // shifts would overflow, as sklearn's do. 1-D k-means is scale-invariant
     // and scaling by a power of two is exact, so such a column runs divided
     // by the power of two that brings its farthest value just under 2^500,
-    // which is the same run, bit for bit, as that smaller column's. Nearer
-    // the mean nothing is scaled.
+    // keeping the distances finite. Nearer the mean nothing is scaled.
     if (std::isinf(high - low)) throw Error(stage + ": column '" + name + "' spans past the range of f64");
     const double largest = std::max(high - mean, mean - low);
     const int exponent = largest >= 0x1p500 ? std::ilogb(largest) - 499 : 0;
     const auto centered = [&](double value) { return std::ldexp(value - mean, -exponent); };
-    // The tolerance is the variance times 1e-4, as sklearn's is. Each square
-    // is below 2^1000, so only more than 2^24 squares sum past f64's range,
-    // and sklearn's sum of the same squares, or of larger ones when the
-    // column was scaled, overflows there too: its variance and its tolerance
-    // are infinite, and its run stops after the first pass. A refused sum
-    // takes no more squares and gives the same infinite tolerance. Divided
-    // by a power of two that brings the sum of its squares within range, the
-    // same column has a finite tolerance and runs on until the squared
-    // center shifts fall to it or the labels repeat, so its edges can differ
-    // from this column's divided by that power, as sklearn's do.
+    // sklearn stops after the first pass when the original squared
+    // deviations sum to infinity. Restore their scale only for that check:
+    // the finite tolerance and the center shifts use the scaled units.
     ExactSum squares;
     bool squares_fit = true;
     sorted.for_each([&](std::size_t, double value) {
       squares_fit = squares_fit && squares.add(centered(value) * centered(value));
     });
-    const double tolerance = squares_fit ? squares.value() / static_cast<double>(count) * kTolerance
-                                         : std::numeric_limits<double>::infinity();
+    const double square_sum = squares_fit ? squares.value() : std::numeric_limits<double>::infinity();
+    const double tolerance = std::isfinite(std::ldexp(square_sum, 2 * exponent))
+                                 ? square_sum / static_cast<double>(count) * kTolerance
+                                 : std::numeric_limits<double>::infinity();
 
     // Point and previous label travel together through sequential spill-file
     // passes. The sentinel is outside the validated [0, bins_) label range,

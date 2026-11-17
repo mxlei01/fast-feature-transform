@@ -361,9 +361,8 @@ TEST_CASE("quantile_transform averages the two interpolations over a run of ties
 }
 
 TEST_CASE("k_bins_discretize's kmeans scales a column far from its mean by a power of two") {
-  // REGRESSION: a column whose values reach 2^500 from its mean runs as the
-  // column divided by the power of two that brings them just under 2^500,
-  // which is exact, so its edges are that column's times the same power.
+  // REGRESSION: a column whose values reach 2^500 from its mean uses
+  // scaled distances to assign each value to its closest center.
   // Unscaled, the squared centers overflowed past about 1.3e154, every
   // distance became infinite, and the fit returned wrong edges without an
   // error.
@@ -380,12 +379,30 @@ TEST_CASE("k_bins_discretize's kmeans scales a column far from its mean by a pow
     for (double& value : values) value = std::ldexp(value, exponent);
     return values;
   };
-  // A column of ordinary spread, and one of 2^600 beside -17, -8 and 9,
-  // whose small values would underflow if the scaling went further.
+  // At 2^520 the tolerance is infinite. The first pass puts the five
+  // lowest values together, then the next two, then the highest three.
   const std::vector<double> narrow{-2.0, -1.5, -1.0, -0.75, 0.0, 0.5, 1.0, 2.5, 3.0, 4.0};
-  REQUIRE(edges(scaled(narrow, 520), 3) == scaled(edges(narrow, 3), 520));
+  const std::vector<double> first = scaled(edges(scaled(narrow, 520), 3), -520);
+  REQUIRE(first.size() == 4);
+  REQUIRE(first[0] == -2.0);
+  REQUIRE(first[1] == Approx(-0.15));
+  REQUIRE(first[2] == Approx(47.0 / 24.0));
+  REQUIRE(first[3] == 4.0);
   const std::vector<double> wide{-std::ldexp(1.0, 600), -17.0, -8.0, 9.0, std::ldexp(1.0, 600)};
-  REQUIRE(edges(wide, 4) == scaled(edges(scaled(wide, -101), 4), 101));
+  const std::vector<double> wide_edges = edges(wide, 4);
+  REQUIRE(wide_edges.size() == 5);
+  REQUIRE(wide_edges.front() == -0x1p600);
+  REQUIRE(wide_edges[1] == -0x1p599);
+  REQUIRE(wide_edges[2] == Approx(-112.0 / 15.0));
+  REQUIRE(wide_edges[3] == 0x1p599);
+  REQUIRE(wide_edges.back() == 0x1p600);
+  // The cubes of 0 to 63, scaled near the overflow threshold for the
+  // variance. scikit-learn 1.9.0 runs until convergence at the lower
+  // exponent and stops after the first pass at the higher exponent.
+  std::vector<double> cubes;
+  for (int i = 0; i < 64; ++i) cubes.push_back(i * i * i);
+  REQUIRE(edges(scaled(cubes, 490), 3) == scaled({0.0, 56995.5, 150780.75, 250047.0}, 490));
+  REQUIRE(edges(scaled(cubes, 493), 3) == scaled({0.0, 71698.0, 167319.5, 250047.0}, 493));
   // Near f64's largest the initial midpoints overflow their sum, and a span
   // past f64 is refused rather than fit to a degenerate model.
   const std::vector<double> top{0.0, 1.63e308, 3e304, 1e304};
