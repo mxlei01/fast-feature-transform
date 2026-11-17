@@ -32,7 +32,10 @@ def _pins(text: str) -> dict[str, set[str]]:
 
 
 def test_build_constraints_match_pyproject() -> None:
-    pins = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["uv"]["build-constraint-dependencies"]
+    tools = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]
+    pins = tools["uv"]["build-constraint-dependencies"]
+    for name in ("cmake", "ninja"):
+        assert name + tools["scikit-build"][name]["version"] in pins
     wanted = _pins("\n".join(pins))
     assert len(wanted) == len(pins), f"not every pin is name==version: {pins}"
     assert (REQUIREMENTS / "build-constraints.in").read_text().splitlines() == pins, STALE

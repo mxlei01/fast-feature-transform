@@ -62,11 +62,10 @@ wheel-tests = [
 
 [tool.scikit-build]
 minimum-version = "1.0"
-# scikit-build-core 1.1 passes Python_FIND_ABI for free-threaded builds, which
-# CMake's Python discovery mishandles before 4.1.2. An older CMake on PATH (the
-# CI runner ships 3.31.6) is then passed over for a wheel from PyPI.
-cmake.version = ">=4.1.2"
-ninja.version = ">=1.11"
+# Use the versions in the hashed build constraints even when the runner has
+# a newer tool on PATH.
+cmake.version = "==4.4.2"
+ninja.version = "==1.13.0"
 ninja.make-fallback = false
 build-dir = "build/{wheel_tag}"
 
