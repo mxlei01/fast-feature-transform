@@ -6,6 +6,7 @@
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
 #include <arrow/chunked_array.h>
+#include <arrow/extension_type.h>
 #include <arrow/io/buffered.h>
 #include <arrow/io/file.h>
 #include <arrow/io/interfaces.h>
@@ -19,7 +20,12 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_page.h>
+#include <parquet/column_reader.h>
+#include <parquet/exception.h>
 #include <parquet/file_reader.h>
+#include <parquet/schema.h>
+#include <parquet/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,12 +33,14 @@
 #include <bit>
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -193,6 +201,11 @@ void collect_leaves(const parquet::arrow::SchemaField& field, std::vector<int>& 
   for (const auto& child : field.children) collect_leaves(child, out);
 }
 
+const arrow::DataType& storage_type(const arrow::DataType& type) {
+  if (type.id() != arrow::Type::EXTENSION) return type;
+  return storage_type(*static_cast<const arrow::ExtensionType&>(type).storage_type());
+}
+
 // Arrow's reader fills the null rows of a fixed-size list by concatenating
 // pieces of its child array. For a child read as a dictionary, that merges
 // the pieces' dictionaries and renumbers every index through a table it reads
@@ -204,7 +217,7 @@ void collect_leaves(const parquet::arrow::SchemaField& field, std::vector<int>& 
 // names the column it fails on (undecodable_column).
 void read_plain_inside_fixed_size_lists(const parquet::arrow::SchemaField& field, bool inside,
                                         parquet::ArrowReaderProperties& properties) {
-  inside = inside || field.field->type()->id() == arrow::Type::FIXED_SIZE_LIST;
+  inside = inside || storage_type(*field.field->type()).id() == arrow::Type::FIXED_SIZE_LIST;
   if (field.is_leaf()) {
     if (inside) properties.set_read_dictionary(field.column_index, false);
     return;
@@ -222,13 +235,17 @@ std::unique_ptr<parquet::arrow::FileReader> make_reader(const std::string& path,
 
 // A column chunk is read through a 64 KiB buffer, so a reader holds the pages
 // of the batch it decodes and not the whole chunk.
+parquet::ReaderProperties buffered_properties() {
+  auto properties = parquet::default_reader_properties();
+  properties.enable_buffered_stream();
+  properties.set_buffer_size(64 * 1024);
+  return properties;
+}
+
 std::unique_ptr<parquet::ParquetFileReader> open_raw(const std::string& path,
                                                      std::shared_ptr<parquet::FileMetaData> metadata) {
   try {
-    auto properties = parquet::default_reader_properties();
-    properties.enable_buffered_stream();
-    properties.set_buffer_size(64 * 1024);
-    return parquet::ParquetFileReader::Open(open_file(path), properties, std::move(metadata));
+    return parquet::ParquetFileReader::Open(open_file(path), buffered_properties(), std::move(metadata));
   } catch (const parquet::ParquetException& e) {
     throw Error(path + ": " + e.what());
   }
@@ -303,11 +320,8 @@ void require_parquet(const std::string& path) {
 // slots count in that maximum, and Parquet leaves zeros there; when the
 // maximum is out of range, Arrow's check, which skips null slots, decides.
 void check_dictionary_indices(const arrow::ArrayData& column, const std::string& where, const std::string& name) {
-  for (const std::shared_ptr<arrow::ArrayData>& child : column.child_data) {
-    check_dictionary_indices(*child, where, name);
-  }
-  if (column.type->id() != arrow::Type::DICTIONARY) return;
-  const arrow::DataType& index_type = *static_cast<const arrow::DictionaryType&>(*column.type).index_type();
+  const auto& dictionary = static_cast<const arrow::DictionaryType&>(storage_type(*column.type));
+  const arrow::DataType& index_type = *dictionary.index_type();
   const auto entries = static_cast<uint64_t>(column.dictionary->length);
   if (index_type.id() == arrow::Type::INT32) {
     const int32_t* values = column.GetValues<int32_t>(1);
@@ -321,6 +335,233 @@ void check_dictionary_indices(const arrow::ArrayData& column, const std::string&
   if (!status.ok()) {
     throw Error(where + ": column '" + name + "' has a dictionary index outside its dictionary: " + status.message());
   }
+}
+
+// Arrow inserts each dictionary value into a table of distinct values, then
+// decodes dictionary indices against that table. Before any plain data page
+// adds entries, the table length equals the page count exactly when all
+// entries are distinct. After plain pages add values, a repeated entry
+// places the page's last value before its declared position. Plain pages
+// append only previously unseen values, so they cannot restore it there.
+// A batch may contain only earlier plain rows. Check the original page
+// once if the count and last value do not prove that its entries are unique.
+struct DictionaryChunk {
+  bool watched = false;
+  int32_t entries = -1;
+  std::optional<std::string> last;
+  bool indexed = false;
+  bool plain = false;
+  bool settled = false;
+};
+
+// Parquet stores the length of a string or byte value in a PLAIN page as 4
+// little-endian bytes, which this machine reads as its own integer.
+static_assert(std::endian::native == std::endian::little, "Parquet stores lengths little-endian");
+
+// The PLAIN string or byte value at `at`, its 4-byte length and then its
+// bytes, with `at` moved past it; nullopt when the bytes before `end` do not
+// hold it.
+std::optional<std::string_view> next_plain_value(const uint8_t*& at, const uint8_t* end) {
+  if (end - at < 4) return std::nullopt;
+  uint32_t length = 0;
+  std::memcpy(&length, at, 4);
+  if (length > static_cast<uint64_t>(end - at - 4)) return std::nullopt;
+  const std::string_view value(reinterpret_cast<const char*>(at + 4), length);
+  at += 4 + static_cast<std::ptrdiff_t>(length);
+  return value;
+}
+
+// Tracks the dictionary count and data page encodings as Arrow reads them.
+class WatchedPages final : public parquet::PageReader {
+ public:
+  WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::vector<DictionaryChunk>& chunks, std::size_t leaf)
+      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf) {
+    chunks_[leaf_] = DictionaryChunk{};
+    chunks_[leaf_].watched = true;
+  }
+
+  std::shared_ptr<parquet::Page> NextPage() override {
+    std::shared_ptr<parquet::Page> page = pages_->NextPage();
+    if (page == nullptr) return page;
+    DictionaryChunk& chunk = chunks_[leaf_];
+    if (page->type() == parquet::PageType::DICTIONARY_PAGE) {
+      const auto& dictionary = static_cast<const parquet::DictionaryPage&>(*page);
+      chunk.entries = dictionary.num_values();
+      const uint8_t* at = dictionary.data();
+      if (dictionary.size() > 0 && chunk.entries > 0) {
+        const uint8_t* end = at + dictionary.size();
+        for (int32_t i = 0; i < chunk.entries; ++i) {
+          const auto value = next_plain_value(at, end);
+          if (!value) break;
+          // A single long string must not keep a copy of its bytes alive
+          // through every batch. Mixed pages then take the exact fallback.
+          if (i == chunk.entries - 1 && value->size() <= 256) chunk.last.emplace(*value);
+        }
+      }
+    } else if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
+      const parquet::Encoding::type encoding = static_cast<const parquet::DataPage&>(*page).encoding();
+      if (encoding == parquet::Encoding::RLE_DICTIONARY || encoding == parquet::Encoding::PLAIN_DICTIONARY) {
+        chunk.indexed = true;
+      } else {
+        chunk.plain = true;
+      }
+    }
+    return page;
+  }
+
+  void set_max_page_header_size(uint32_t size) override { pages_->set_max_page_header_size(size); }
+
+ private:
+  std::unique_ptr<parquet::PageReader> pages_;
+  std::vector<DictionaryChunk>& chunks_;
+  std::size_t leaf_;
+};
+
+// A row group of a WatchedFile: the pages of each watched leaf pass through
+// WatchedPages.
+class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
+ public:
+  WatchedRowGroup(std::shared_ptr<parquet::RowGroupReader> group, parquet::ReaderProperties properties,
+                  std::vector<DictionaryChunk>& chunks)
+      : group_(std::move(group)), properties_(std::move(properties)), chunks_(chunks) {}
+
+  std::unique_ptr<parquet::PageReader> GetColumnPageReader(int i) override {
+    std::unique_ptr<parquet::PageReader> pages = group_->GetColumnPageReader(i);
+    const auto leaf = static_cast<std::size_t>(i);
+    if (!chunks_[leaf].watched) return pages;
+    return std::make_unique<WatchedPages>(std::move(pages), chunks_, leaf);
+  }
+  const parquet::RowGroupMetaData* metadata() const override { return group_->metadata(); }
+  const parquet::ReaderProperties* properties() const override { return &properties_; }
+
+ private:
+  std::shared_ptr<parquet::RowGroupReader> group_;
+  parquet::ReaderProperties properties_;
+  std::vector<DictionaryChunk>& chunks_;
+};
+
+// A Parquet file whose row groups are WatchedRowGroups. Arrow pre-buffers a
+// file by casting it to its own class, so a reader of a WatchedFile must not
+// pre-buffer.
+class WatchedFile final : public parquet::ParquetFileReader::Contents {
+ public:
+  WatchedFile(std::unique_ptr<parquet::ParquetFileReader::Contents> file, parquet::ReaderProperties properties,
+              std::vector<DictionaryChunk>& chunks)
+      : file_(std::move(file)), properties_(std::move(properties)), chunks_(chunks) {}
+
+  void Close() override { file_->Close(); }
+  std::shared_ptr<parquet::RowGroupReader> GetRowGroup(int i) override {
+    return std::make_shared<parquet::RowGroupReader>(
+        std::make_unique<WatchedRowGroup>(file_->GetRowGroup(i), properties_, chunks_));
+  }
+  std::shared_ptr<parquet::FileMetaData> metadata() const override { return file_->metadata(); }
+  std::shared_ptr<parquet::PageIndexReader> GetPageIndexReader() override { return file_->GetPageIndexReader(); }
+  parquet::BloomFilterReader& GetBloomFilterReader() override { return file_->GetBloomFilterReader(); }
+
+ private:
+  std::unique_ptr<parquet::ParquetFileReader::Contents> file_;
+  parquet::ReaderProperties properties_;
+  std::vector<DictionaryChunk>& chunks_;
+};
+
+// The file at `path`, opened as open_raw opens it, reading the pages of each
+// leaf that `chunks` watches through WatchedPages.
+std::unique_ptr<parquet::ParquetFileReader> open_watched(const std::string& path,
+                                                         const std::shared_ptr<arrow::io::RandomAccessFile>& input,
+                                                         std::shared_ptr<parquet::FileMetaData> metadata,
+                                                         std::vector<DictionaryChunk>& chunks) {
+  try {
+    const parquet::ReaderProperties properties = buffered_properties();
+    auto file = std::make_unique<parquet::ParquetFileReader>();
+    file->Open(std::make_unique<WatchedFile>(
+        parquet::ParquetFileReader::Contents::Open(input, properties, std::move(metadata)), properties, chunks));
+    return file;
+  } catch (const parquet::ParquetException& e) {
+    throw Error(path + ": " + e.what());
+  }
+}
+
+// Marks in `chunks` the leaves under `field` that Arrow reads as a dictionary
+// of strings or bytes: a BYTE_ARRAY leaf whose Arrow type is a dictionary.
+// Arrow decodes any other leaf plain, and builds a dictionary of other values
+// from what it decoded, so no page of theirs needs watching.
+void watch_dictionary_leaves(const parquet::arrow::SchemaField& field, const parquet::SchemaDescriptor& schema,
+                             std::vector<DictionaryChunk>& chunks, const std::vector<int>* selected,
+                             const std::string& path, const std::string& name) {
+  if (!field.is_leaf()) {
+    for (const auto& child : field.children) watch_dictionary_leaves(child, schema, chunks, selected, path, name);
+    return;
+  }
+  const arrow::DataType& type = *field.field->type();
+  // Arrow cannot wrap an empty collection of dictionary chunks as an
+  // extension. Only a projected leaf will enter its stream reader.
+  if (type.id() == arrow::Type::EXTENSION && storage_type(type).id() == arrow::Type::DICTIONARY &&
+      (selected == nullptr || std::binary_search(selected->begin(), selected->end(), field.column_index))) {
+    throw Error(path + ": column '" + name + "' has an extension with dictionary storage, which cannot be streamed");
+  }
+  chunks[static_cast<std::size_t>(field.column_index)].watched =
+      type.id() == arrow::Type::DICTIONARY &&
+      schema.Column(field.column_index)->physical_type() == parquet::Type::BYTE_ARRAY;
+}
+
+// Whether `dictionary`, a batch's dictionary of strings or bytes, starts with
+// the values of the chunk's dictionary page: it holds as many values as the
+// page declares, or more, and the page's last value at the page's last
+// position (see DictionaryChunk).
+bool shows_dictionary_page(const arrow::ArrayData& dictionary, const DictionaryChunk& chunk) {
+  if (!chunk.last || dictionary.length < chunk.entries) return false;
+  const int64_t at = chunk.entries - 1;
+  const auto& data = dictionary.buffers[2];
+  const char* bytes = data && data->data() ? reinterpret_cast<const char*>(data->data()) : "";
+  std::string_view value;
+  switch (dictionary.type->id()) {
+    case arrow::Type::STRING:
+    case arrow::Type::BINARY: {
+      const int32_t* offsets = dictionary.GetValues<int32_t>(1);
+      value = std::string_view(bytes + offsets[at], static_cast<std::size_t>(offsets[at + 1] - offsets[at]));
+      break;
+    }
+    case arrow::Type::LARGE_STRING:
+    case arrow::Type::LARGE_BINARY: {
+      const int64_t* offsets = dictionary.GetValues<int64_t>(1);
+      value = std::string_view(bytes + offsets[at], static_cast<std::size_t>(offsets[at + 1] - offsets[at]));
+      break;
+    }
+    default:
+      return false;
+  }
+  return value == *chunk.last;
+}
+
+// Whether the dictionary page of column chunk (`row_group`, `leaf`) holds a
+// value twice, read from the file again.
+bool dictionary_page_repeats(const std::shared_ptr<arrow::io::RandomAccessFile>& input,
+                             const std::shared_ptr<parquet::FileMetaData>& metadata, int row_group, int leaf,
+                             const std::string& where) {
+  try {
+    const auto file = parquet::ParquetFileReader::Open(input, buffered_properties(), metadata);
+    const std::shared_ptr<parquet::RowGroupReader> group = file->RowGroup(row_group);
+    const std::unique_ptr<parquet::PageReader> pages = group->GetColumnPageReader(leaf);
+    while (const std::shared_ptr<parquet::Page> page = pages->NextPage()) {
+      if (page->type() != parquet::PageType::DICTIONARY_PAGE) continue;
+      const auto& dictionary = static_cast<const parquet::DictionaryPage&>(*page);
+      std::vector<std::string_view> values;
+      const uint8_t* at = dictionary.data();
+      if (dictionary.num_values() <= 0) return false;
+      if (!at || dictionary.size() == 0) throw Error(where + ": incomplete dictionary page");
+      const uint8_t* const end = at + dictionary.size();
+      for (int32_t entry = 0; entry < dictionary.num_values(); ++entry) {
+        const std::optional<std::string_view> value = next_plain_value(at, end);
+        if (!value) throw Error(where + ": incomplete dictionary page");
+        values.push_back(*value);
+      }
+      std::sort(values.begin(), values.end());
+      return std::adjacent_find(values.begin(), values.end()) != values.end();
+    }
+  } catch (const parquet::ParquetException& e) {
+    throw Error(where + ": " + e.what());
+  }
+  return false;
 }
 
 // Every timestamp column enters the engine as int64 microseconds since
@@ -794,9 +1035,24 @@ class ParquetSource::Reader final : public TaskReader {
     if (!reader_ || file_ != task.file) {
       auto properties = file.properties;
       // Otherwise Arrow may prefetch the entire compressed row group, even
-      // though decoded record batches are small.
+      // though decoded record batches are small. A WatchedFile must not be
+      // pre-buffered either.
       properties.set_pre_buffer(false);
-      reader_ = make_reader(file.path, open_raw(file.path, file.metadata), properties);
+      reader_.reset();
+      chunks_.assign(static_cast<std::size_t>(file.metadata->num_columns()), DictionaryChunk{});
+      input_ = open_file(file.path);
+      auto reader = make_reader(file.path, open_watched(file.path, input_, file.metadata, chunks_), properties);
+      const auto* selected = projection_ ? &(*projection_)[task.file] : nullptr;
+      for (const auto& field : reader->manifest().schema_fields) {
+        watch_dictionary_leaves(field, *file.metadata->schema(), chunks_, selected, file.path, field.field->name());
+      }
+      reader_ = std::move(reader);
+      if (projection_) {
+        leaves_ = (*projection_)[task.file];
+      } else {
+        leaves_.resize(chunks_.size());
+        std::iota(leaves_.begin(), leaves_.end(), 0);
+      }
       file_ = task.file;
     }
     reader_->set_batch_size(batch_size);
@@ -812,8 +1068,10 @@ class ParquetSource::Reader final : public TaskReader {
         throw Error(where + ": " + undecodable_column(file, task.row_group, *(*stream)->schema()) + status.ToString());
       }
       if (!batch) break;
+      std::size_t leaf = 0;
       for (int i = 0; i < batch->num_columns(); ++i) {
-        check_dictionary_indices(*batch->column_data(i), where, batch->schema()->field(i)->name());
+        const std::string& name = batch->schema()->field(i)->name();
+        check_dictionaries(*batch->column_data(i), leaf, file, task.row_group, where, name);
       }
       emitted = true;
       consume(batch_from_arrow(*batch));
@@ -826,6 +1084,35 @@ class ParquetSource::Reader final : public TaskReader {
   }
 
  private:
+  // Checks each leaf of `column` read as a dictionary against the dictionary
+  // page of its chunk (see DictionaryChunk). A batch's arrays without
+  // children are the leaves read, in the order of `leaves_`; `leaf` counts
+  // those visited so far.
+  void check_dictionaries(const arrow::ArrayData& column, std::size_t& leaf, const File& file, int row_group,
+                          const std::string& where, const std::string& name) {
+    if (!column.child_data.empty()) {
+      for (const std::shared_ptr<arrow::ArrayData>& child : column.child_data) {
+        check_dictionaries(*child, leaf, file, row_group, where, name);
+      }
+      return;
+    }
+    if (leaf == leaves_.size()) throw Error(where + ": column '" + name + "' holds more leaves than the file");
+    const int column_index = leaves_[leaf++];
+    DictionaryChunk& chunk = chunks_[static_cast<std::size_t>(column_index)];
+    if (!column.dictionary) return;
+    if (chunk.entries > 0 && chunk.indexed && !chunk.settled) {
+      if (!chunk.plain && column.dictionary->length == chunk.entries) {
+        chunk.settled = true;
+      } else if (!shows_dictionary_page(*column.dictionary, chunk)) {
+        if (dictionary_page_repeats(input_, file.metadata, row_group, column_index, where)) {
+          throw Error(where + ": column '" + name + "' has a dictionary page that repeats a value");
+        }
+        chunk.settled = true;
+      }
+    }
+    check_dictionary_indices(column, where, name);
+  }
+
   // Arrow's reader does not name the column of a page it cannot decode, so
   // after a failure the row group's columns are read again one at a time,
   // and the first that fails on its own is named. A failure that no column
@@ -852,6 +1139,9 @@ class ParquetSource::Reader final : public TaskReader {
   const ParquetSource& source_;
   std::shared_ptr<const Projection> projection_;
   std::size_t file_ = 0;
+  std::shared_ptr<arrow::io::RandomAccessFile> input_;
+  std::vector<DictionaryChunk> chunks_;  // per leaf of the open file; reader_ notes into it
+  std::vector<int> leaves_;              // the leaves read from the open file, in order
   std::unique_ptr<parquet::arrow::FileReader> reader_;
 };
 
