@@ -54,13 +54,10 @@ arrow::FieldVector fields_without_dictionaries(const arrow::DataType& type) {
   return fields;
 }
 
-// A list, struct or map type with every dictionary inside it replaced by the
-// type of its values, and every large_string or string_view inside it by
-// string; null for any other type. Whether a string is read as a dictionary
-// follows from how its file stored it (dictionary_readable below), and that
-// read gives a dictionary of string whichever of the three a file stores, so
-// a tag that kept the dictionary or the stored string type would name the
-// storage. A top-level column of any of the three is tagged utf8.
+// A list, struct or map with dictionaries replaced by their value types and
+// strings and bytes named by their logical types. Arrow's dictionary reader
+// produces string or binary for all storage layouts of those types. Delta
+// pages retain their stored layout. Use the same tags for both.
 // REGRESSION: two files that hold the same list of strings, one in
 // dictionary pages and one in delta pages, have one tag and are read
 // together, whether the files store string, large_string or string_view. The
@@ -91,6 +88,7 @@ std::shared_ptr<arrow::DataType> without_dictionaries(const std::shared_ptr<arro
     return without_dictionaries(static_cast<const arrow::DictionaryType&>(*type).value_type());
   }
   if (type->id() == arrow::Type::LARGE_STRING || type->id() == arrow::Type::STRING_VIEW) return arrow::utf8();
+  if (type->id() == arrow::Type::LARGE_BINARY || type->id() == arrow::Type::BINARY_VIEW) return arrow::binary();
   std::shared_ptr<arrow::DataType> nested = nested_without_dictionaries(*type);
   return nested ? nested : type;
 }
@@ -103,6 +101,10 @@ std::string type_tag(const arrow::DataType& type) {
     case arrow::Type::LARGE_STRING:
     case arrow::Type::STRING_VIEW:  // read as large_string: see strings_from_views
       return "utf8";
+    case arrow::Type::BINARY:
+    case arrow::Type::LARGE_BINARY:
+    case arrow::Type::BINARY_VIEW:
+      return "binary";
     case arrow::Type::BOOL:
       return "bool";
     case arrow::Type::INT8:

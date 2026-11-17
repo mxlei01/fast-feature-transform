@@ -644,6 +644,30 @@ def test_files_that_store_large_or_view_strings_differently_are_read_together(
     assert pq.read_table(tmp_path / "out").equals(pa.concat_tables([table.cast(written)] * len(sources)))
 
 
+@pytest.mark.parametrize("leaf", [pa.large_binary(), pa.binary_view()], ids=str)
+@pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY"])
+def test_files_that_store_bytes_in_different_pages_are_read_together(
+    tmp_path: Path, leaf: pa.DataType, encoding: str
+) -> None:
+    values: list[bytes | None] = [b"\xff", None, b"", b"longer than twelve bytes"]
+    table: pa.Table = pa.table(
+        {"raw": pa.array(values, leaf), "nested": pa.array([[v] for v in values], pa.list_(leaf))}
+    )
+    files: list[str] = [
+        write_parquet(tmp_path / "dictionary.parquet", table),
+        write_parquet(tmp_path / "plain.parquet", table, use_dictionary=False),
+        write_parquet(
+            tmp_path / "delta.parquet",
+            table,
+            use_dictionary=False,
+            column_encoding=dict.fromkeys(["raw", "nested.list.element"], encoding),
+        ),
+    ]
+    for order in (files, files[::-1]):
+        parts = Select(columns=["raw", "nested"]).fit(order).transform_parquet(order, output_dir=tmp_path / "out")
+        assert [pq.read_table(part).to_pydict() for part in parts] == [table.to_pydict()] * len(files)
+
+
 @pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY"])
 def test_a_string_view_column_in_delta_pages_is_utf8_to_string_steps_and_cast(tmp_path: Path, encoding: str) -> None:
     # REGRESSION: a string_view column is utf8 whichever pages its file stores
