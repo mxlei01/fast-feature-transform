@@ -132,8 +132,8 @@ def parquet_to_memmap(X: Sequence[str | Path], *, output_dir: str | Path | None 
     Args:
         X: List of Parquet file paths.
         output_dir: Directory for ``data.mmap`` and ``index.json``; a temporary
-            directory is created when omitted, and removed again if the run
-            fails. A previous memmap there is replaced only after every row is
+            directory is created when omitted and removed with its files if the call
+            raises. A previous memmap there is replaced only after every row is
             written, so a run that fails before then leaves it untouched.
         threads: Worker threads; 0 uses all cores.
 
@@ -331,7 +331,7 @@ class Pipeline:
         Args:
             X: List of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted, and removed again if the run fails.
+                is created when omitted and removed with its files if the call raises.
                 Existing ``part-NNNNN.parquet`` files in it are replaced once
                 the run starts, and a run that fails midway leaves none.
 
@@ -351,8 +351,9 @@ class Pipeline:
 
         """
         handle: _core.FittedPipeline = self._require_handle()
+        sources: list[str] = _source_paths(X)
         with _output_directory(output_dir) as out_dir:
-            return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
+            return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
     def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
         """Write transformed training records without intermediate Parquet files.
@@ -396,7 +397,7 @@ class Pipeline:
         Args:
             X: A single record dict, or a list of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
-                directory is created when omitted.
+                directory is created when omitted and removed with its files if the call raises.
 
         Returns:
             A transformed record dict, or the list of written part-file paths.
@@ -434,7 +435,7 @@ class Pipeline:
             temp_dir: Existing parent directory for temporary spill files;
                 defaults to the system temporary directory.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted.
+                is created when omitted and removed with its files if the call raises.
 
         Returns:
             The list of written part-file paths.
