@@ -1,7 +1,9 @@
 """Tests for artifact integrity: provenance, validation on load, and how engine errors surface."""
 
+import collections
 import datetime
 import enum
+import functools
 import importlib.metadata
 import inspect
 import itertools
@@ -9,11 +11,14 @@ import json
 import math
 import pickle
 import re
+import subprocess  # nosec B404
+import sys
+import types
 import weakref
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -440,6 +445,28 @@ def test_transform_dict_rejects_unconvertible_values_by_name(source: str) -> Non
         pipeline.transform_dict({"device": "ios", "blob": b"x"})
 
 
+def test_transform_dict_refuses_a_record_that_is_not_a_dict(source: str) -> None:
+    # REGRESSION: a record that is not a dict raises a TypeError that names
+    # transform_dict and the record's type. The TypeError used to name the
+    # internal transform_row and its handle type.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    standalone: Select = Select(columns=["device"]).fit([source])
+    records: list[tuple[Any, str]] = [
+        ([("device", "ios")], "list"),
+        (None, "NoneType"),
+        (types.MappingProxyType({"device": "ios"}), "mappingproxy"),
+        (collections.UserDict(device="ios"), "UserDict"),
+    ]
+    for record, name in records:
+        for owner in (pipeline, standalone):
+            with pytest.raises(TypeError) as refused:
+                owner.transform_dict(record)
+            assert str(refused.value) == f"transform_dict: X must be a dict, got {name}"
+    # A subclass of dict is a dict.
+    assert pipeline.transform_dict(collections.OrderedDict(device="ios")) == {"device": "ios"}
+    assert standalone.transform_dict(collections.OrderedDict(device="ios")) == {"device": "ios"}
+
+
 class _OwnHash(str):
     """A str whose hash is not its text's, so a dict keeps it beside a str of the same text."""
 
@@ -535,6 +562,29 @@ def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -
     assert refused_records > 0
 
 
+class _ChangesOnIndex:
+    """An integer-like value whose __index__ changes its record."""
+
+    def __init__(self, change: Callable[[], Any]) -> None:
+        """Hold the change.
+
+        Args:
+            change: Changes the record this value is in.
+
+        """
+        self.change: Callable[[], Any] = change
+
+    def __index__(self) -> int:
+        """Change the record, then answer.
+
+        Returns:
+            1.
+
+        """
+        self.change()
+        return 1
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -546,17 +596,31 @@ def test_transform_dict_refuses_a_record_whose_keys_repeat_a_text(source: str) -
         datetime.datetime(2021, 6, 1),  # noqa: DTZ001
         datetime.datetime(2021, 6, 1, tzinfo=datetime.UTC),
         datetime.datetime(2021, 6, 1, tzinfo=datetime.timezone(datetime.timedelta(hours=2))),
+        np.datetime64("2021-06-01T00:00", "us"),
+        _ChangesOnIndex(lambda: None),
     ],
-    ids=["float", "int64", "float32", "numpy_bool", "numpy_array", "datetime", "datetime_utc", "datetime_offset"],
+    ids=[
+        "float",
+        "int64",
+        "float32",
+        "numpy_bool",
+        "numpy_array",
+        "datetime",
+        "datetime_utc",
+        "datetime_offset",
+        "datetime64",
+        "python_class",
+    ],
 )
 def test_transform_dict_does_not_check_keys_and_values_that_cannot_repeat_a_key(source: str, value: Any) -> None:
     # The names are checked only for a key whose type has its own hash or
-    # comparison, or a value whose conversion can run Python code. Records of
-    # StrEnum members, numpy.str_ values, numpy scalars and arrays, and
-    # datetimes whose tzinfo is None or a datetime.timezone do not pay for the
-    # check. A key whose class changes after it is stored breaks the rule for
-    # dict keys: the record then holds one text twice, and the check, which
-    # does not run for such a record, does not see it.
+    # comparison. A value does not set off the check, whatever its type:
+    # Python code that reading it runs cannot repeat a key, since such a value
+    # is read only after every field of the record has been read. Records of
+    # StrEnum members and numpy.str_ values do not pay for the check. A key
+    # whose class changes after it is stored breaks the rule for dict keys:
+    # the record then holds one text twice, and the check, which does not run
+    # for such a record, does not see it.
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
     key: str = _OwnHash("device")
     record: dict[str, Any] = {"device": "ios", key: "android", "v": value}
@@ -565,53 +629,13 @@ def test_transform_dict_does_not_check_keys_and_values_that_cannot_repeat_a_key(
     assert list(pipeline.transform_dict(record)) == ["device"]
 
 
-def _move_device(record: dict[str, Any], grow: int) -> None:
-    """Take the key "device" out of a record and store it again, last.
+class _ChangesOnAsm8(datetime.datetime):
+    """A datetime that changes its record when asked for a pandas Timestamp's asm8, and then has none."""
 
-    Args:
-        record: The record.
-        grow: How many keys to add in between; enough of them rebuild the
-            dict's table.
-
-    """
-    device: Any = record.pop("device")
-    for index in range(grow):
-        record[f"g{index}"] = index
-    record["device"] = device
-
-
-class _MovesOnIndex:
-    """An integer-like value whose __index__ moves the key "device" of its record."""
-
-    def __init__(self, record: dict[str, Any], grow: int) -> None:
-        """Hold the record to change.
-
-        Args:
-            record: The record this value is in.
-            grow: Passed to _move_device.
-
-        """
-        self.record: dict[str, Any] = record
-        self.grow: int = grow
-
-    def __index__(self) -> int:
-        """Move the key, then answer.
-
-        Returns:
-            1.
-
-        """
-        _move_device(self.record, self.grow)
-        return 1
-
-
-class _MovesOnAsm8(datetime.datetime):
-    """A datetime that moves the key "device" of the record in `record` when asked for a pandas Timestamp's asm8."""
-
-    record: ClassVar[dict[str, Any]] = {}
+    change: Callable[[], Any]
 
     def __getattr__(self, name: str) -> Any:
-        """Move the key, then refuse the attribute.
+        """Change the record when asked for asm8, then refuse the attribute.
 
         Args:
             name: The attribute asked for.
@@ -621,24 +645,24 @@ class _MovesOnAsm8(datetime.datetime):
 
         """
         if name == "asm8":
-            _move_device(type(self).record, 0)
+            self.change()
         raise AttributeError(name)
 
 
-class _MovesOnUtcoffset(datetime.tzinfo):
-    """A tzinfo whose utcoffset moves the key "device" of its record."""
+class _ChangesOnUtcoffset(datetime.tzinfo):
+    """A tzinfo whose utcoffset changes the record of its datetime."""
 
-    def __init__(self, record: dict[str, Any]) -> None:
-        """Hold the record to change.
+    def __init__(self, change: Callable[[], Any]) -> None:
+        """Hold the change.
 
         Args:
-            record: The record whose value holds this tzinfo.
+            change: Changes the record that holds a datetime in this zone.
 
         """
-        self.record: dict[str, Any] = record
+        self.change: Callable[[], Any] = change
 
     def utcoffset(self, dt: datetime.datetime | None, /) -> datetime.timedelta:
-        """Move the key, then answer.
+        """Change the record, then answer.
 
         Args:
             dt: The datetime asked about.
@@ -647,52 +671,169 @@ class _MovesOnUtcoffset(datetime.tzinfo):
             One hour.
 
         """
-        _move_device(self.record, 0)
+        self.change()
         return datetime.timedelta(hours=1)
 
 
-@pytest.mark.parametrize(
-    "mover", ["index", "index_grown", "asm8", "weakref_proxy", "named_numpy", "tzinfo", "datetime_data"]
-)
-def test_transform_dict_refuses_a_record_whose_value_moves_a_key_while_it_is_read(
-    source: str, mover: str, monkeypatch: pytest.MonkeyPatch
+class _ChangesFirst:
+    """A function that changes a record and then answers as another function."""
+
+    def __init__(self, change: Callable[[], Any], call: Callable[..., Any]) -> None:
+        """Hold the change and the function.
+
+        Args:
+            change: Changes the record.
+            call: The function that answers.
+
+        """
+        self.change: Callable[[], Any] = change
+        self.call: Callable[..., Any] = call
+
+    def __call__(self, *args: Any) -> Any:
+        """Change the record, then answer.
+
+        Args:
+            *args: Passed to the function.
+
+        Returns:
+            What the function returns.
+
+        """
+        self.change()
+        return self.call(*args)
+
+
+def _rebuild(record: dict[str, Any]) -> None:
+    """Add 40 keys to a record of five, enough to rebuild its dict's table.
+
+    Args:
+        record: The record.
+
+    """
+    for index in range(40):
+        record[f"g{index}"] = index
+
+
+def _take_out_a_and_rebuild(record: dict[str, Any]) -> None:
+    """Take the key "a" out of a record, then rebuild its table.
+
+    Args:
+        record: The record.
+
+    """
+    del record["a"]
+    _rebuild(record)
+
+
+def _move_a(record: dict[str, Any]) -> None:
+    """Take the key "a" out of a record and store it again, last.
+
+    Args:
+        record: The record.
+
+    """
+    record["a"] = record.pop("a")
+
+
+def _move_a_and_rebuild(record: dict[str, Any]) -> None:
+    """Take the key "a" out of a record, rebuild its table, and store "a" again, last.
+
+    Args:
+        record: The record.
+
+    """
+    a: Any = record.pop("a")
+    _rebuild(record)
+    record["a"] = a
+
+
+# Each changes a record that holds "a", "device", "b", "c" and "price", in
+# that order, while "b" is read.
+_CHANGES: dict[str, Callable[[dict[str, Any]], Any]] = {
+    "take_out_a_read_key": lambda record: record.pop("a"),
+    "take_out_a_later_key": lambda record: record.pop("c"),
+    "add_a_key": lambda record: record.update(added=1.0),
+    "rebuild_the_table": _rebuild,
+    "take_out_a_read_key_and_rebuild": _take_out_a_and_rebuild,
+    "move_a_read_key": _move_a,
+    "move_a_read_key_and_rebuild": _move_a_and_rebuild,
+    "store_another_value": lambda record: record.update(c=99.0),
+    "clear": lambda record: record.clear(),
+}
+
+# 2021-06-01 00:00 in epoch microseconds.
+_MIDNIGHT: int = (
+    datetime.datetime(2021, 6, 1, tzinfo=datetime.UTC) - datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+) // datetime.timedelta(microseconds=1)
+
+
+def _changing_value(
+    route: str, change: Callable[[], Any], monkeypatch: pytest.MonkeyPatch, datetime_data: Callable[..., Any]
+) -> tuple[Any, int, Any]:
+    """Make a value whose reading runs a change once, through one route.
+
+    Args:
+        route: How reading the value runs the change.
+        change: The change.
+        monkeypatch: Replaces numpy.datetime_data for the route through it.
+        datetime_data: numpy's own datetime_data.
+
+    Returns:
+        The value, what the record path reads it as, and an object to keep
+        alive while the value is read.
+
+    """
+    if route == "weakref_proxy":
+        referent: _ChangesOnIndex = _ChangesOnIndex(change)
+        return weakref.proxy(referent), 1, referent
+    if route == "named_numpy":
+        # The C name of a class made in Python is its __name__.
+        named: Any = type("numpy.int64", (_ChangesOnIndex,), {"__module__": "numpy"})(change)
+        return named, 1, named
+    if route == "tzinfo":
+        zoned: datetime.datetime = datetime.datetime(2021, 6, 1, tzinfo=_ChangesOnUtcoffset(change))
+        return zoned, _MIDNIGHT - 3_600_000_000, zoned
+    if route == "asm8":
+        stamp: _ChangesOnAsm8 = _ChangesOnAsm8(2021, 6, 1)
+        stamp.change = change
+        return stamp, _MIDNIGHT, stamp
+    if route == "datetime_data":
+        monkeypatch.setattr(np, "datetime_data", _ChangesFirst(change, datetime_data))
+        moment: np.datetime64 = np.datetime64("2021-06-01T00:00", "us")
+        return moment, _MIDNIGHT, moment
+    value: _ChangesOnIndex = _ChangesOnIndex(change)
+    return value, 1, value
+
+
+@pytest.mark.parametrize("route", ["index", "weakref_proxy", "named_numpy", "tzinfo", "asm8", "datetime_data"])
+def test_transform_dict_reads_a_record_as_it_was_when_a_value_changes_it(
+    source: str, route: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # REGRESSION: a value whose own code, run while the record is read, takes
-    # a key that was read out of the record and stores it again is an error
-    # that names the key. The read used to reach the key a second time, at
-    # its new place, and gave the steps a record that held it twice. The code
-    # is Python code that reading the value reaches: a method of the value's
-    # class, also when the class is named like numpy's int64; the __index__
-    # of the object that a weakref proxy refers to; a tzinfo's utcoffset; and
-    # numpy.datetime_data, which reading a datetime64 calls.
-    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
-    record: dict[str, Any] = {"device": "ios"}
-    if mover == "asm8":
-        _MovesOnAsm8.record = record
-        record["t"] = _MovesOnAsm8(2021, 6, 1)
-    elif mover == "weakref_proxy":
-        referent: _MovesOnIndex = _MovesOnIndex(record, 0)  # alive until the test ends
-        record["n"] = weakref.proxy(referent)
-    elif mover == "named_numpy":
-        record["n"] = type("numpy.int64", (_MovesOnIndex,), {})(record, 0)
-    elif mover == "tzinfo":
-        record["t"] = datetime.datetime(2021, 6, 1, tzinfo=_MovesOnUtcoffset(record))
-    elif mover == "datetime_data":
-        datetime_data: Callable[..., Any] = np.datetime_data
-
-        def moving_datetime_data(dtype: Any) -> Any:
-            _move_device(record, 0)
-            return datetime_data(dtype)
-
-        monkeypatch.setattr(np, "datetime_data", moving_datetime_data)
-        record["t"] = np.datetime64("2021-06-01T00:00", "us")
-    else:
-        record["n"] = _MovesOnIndex(record, 40 if mover == "index_grown" else 0)
-    with pytest.raises(EngineError) as refused:
-        pipeline.transform_dict(record)
-    assert str(refused.value) == "record holds the key 'device' twice"
-    # The key moved: the record holds it once, last.
-    assert list(record)[-1] == "device"
+    # REGRESSION: a value whose own code, run while the record is read,
+    # changes the record does not change what is read: the record is read as
+    # it was when the call began. The walk over the dict used to read what
+    # the record held at each step. It read a key that was taken out and
+    # stored again a second time, and refused the record; it read a key added
+    # and a value stored after the call began; it missed a key taken out
+    # before it was read; and when a key was taken out and enough keys added
+    # to rebuild the dict's table, it skipped a later key that the record
+    # held throughout. The code is Python code that reading the value
+    # reaches: a method of the value's class, also when the class carries
+    # numpy's name and module; the __index__ of the object that a weakref
+    # proxy refers to; a tzinfo's utcoffset; the lookup of a pandas
+    # Timestamp's asm8 on a datetime; and numpy.datetime_data, which reading a
+    # datetime64 calls.
+    pipeline: Pipeline = Pipeline([("s", StandardScaler(columns=["price"]))]).fit([source])
+    datetime_data: Callable[..., Any] = np.datetime_data
+    for name, change in _CHANGES.items():
+        record: dict[str, Any] = {}
+        value, read_as, _alive = _changing_value(route, functools.partial(change, record), monkeypatch, datetime_data)
+        record.update({"a": 1.0, "device": "ios", "b": value, "c": 3.0, "price": 2.0})
+        items: list[tuple[str, Any]] = list(record.items())
+        out: dict[str, Any] = pipeline.transform_dict(record)
+        # The price at fit has mean 2.0, so the scaler reads 2.0 as 0.0.
+        assert list(out.items()) == [("a", 1.0), ("device", "ios"), ("b", read_as), ("c", 3.0), ("price", 0.0)], name
+        assert list(record.items()) != items, name  # the change ran
 
 
 def test_manifest_with_invalid_bytes_is_an_engine_error(tmp_path: Path) -> None:
@@ -714,7 +855,7 @@ def test_transform_dict_rejects_lookalike_numerics_by_type(source: str) -> None:
 
 
 class bool_:
-    """A value that carries the name of numpy's bool, which the record path tests by its truth."""
+    """A value that carries the name of numpy's bool, and refuses a truth value."""
 
     def __bool__(self) -> bool:
         """Refuse a truth value.
@@ -724,6 +865,133 @@ class bool_:
 
         """
         raise ValueError("no truth value")
+
+
+class _NameIsNotText(type):
+    """A metaclass that gives its classes a __name__ that is not a str."""
+
+    @property
+    def __name__(self) -> Any:
+        """Answer a number.
+
+        Returns:
+            5.
+
+        """
+        return 5
+
+
+class _Count:
+    """What a lookalike datetime64's astype returns: its item is 5."""
+
+    def item(self) -> int:
+        """Answer the count.
+
+        Returns:
+            5.
+
+        """
+        return 5
+
+
+def _astype(_value: Any, _kind: str) -> _Count:
+    """Answer as numpy's astype does, with an object whose item is 5.
+
+    Args:
+        _value: The value.
+        _kind: The type asked for.
+
+    Returns:
+        A _Count.
+
+    """
+    return _Count()
+
+
+def test_transform_dict_reads_a_numpy_value_only_from_numpy_types(source: str) -> None:
+    # REGRESSION: a value is read as numpy's bool, datetime64 or floating
+    # type only when its type is numpy's own. Any other type is not
+    # supported: one that carries numpy's name, also with numpy as its module
+    # or as part of its name, and a subclass of a numpy type. The record path
+    # used to go by the type's __name__ alone: a class named bool_ without
+    # __bool__ was read as True, one named float32 through its __float__,
+    # and one named datetime64 through its astype and dtype, whose results
+    # could raise RuntimeError("std::bad_cast"). A type whose metaclass gives
+    # a __name__ that is not a str raised that RuntimeError too.
+    pipeline: Pipeline = Pipeline([("s", StandardScaler(columns=["price"]))]).fit([source])
+    lookalikes: list[tuple[Any, str]] = [
+        (type("bool_", (), {})(), "bool_"),
+        (bool_(), "bool_"),
+        (type("bool", (), {"__bool__": lambda _self: False})(), "bool"),
+        (type("bool_", (), {"__module__": "numpy"})(), "bool_"),
+        (type("numpy.bool", (), {})(), "numpy.bool"),  # the C name of a class made in Python is its __name__
+        (type("datetime64", (), {"astype": _astype, "dtype": np.dtype("M8[s]")})(), "datetime64"),
+        (type("float32", (), {"__float__": lambda _self: 1.25})(), "float32"),
+        (type("float16", (), {"__float__": lambda _self: 1.25})(), "float16"),
+        (type("longdouble", (), {"__float__": lambda _self: 1.25})(), "longdouble"),
+        (type("float128", (), {"__float__": lambda _self: 1.25})(), "float128"),
+        (type("float32", (np.float32,), {})(1.25), "float32"),
+        (_NameIsNotText("Odd", (), {})(), "Odd"),
+    ]
+    unsupported: str = "record value for 'v' must be str, int, float, bool, datetime, or None"
+    for value, name in lookalikes:
+        with pytest.raises(EngineError) as refused:
+            pipeline.transform_dict({"price": 2.0, "v": value})
+        assert str(refused.value) == f"{unsupported} (got {name})"
+    # numpy's own values, read as numpy reads them.
+    owns: list[tuple[Any, Any]] = [
+        (np.bool_(False), False),
+        (np.bool_(True), True),
+        (np.float32(1.25), 1.25),
+        (np.float16(2.5), 2.5),
+        (np.longdouble(0.5), 0.5),
+    ]
+    for value, expected in owns:
+        out: Any = pipeline.transform_dict({"price": 2.0, "v": value})["v"]
+        assert (type(out), out) == (type(expected), expected)
+    assert pipeline.transform_dict({"price": 2.0, "v": np.datetime64(5, "s")})["v"] == 5_000_000
+
+
+# A process that has not imported numpy sends values whose types carry
+# numpy's names, and prints whether numpy is imported after.
+NO_NUMPY_CHILD: str = """
+import sys
+
+from fast_feature_transform import EngineError, Pipeline, StandardScaler
+
+
+class Count:
+    def item(self):
+        return 5
+
+
+class datetime64:
+    dtype = "M8[s]"
+
+    def astype(self, kind):
+        return Count()
+
+
+pipeline = Pipeline([("s", StandardScaler(columns=["price"]))]).fit([sys.argv[1]], threads=1)
+for value in (datetime64(), type("bool_", (), {})(), type("float32", (), {"__float__": lambda self: 1.0})()):
+    try:
+        print(pipeline.transform_dict({"price": 2.0, "v": value})["v"])
+    except EngineError as error:
+        print(error)
+print("numpy" in sys.modules)
+"""
+
+
+def test_transform_dict_does_not_import_numpy(source: str, tmp_path: Path) -> None:
+    # REGRESSION: numpy is not a dependency, and the record path does not
+    # import it. A value of a type named datetime64 that had astype and dtype
+    # used to import numpy, to call its datetime_data.
+    command: list[str] = [sys.executable, "-c", NO_NUMPY_CHILD, source]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=60, check=False)  # nosec B603
+    unsupported: str = "record value for 'v' must be str, int, float, bool, datetime, or None"
+    expected: list[str] = [f"{unsupported} (got datetime64)", f"{unsupported} (got bool_)"]
+    expected += [f"{unsupported} (got float32)", "False"]
+    assert (child.returncode, child.stdout.splitlines()) == (0, expected), child.stderr
 
 
 class _NoIndex:
@@ -740,15 +1008,16 @@ class _NoIndex:
 
 
 def test_transform_dict_raises_the_error_a_value_raises_while_it_converts(source: str) -> None:
-    # REGRESSION: an error from a value's own __bool__ or __index__ reaches
-    # the caller. A raising __bool__ used to leave its error set, which
-    # surfaced as a SystemError, and any error from __index__ used to become
-    # the EngineError for an unsupported type.
+    # REGRESSION: an error from a value's own __index__ reaches the caller.
+    # Any error from __index__ used to become the EngineError for an
+    # unsupported type.
     pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
-    with pytest.raises(ValueError, match="no truth value"):
-        pipeline.transform_dict({"device": "ios", "flag": bool_()})
     with pytest.raises(ValueError, match="no integer value"):
         pipeline.transform_dict({"device": "ios", "n": _NoIndex()})
+    # A value whose reading runs Python code is read after every other field,
+    # so the refusal of a later field comes first.
+    with pytest.raises(EngineError, match="'big' does not fit in a 64-bit integer"):
+        pipeline.transform_dict({"device": "ios", "n": _NoIndex(), "big": INT64_MAX + 1})
 
 
 class _LookupRaises:
