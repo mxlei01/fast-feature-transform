@@ -44,6 +44,9 @@ pipeline.save("artifacts/preprocessing")
 serving = Pipeline.load("artifacts/preprocessing")
 ```
 
+If you run a batch operation in a daemon thread, join that thread before Python shuts down. The engine needs the
+interpreter to stay alive until the call returns.
+
 ## Transform latency
 
 Time to transform one record (a `dict` in, a `dict` out) and batches of 100,000 and 1,000,000 rows, after fitting on
