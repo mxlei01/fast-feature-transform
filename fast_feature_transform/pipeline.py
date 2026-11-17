@@ -11,7 +11,7 @@ path, and a list of Parquet paths takes the batch path.
 import json
 import operator
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Self, SupportsIndex, overload
 
@@ -58,10 +58,13 @@ from fast_feature_transform.transformers import (
     _directory_path,
     _fit_engine,
     _output_directory,
+    _ParquetPaths,
+    _PathT,
     _source_paths,
+    _StrPath,
 )
 
-TransformInput = dict[str, Any] | Sequence[str | Path]
+TransformInput = dict[str, Any] | _ParquetPaths[_PathT]
 TransformOutput = dict[str, Any] | list[Path]
 
 Step = tuple[str, "Transformer | Pipeline"]
@@ -116,7 +119,7 @@ _SHELLS: dict[str, type[Transformer]] = {
 }
 
 
-def parquet_to_memmap(X: Sequence[str | Path], *, output_dir: str | Path | None = None, threads: int = 0) -> Path:
+def parquet_to_memmap(X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None, threads: int = 0) -> Path:
     """Convert Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
 
     Meant for ``transform_parquet``'s output. The file holds row-major
@@ -266,32 +269,44 @@ class Pipeline:
 
     def fit(
         self,
-        X: Sequence[str | Path],
+        X: _ParquetPaths[_PathT],
         y: Any = None,
         *,
         threads: int = 0,
-        temp_dir: str | Path | None = None,
+        temp_dir: _StrPath | None = None,
     ) -> Self:
-        """Fit every step in one engine call over the given Parquet files.
+        """Fit on the given Parquet files.
+
+        Fitting again replaces the fitted state. Each read sees one fit, even
+        when another thread fits the same object.
+
+        Fit reads Parquet in batches. Steps that need every value (exact
+        medians, quantiles, k-means and power fits) keep those values within a
+        64 MiB budget per fit and move them to temporary files when they
+        outgrow it, trading disk space and I/O time for memory. The budget
+        covers those values only: fitted tables, batches and Parquet decoder
+        buffers take memory too. Nothing is sampled.
 
         Args:
-            X: List of Parquet file paths.
+            X: A list or tuple of Parquet file paths.
             y: Ignored; present to match scikit-learn's ``fit(X, y)``.
             threads: Worker threads for the engine; 0 uses all cores.
-            temp_dir: Existing parent directory for temporary spill files;
-                defaults to the system temporary directory.
+            temp_dir: Existing parent directory for private temporary spill files;
+                defaults to the system temporary directory. The files are
+                deleted when the fit ends or fails.
 
         Returns:
             self, fitted.
 
         Raises:
-            EngineError: If the input cannot be read or a step's columns are missing or mistyped.
+            EngineError: If the input cannot be read or a column is missing or mistyped.
             TypeError: If X is a single path instead of a list of paths, or
                 temp_dir is not None and is neither a str nor an os.PathLike
                 that gives a str.
             ValueError: If threads is not an integer from 0 to 2**32 - 1, or
                 temp_dir holds a NUL character or is not an existing
                 directory.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         plan: str = json.dumps(self._to_tree())
@@ -312,7 +327,7 @@ class Pipeline:
 
         Raises:
             EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
-            RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is not a dict.
 
         """
@@ -325,11 +340,11 @@ class Pipeline:
             handle = self._require_handle()
         return handle.transform_row(X)
 
-    def transform_parquet(self, X: Sequence[str | Path], *, output_dir: str | Path | None = None) -> list[Path]:
+    def transform_parquet(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None) -> list[Path]:
         """Transform Parquet files through the streaming batch path.
 
         Args:
-            X: List of Parquet file paths.
+            X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
                 is created when omitted and removed with its files if the call raises.
                 Existing ``part-NNNNN.parquet`` files in it are replaced once
@@ -343,11 +358,12 @@ class Pipeline:
             EngineError: If the input cannot be read, does not match the fitted schema, or
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
-            RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is a single path instead of a list of paths, or
                 output_dir is not None and is neither a str nor an os.PathLike
                 that gives a str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         handle: _core.FittedPipeline = self._require_handle()
@@ -355,7 +371,7 @@ class Pipeline:
         with _output_directory(output_dir) as out_dir:
             return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
-    def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
+    def transform_memmap(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath) -> Path:
         """Write transformed training records without intermediate Parquet files.
 
         Args:
@@ -371,11 +387,12 @@ class Pipeline:
                 fitted schema, or the output has no columns or holds a string
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
-            RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is a single path instead of a list of paths, or
                 output_dir is neither a str nor an os.PathLike that gives a
                 str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         return Path(
@@ -386,16 +403,16 @@ class Pipeline:
     def transform(self, X: dict[str, Any]) -> dict[str, Any]: ...
 
     @overload
-    def transform(self, X: Sequence[str | Path], *, output_dir: str | Path | None = None) -> list[Path]: ...
+    def transform(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None) -> list[Path]: ...
 
-    def transform(self, X: TransformInput, *, output_dir: str | Path | None = None) -> TransformOutput:
+    def transform(self, X: TransformInput[_PathT], *, output_dir: _StrPath | None = None) -> TransformOutput:
         """Transform a record dict or a list of Parquet paths.
 
         Dispatches on input type: a dict goes to transform_dict, and a list or
         tuple of paths to transform_parquet.
 
         Args:
-            X: A single record dict, or a list of Parquet file paths.
+            X: A record dict, or a list or tuple of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
                 directory is created when omitted and removed with its files if the call raises.
 
@@ -404,11 +421,12 @@ class Pipeline:
 
         Raises:
             EngineError: If the engine rejects the input.
-            RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is neither a dict nor a list of paths, or
                 output_dir is not None and is neither a str nor an os.PathLike
                 that gives a str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         if isinstance(X, dict):
@@ -419,12 +437,12 @@ class Pipeline:
 
     def fit_transform(
         self,
-        X: Sequence[str | Path],
+        X: _ParquetPaths[_PathT],
         y: Any = None,
         *,
         threads: int = 0,
-        temp_dir: str | Path | None = None,
-        output_dir: str | Path | None = None,
+        temp_dir: _StrPath | None = None,
+        output_dir: _StrPath | None = None,
     ) -> list[Path]:
         """Fit the pipeline, then transform the same files with transform_parquet.
 
@@ -455,7 +473,7 @@ class Pipeline:
             output_dir = _directory_path(output_dir, "output_dir")
         return self.fit(X, y, threads=threads, temp_dir=temp_dir).transform_parquet(X, output_dir=output_dir)
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: _StrPath) -> None:
         """Write the fitted pipeline to ``<path>/manifest.json``, which ``Pipeline.load`` reads.
 
         Args:
@@ -509,7 +527,7 @@ class Pipeline:
         return self._require_handle().stages_state()
 
     @classmethod
-    def load(cls, path: str | Path, *, threads: int = 0) -> Pipeline:
+    def load(cls, path: _StrPath, *, threads: int = 0) -> Pipeline:
         """Load a fitted pipeline from the directory ``save`` wrote.
 
         The nested step structure is rebuilt from the manifest's dotted stage

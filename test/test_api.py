@@ -317,6 +317,18 @@ def _listing(*roots: Path) -> list[str]:
     return sorted(str(path) for root in roots for path in root.rglob("*"))
 
 
+@pytest.mark.parametrize("method", ["fit", "transform", "transform_dict", "transform_parquet", "transform_memmap"])
+def test_shared_methods_describe_the_same_public_contract(method: str) -> None:
+    assert getattr(Pipeline, method).__doc__ == getattr(Transformer, method).__doc__
+
+
+@pytest.mark.parametrize("path", [_PathLike(b"file"), "file\ud800"])
+def test_a_source_path_must_give_utf8_text(path: Any) -> None:
+    error = TypeError if isinstance(path, _PathLike) else ValueError
+    with pytest.raises(error, match="^X must be a "):
+        parquet_to_memmap([path])
+
+
 @pytest.mark.parametrize("call", _PATH_CALLS)
 def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
     call: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -342,6 +354,7 @@ def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
         (7, TypeError, "must be a str or os.PathLike, got int"),
         (b"tgt", TypeError, "must be a str path, got bytes; decode it with os.fsdecode"),
         (_PathLike(b"tgt"), TypeError, "must be a str path, got bytes; decode it with os.fsdecode"),
+        ("bad\ud800", ValueError, "must be a UTF-8 path, got 'bad\\ud800'"),
         ("new\0junk", ValueError, "must not hold a NUL character, got 'new\\x00junk'"),
         ("kept\0junk", ValueError, "must not hold a NUL character, got 'kept\\x00junk'"),
     ]
