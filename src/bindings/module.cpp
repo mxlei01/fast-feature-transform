@@ -9,14 +9,18 @@
 #include <ankerl/unordered_dense.h>
 #include <datetime.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "fastfeaturetransform/engine.hpp"
 
@@ -29,14 +33,36 @@ using fastfeaturetransform::RowValue;
 
 namespace {
 
+// The __name__ of a value's type, as the type holds it. Looking the
+// attribute up instead runs the code of a metaclass, which can give a value
+// that is not a str.
 std::string python_type_name(nb::handle value) {
-  return nb::cast<std::string>(nb::borrow<nb::str>(nb::getattr(value.type(), "__name__")));
+  const nb::object name = nb::steal(PyType_GetName(Py_TYPE(value.ptr())));
+  if (!name.is_valid()) throw nb::python_error();
+  Py_ssize_t size = 0;
+  const char* const data = PyUnicode_AsUTF8AndSize(name.ptr(), &size);
+  if (data == nullptr) throw nb::python_error();
+  return {data, static_cast<std::size_t>(size)};
+}
+
+// The name of numpy's own type of a value, such as "float32", or an empty
+// view for a value of any other type. numpy's types are static types, whose
+// C name holds the module and the name together: "numpy.float32". A class
+// made in Python is a heap type, whose C name is only its __name__, so it is
+// never taken for numpy's, whatever its __name__ and __module__; neither is
+// a subclass of a numpy type. numpy is not imported to tell: a value of one
+// of its types means that it is loaded.
+std::string_view numpy_type_name(PyTypeObject* type) {
+  constexpr std::string_view numpy = "numpy.";
+  const std::string_view name = type->tp_name;
+  if (PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) || !name.starts_with(numpy)) return {};
+  return name.substr(numpy.size());
 }
 
 // numpy's floating scalar types, the only non-builtin values converted
 // through __float__ (anything else with a __float__, such as a numpy complex
 // or a Decimal, is rejected rather than silently narrowed).
-const std::unordered_set<std::string> kNumpyFloats{"float16", "float32", "float64", "longdouble", "float128"};
+constexpr std::array<std::string_view, 5> kNumpyFloats{"float16", "float32", "float64", "longdouble", "float128"};
 
 __extension__ typedef __int128 Int128;  // NOLINT(modernize-use-using): __extension__ needs the typedef form
 
@@ -95,18 +121,31 @@ nb::object optional_attr(nb::handle value, const char* attribute) {
   return nb::steal(found);
 }
 
-// A numpy.datetime64 (or a pandas Timestamp's asm8) from its stored count,
-// which its astype reads, and its unit, which its dtype holds, rescaled
-// exactly: numpy's own cast to microseconds can overflow on a value that
-// fits. Finer units floor, as numpy and the batch path do; NaT, which numpy
-// stores as INT64_MIN, becomes null.
-std::optional<int64_t> numpy_epoch_microseconds(const nb::object& astype, const nb::object& dtype,
-                                                const std::string& name) {
-  const auto count = nb::cast<int64_t>(astype("int64").attr("item")());
+// A numpy.datetime64 (or a pandas Timestamp's asm8, which is one) from its
+// stored count, which its astype reads, and its unit, which its dtype holds,
+// rescaled exactly: numpy's own cast to microseconds can overflow on a value
+// that fits. Finer units floor, as numpy and the batch path do; NaT, which
+// numpy stores as INT64_MIN, becomes null.
+std::optional<int64_t> numpy_epoch_microseconds(nb::handle datetime64, const std::string& name) {
+  // numpy's own astype and item, which Python code cannot replace on numpy's
+  // type, give the count as an int.
+  const auto count = nb::cast<int64_t>(nb::getattr(datetime64, "astype")("int64").attr("item")());
   if (count == std::numeric_limits<int64_t>::min()) return std::nullopt;
+  const nb::object dtype = nb::getattr(datetime64, "dtype");
+  // numpy.datetime_data is looked up in numpy's module, where Python code can
+  // replace it, so its answer is checked. numpy gives the unit as a str and
+  // the step, which it stores as a C int, as an int of at least 1.
   const nb::object unit_and_step = nb::module_::import_("numpy").attr("datetime_data")(dtype);
-  const auto unit = nb::cast<std::string>(unit_and_step[0]);
-  const auto step = nb::cast<int64_t>(unit_and_step[1]);
+  const nb::object unit_item = unit_and_step[0];
+  const nb::object step_item = unit_and_step[1];
+  std::string unit;
+  int64_t step = 0;
+  if (!nb::try_cast(unit_item, unit) || !nb::try_cast(step_item, step, false) || step < 1 ||
+      step > std::numeric_limits<int32_t>::max()) {
+    throw fastfeaturetransform::Error("record value for '" + name +
+                                      "' is a numpy datetime64 whose unit numpy.datetime_data does not give as a "
+                                      "str and an int from 1 to 2**31 - 1");
+  }
   const auto per_unit = kMicrosecondsPerUnit.find(unit);
   if (per_unit == kMicrosecondsPerUnit.end()) {
     throw fastfeaturetransform::Error("record value for '" + name + "' is a numpy datetime64 in '" + unit +
@@ -128,15 +167,13 @@ std::optional<int64_t> numpy_epoch_microseconds(const nb::object& astype, const 
 // are equal and they compare equal. Keys whose types use str's own hash and
 // comparison always do: a str, a StrEnum member, a member of an Enum with a
 // str mixin, a numpy.str_. A key whose type has its own hash or comparison
-// can sit beside a str of its text. And Python code that runs while the
-// record is read can take a key out and store it again past the field being
-// read, where the walk reaches it a second time. So the names are checked
-// only when a key's type has its own hash or comparison, or a value's
-// conversion can run Python code (see converts_without_python). A key whose
-// hash or equality changes while it is in the record, as when its class or
-// its class's __hash__ or __eq__ changes, breaks the rule for dict keys: the
-// walk sees only the type the key has now, so such a key can repeat a text
-// unchecked.
+// can sit beside a str of its text, so the names are checked only when a
+// key's type has one. A key whose hash or equality changes while it is in
+// the record, as when its class or its class's __hash__ or __eq__ changes,
+// breaks the rule for dict keys: the walk sees only the type the key has
+// now, so such a key can repeat a text unchecked. Python code that a value
+// runs cannot repeat a key: row_from_dict reads such a value only after it
+// has read every other field.
 // Another thread that changes the record while this one waits for a str's
 // lock, on a free-threaded build, can repeat a key too; that race in the
 // caller's code is not checked, since checking it would cost every record
@@ -155,14 +192,13 @@ void refuse_repeated_keys(const Row& row) {
 // float or a str without running Python code, so that the value cannot
 // change the record while it is read: an exact datetime whose tzinfo is None
 // or a datetime.timezone, or a value of a numpy type other than datetime64,
-// which numpy's C functions alone convert or refuse. A type is numpy's when
-// its C name starts with "numpy." and it is not a heap type: a class made in
-// Python is a heap type, whatever its name. Any other value counts as one
-// that can run Python code: the methods of a class made in Python, another
-// tzinfo's utcoffset, a static type of another library that calls Python
-// code from its C functions (a weakref proxy calls its referent's
-// __index__), and a datetime64, which converts through numpy.datetime_data
-// and builtins.__import__, both of which Python code can replace.
+// which numpy's C functions alone convert or refuse (see numpy_type_name).
+// Any other value counts as one that can run Python code: the methods of a
+// class made in Python, another tzinfo's utcoffset, a static type of another
+// library that calls Python code from its C functions (a weakref proxy calls
+// its referent's __index__), and a datetime64, which converts through
+// numpy.datetime_data and builtins.__import__, both of which Python code can
+// replace.
 // It is kept out of line: inlined into row_from_dict, it made a record of 128
 // str values that are not ASCII, which never reach it, take 5% more time
 // through one Select step (an Apple M4, one thread).
@@ -171,18 +207,86 @@ void refuse_repeated_keys(const Row& row) {
     PyObject* const tzinfo = PyDateTime_DATE_GET_TZINFO(value);
     return tzinfo == Py_None || Py_IS_TYPE(tzinfo, Py_TYPE(PyDateTime_TimeZone_UTC));
   }
-  PyTypeObject* const type = Py_TYPE(value);
-  const std::string_view name = type->tp_name;
-  return !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) && name.starts_with("numpy.") && name != "numpy.datetime64";
+  const std::string_view numpy = numpy_type_name(Py_TYPE(value));
+  return !numpy.empty() && numpy != "datetime64";
+}
+
+// Reads a record value that is not None, a bool, an int, a float or a str.
+// name is its key, for the errors.
+RowValue read_other_value(nb::handle value, const std::string& name) {
+  const std::string_view numpy = numpy_type_name(Py_TYPE(value.ptr()));
+  const auto unsupported = [&] {
+    return fastfeaturetransform::Error("record value for '" + name +
+                                       "' must be str, int, float, bool, datetime, or None (got " +
+                                       python_type_name(value) + ")");
+  };
+  if (PyDateTime_Check(value.ptr()) || numpy == "datetime64") {
+    std::optional<int64_t> micros;
+    if (!PyDateTime_Check(value.ptr())) {
+      micros = numpy_epoch_microseconds(value, name);
+    } else if (const nb::object asm8 = optional_attr(value, "asm8"); asm8.is_valid()) {
+      // A pandas Timestamp, NaT included, is a datetime whose fields cannot
+      // be trusted: they read 0001-01-01 for NaT and hold a stand-in year
+      // outside 1 to 9999. Its asm8, a numpy datetime64, is its true count
+      // (the UTC instant when aware).
+      if (numpy_type_name(Py_TYPE(asm8.ptr())) != "datetime64") {
+        throw fastfeaturetransform::Error("record value for '" + name +
+                                          "' is a datetime whose asm8 is not a numpy datetime64 (got " +
+                                          python_type_name(asm8) + ")");
+      }
+      micros = numpy_epoch_microseconds(asm8, name);
+    } else {
+      micros = epoch_microseconds(value.ptr(), name);
+    }
+    if (micros) return *micros;
+    return std::monostate{};
+  }
+  if (numpy == "bool" || numpy == "bool_") {  // numpy's bool (2.x / 1.x names)
+    const int truth = PyObject_IsTrue(value.ptr());
+    if (truth < 0) throw nb::python_error();
+    return truth == 1;
+  }
+  if (optional_attr(value, "__index__").is_valid()) {  // integer-like: fits int64 or fails, never widens
+    nb::object index = nb::steal(PyNumber_Index(value.ptr()));
+    if (!index.is_valid()) {
+      // A TypeError is __index__ refusing it (a float or non-scalar ndarray,
+      // say); any other error is the value's own and propagates.
+      if (!PyErr_ExceptionMatches(PyExc_TypeError)) throw nb::python_error();
+      PyErr_Clear();
+      throw unsupported();
+    }
+    int overflow = 0;
+    const long long integer = PyLong_AsLongLongAndOverflow(index.ptr(), &overflow);
+    if (overflow != 0) {
+      throw fastfeaturetransform::Error("record value for '" + name + "' does not fit in a 64-bit integer");
+    }
+    return static_cast<int64_t>(integer);
+  }
+  if (double real = 0.0; std::ranges::find(kNumpyFloats, numpy) != kNumpyFloats.end() && nb::try_cast(value, real)) {
+    return real;
+  }
+  throw unsupported();
 }
 
 // Record values: str, int, float, bool, None, datetimes (as epoch
 // microseconds), plus numpy scalars (their integer and floating types convert
 // through __index__/__float__). Each refusal of a value names its key.
+//
+// A record is read as it was when the call began. Reading a value can run
+// Python code (see converts_without_python), and that code can change the
+// record: take a key out, add keys, rebuild the dict's table or store
+// another value. A walk over the dict would then read a key twice, skip a
+// key that the record held throughout, or read a key or a value that the
+// record did not hold when the call began. So the walk holds each such
+// value, reads it only after the walk has read every other field, and runs
+// no Python code itself. When a record holds more than one value that is
+// refused, the refusal of such a value comes after those of the others.
 Row row_from_dict(const nb::dict& record) {
   Row row;
   row.reserve(nb::len(record));
   bool can_repeat = false;  // whether refuse_repeated_keys must look
+  // The values read after the walk, each with the index of its field in row.
+  std::vector<std::pair<std::size_t, nb::object>> deferred;
   for (auto [key, value] : record) {
     // A key is read with the calls nanobind's caster for std::string makes,
     // without the string the caster builds and then moves, and the test for
@@ -196,15 +300,13 @@ Row row_from_dict(const nb::dict& record) {
       can_repeat = true;
     }
     // The record lends its keys and values, and its reference can be the
-    // only one. Code that runs while a field is read can take the key or the
-    // value out of the record and free it: a hook of the value or of its
-    // type, or another thread, which on the standard build can run whenever
-    // Python code runs and on a free-threaded build whenever this thread
-    // waits, since waiting suspends the record's lock. So from the first step
-    // that can run Python code or wait, the key and the value that are still
-    // to be read are held. Reading None, a bool, an int, a float or an ASCII
-    // str does neither. On a free-threaded build the first UTF-8 conversion
-    // of a str that is not ASCII locks the str, and can wait for that lock.
+    // only one. On a free-threaded build another thread can take the key or
+    // the value out of the record and free it whenever this thread waits,
+    // since waiting suspends the record's lock. So from the first step that
+    // can wait, the key and the value that are still to be read are held.
+    // Reading None, a bool, an int, a float or an ASCII str does not wait. The
+    // first UTF-8 conversion of a str that is not ASCII locks the str, and
+    // can wait for that lock.
     const bool key_can_wait = !PyUnicode_IS_ASCII(key.ptr());
     const nb::object held_key = key_can_wait ? nb::borrow(key) : nb::object();
     nb::object held_value = key_can_wait ? nb::borrow(value) : nb::object();
@@ -234,67 +336,18 @@ Row row_from_dict(const nb::dict& record) {
         throw fastfeaturetransform::Error("record value for '" + name + "' is not encodable as UTF-8");
       }
       row.emplace_back(std::move(name), std::move(text));
-    } else {
+    } else if (converts_without_python(value.ptr())) {
       held_value = nb::borrow(value);
-      if (!converts_without_python(value.ptr())) can_repeat = true;
-      const std::string type = python_type_name(value);
-      const auto unsupported = [&] {
-        return fastfeaturetransform::Error("record value for '" + name +
-                                           "' must be str, int, float, bool, datetime, or None (got " + type + ")");
-      };
-      double real = 0.0;
-      if (PyDateTime_Check(value.ptr()) || type == "datetime64") {
-        std::optional<int64_t> micros;
-        if (!PyDateTime_Check(value.ptr())) {
-          // A value of another type named datetime64 that has no astype or no
-          // dtype is not numpy's, and so not a supported type.
-          const nb::object astype = optional_attr(value, "astype");
-          const nb::object dtype = optional_attr(value, "dtype");
-          if (!astype.is_valid() || !dtype.is_valid()) throw unsupported();
-          micros = numpy_epoch_microseconds(astype, dtype, name);
-        } else if (const nb::object asm8 = optional_attr(value, "asm8"); asm8.is_valid()) {
-          // A pandas Timestamp, NaT included, is a datetime whose fields
-          // cannot be trusted: they read 0001-01-01 for NaT and hold a
-          // stand-in year outside 1 to 9999. Its asm8 is its true count (the
-          // UTC instant when aware), and an asm8 without astype or dtype
-          // raises the AttributeError of the one it lacks.
-          const nb::object astype = nb::getattr(asm8, "astype");
-          const nb::object dtype = nb::getattr(asm8, "dtype");
-          micros = numpy_epoch_microseconds(astype, dtype, name);
-        } else {
-          micros = epoch_microseconds(value.ptr(), name);
-        }
-        if (micros) {
-          row.emplace_back(std::move(name), *micros);
-        } else {
-          row.emplace_back(std::move(name), std::monostate{});
-        }
-      } else if (type == "bool" || type == "bool_") {  // numpy's bool (2.x / 1.x names)
-        const int truth = PyObject_IsTrue(value.ptr());
-        if (truth < 0) throw nb::python_error();  // the error its __bool__ raised
-        row.emplace_back(std::move(name), truth == 1);
-      } else if (optional_attr(value, "__index__").is_valid()) {  // integer-like: fits int64 or fails, never widens
-        nb::object index = nb::steal(PyNumber_Index(value.ptr()));
-        if (!index.is_valid()) {
-          // A TypeError is __index__ refusing it (a float or non-scalar
-          // ndarray, say); any other error is the value's own and propagates.
-          if (!PyErr_ExceptionMatches(PyExc_TypeError)) throw nb::python_error();
-          PyErr_Clear();
-          throw unsupported();
-        }
-        int overflow = 0;
-        const long long integer = PyLong_AsLongLongAndOverflow(index.ptr(), &overflow);
-        if (overflow != 0) {
-          throw fastfeaturetransform::Error("record value for '" + name + "' does not fit in a 64-bit integer");
-        }
-        row.emplace_back(std::move(name), static_cast<int64_t>(integer));
-      } else if (kNumpyFloats.contains(type) && nb::try_cast(value, real)) {
-        row.emplace_back(std::move(name), real);
-      } else {
-        throw unsupported();
-      }
+      RowValue read = read_other_value(value, name);
+      row.emplace_back(std::move(name), std::move(read));
+    } else {
+      // The value is alive here: held_value holds it if the key waited, and
+      // the record holds it if the key did not.
+      deferred.emplace_back(row.size(), nb::borrow(value));
+      row.emplace_back(std::move(name), std::monostate{});
     }
   }
+  for (const auto& [index, value] : deferred) row[index].second = read_other_value(value, row[index].first);
   if (can_repeat) refuse_repeated_keys(row);
   return row;
 }
@@ -367,10 +420,15 @@ NB_MODULE(_core, m) {
            nb::call_guard<nb::gil_scoped_release>())
       .def(
           "transform_row",
-          [](const FittedPipeline& self, const nb::dict& record) {
-            return row_to_dict(self.transform_row(row_from_dict(record)));
+          [](const FittedPipeline& self, nb::handle record) {
+            // Only transform_dict calls this, so the TypeError for a record
+            // that is not a dict, None included, names it.
+            if (!PyDict_Check(record.ptr())) {
+              throw nb::type_error(("transform_dict: X must be a dict, got " + python_type_name(record)).c_str());
+            }
+            return row_to_dict(self.transform_row(row_from_dict(nb::borrow<nb::dict>(record))));
           },
-          "record"_a)
+          "record"_a.none())
       .def("stage_state", &FittedPipeline::stage_state, "stage"_a, nb::call_guard<nb::gil_scoped_release>())
       .def("vocab_size", &FittedPipeline::vocab_size, "stage"_a, "column"_a)
       .def("manifest_json", &FittedPipeline::manifest_json, nb::call_guard<nb::gil_scoped_release>())

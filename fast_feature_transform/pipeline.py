@@ -313,6 +313,7 @@ class Pipeline:
         Raises:
             EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
+            TypeError: If X is not a dict.
 
         """
         # The record path: a record costs a couple of hundred nanoseconds, and

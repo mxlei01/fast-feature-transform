@@ -161,6 +161,44 @@ def test_nat_becomes_null_and_numpy_datetimes_convert_exactly_with_floor(tmp_pat
         assert _through(pipeline, value) == expected, value
 
 
+def test_a_numpy_datetime64_is_read_only_from_a_unit_of_the_kind_numpy_gives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # REGRESSION: numpy.datetime_data, which Python code can replace, must
+    # give a datetime64's unit as a str and its step as an int from 1 to
+    # 2**31 - 1, as numpy's own does; any other answer is an EngineError. A
+    # unit or a step of another type used to raise
+    # RuntimeError("std::bad_cast"), and a step outside that range scaled the
+    # count by it.
+    pipeline: Pipeline = _scaler(tmp_path)
+    value: np.datetime64 = np.datetime64(3, "us")
+    answers: list[tuple[Any, int | None]] = [
+        (("us", 1), 3),
+        (("ms", 7), 21_000),
+        (("us", 2**31 - 1), 3 * (2**31 - 1)),
+        (("us", "1"), None),
+        ((b"us", 1), None),
+        ((5, 1), None),
+        (("us", 1.0), None),
+        (("us", True), None),
+        (("us", 0), None),
+        (("us", -1), None),
+        (("us", 2**31), None),
+    ]
+    refusal: str = (
+        "record value for 'when' is a numpy datetime64 whose unit numpy.datetime_data does not give as a str and an "
+        "int from 1 to 2**31 - 1"
+    )
+    for answer, expected in answers:
+        monkeypatch.setattr(np, "datetime_data", lambda _dtype, answer=answer: answer)
+        if expected is not None:
+            assert _through(pipeline, value) == expected, answer
+            continue
+        with pytest.raises(EngineError) as refused:
+            _through(pipeline, value)
+        assert str(refused.value) == refusal, answer
+
+
 def test_a_pandas_timestamp_converts_from_its_true_count(tmp_path: Path) -> None:
     pipeline: Pipeline = _scaler(tmp_path)
     # Outside years 1 to 9999 pandas fills the year field with 1970 or 1972; asm8 is the true count.
@@ -191,8 +229,8 @@ def test_datetimes_outside_int64_microseconds_dates_and_other_time_types_are_ref
             _through(pipeline, value)
 
 
-# Each case sends a value that the record path reads through attributes it
-# looks up: a value of a type named datetime64, as numpy's is, or a
+# Each case sends a value that the record path read through attributes it
+# looked up: a value of a type named datetime64, as numpy's is, or a
 # datetime's asm8, as a pandas Timestamp has one. A lookup that failed used
 # to end the process, so the cases run in a child process, which prints what
 # came back under the value's key.
@@ -212,8 +250,17 @@ class Count:
         return 5
 
 
+class Text:
+    def item(self):
+        return "five"
+
+
 def astype(self, kind):
     return Count()
+
+
+def astype_text(self, kind):
+    return Text()
 
 
 def named(**members):
@@ -238,6 +285,8 @@ cases = [
     ("astype raises", named(astype=raising(ValueError("no astype")), dtype=np.dtype("M8[s]"))),
     ("both", named(astype=astype, dtype=np.dtype("M8[s]"))),
     ("asm8 without dtype", stamp(property(lambda self: named(astype=astype)))),
+    ("asm8 whose item is a str", stamp(property(lambda self: named(astype=astype_text, dtype=np.dtype("M8[s]"))))),
+    ("asm8 of numpy", stamp(property(lambda self: np.datetime64(7, "s")))),
     ("asm8 raises", stamp(raising(ValueError("no asm8")))),
     ("asm8 absent", stamp(raising(AttributeError("asm8")))),
 ]
@@ -253,22 +302,29 @@ for label, value in cases:
 
 
 def test_a_failed_attribute_lookup_raises_the_values_own_error(tmp_path: Path) -> None:
-    # REGRESSION: the record path fetches each attribute it calls with before
-    # the call. A value of a type named datetime64 that lacks astype or dtype
-    # is not numpy's, and gets the EngineError of a type that is not
-    # supported; any other failed lookup raises the value's own error, and an
-    # asm8 that raises AttributeError is taken as absent. nanobind used to
-    # convert value.attr("dtype") as a call's argument, where its failure
-    # ended the process, and an asm8 that raised anything else was read as
-    # absent.
+    # REGRESSION: the record path reads a datetime64 only from numpy's own
+    # type, and fetches each attribute it calls with before the call. A value
+    # of a type that is only named datetime64 gets the EngineError of a type
+    # that is not supported, whatever attributes it has; a datetime's asm8
+    # that is not a numpy datetime64 is an EngineError; a failed lookup of
+    # asm8 raises the value's own error, and an asm8 that raises
+    # AttributeError is taken as absent. nanobind used to convert
+    # value.attr("dtype") as a call's argument, where its failure ended the
+    # process. A value of a type named datetime64, or an asm8 of any type,
+    # used to be read through its astype and dtype, whose results could raise
+    # RuntimeError("std::bad_cast"), and an asm8 that raised anything but
+    # AttributeError was read as absent.
     unsupported: str = "EngineError: record value for 'when' must be str, int, float, bool, datetime, or None"
+    not_numpy: str = "EngineError: record value for 'when' is a datetime whose asm8 is not a numpy datetime64"
     expected: list[str] = [
         f"no dtype: {unsupported} (got datetime64)",
         f"no astype: {unsupported} (got datetime64)",
-        "dtype raises: ValueError: no dtype",
-        "astype raises: ValueError: no astype",
-        "both: 5000000",  # 5 seconds
-        "asm8 without dtype: AttributeError: 'datetime64' object has no attribute 'dtype'",
+        f"dtype raises: {unsupported} (got datetime64)",
+        f"astype raises: {unsupported} (got datetime64)",
+        f"both: {unsupported} (got datetime64)",
+        f"asm8 without dtype: {not_numpy} (got datetime64)",
+        f"asm8 whose item is a str: {not_numpy} (got datetime64)",
+        "asm8 of numpy: 7000000",  # 7 seconds
         "asm8 raises: ValueError: no asm8",
         f"asm8 absent: {(datetime(2024, 1, 5, 8, 30) - EPOCH) // ONE_US}",  # read from its fields
     ]
