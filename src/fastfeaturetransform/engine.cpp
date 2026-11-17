@@ -210,6 +210,20 @@ void validate_ops(const std::vector<std::unique_ptr<Kernel>>& ops) {
     if (!well_formed) throw Error("invalid stage name '" + stage + "'");
     if (!stages.insert(stage).second) throw Error("duplicate stage name '" + stage + "'");
   }
+  // Dotted names must reconstruct one tree in execution order. All the
+  // leaves beneath a nested pipeline occupy one contiguous run of stages.
+  std::unordered_set<std::string> groups;
+  std::string_view previous;
+  for (const auto& op : ops) {
+    const std::string& stage = op->stage;
+    for (auto dot = stage.find('.'); dot != std::string::npos; dot = stage.find('.', dot + 1)) {
+      const std::string prefix = stage.substr(0, dot);
+      if (stages.contains(prefix)) throw Error("stage '" + prefix + "' is both a step and a nested pipeline");
+      if (!groups.insert(prefix).second && !previous.starts_with(std::string_view(stage).substr(0, dot + 1)))
+        throw Error("the stages of nested pipeline '" + prefix + "' are not consecutive");
+    }
+    previous = stage;
+  }
 }
 
 // A string field of a manifest object, `fallback` when absent; any other

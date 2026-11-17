@@ -224,6 +224,13 @@ TEST_CASE("a polynomial artifact serves its stored basis and refuses one without
   REQUIRE(nlohmann::json::parse(loaded.manifest_json()) == manifest);
   REQUIRE(loaded.transform_row({{"c", std::string("a")}}) == fft::Row{{"c_0", -0.25}});
 
+  for (const char* key : {"handle_missing", "handle_unknown"}) {
+    nlohmann::json wrong = manifest;
+    wrong["ops"][0]["params"][key] = true;
+    REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(wrong.dump()),
+                        ContainsSubstring(std::string("'") + key + "' must be 'value', 'return_nan'"));
+  }
+
   // A stripped basis is refused rather than rebuilt.
   manifest["ops"][0]["state"].erase("polynomial_basis");
   REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(manifest.dump()),
@@ -247,6 +254,21 @@ TEST_CASE("load_json enforces the same invariants as compile_plan, with context"
     bad["ops"][0]["stage"] = stage;
     REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(bad.dump()), ContainsSubstring("invalid stage name"));
   }
+
+  for (const auto& names : {std::pair{"a", "a.inner"}, std::pair{"a.inner", "a"}}) {
+    nlohmann::json clash = duplicate;
+    clash["ops"][0]["stage"] = names.first;
+    clash["ops"][1]["stage"] = names.second;
+    REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(clash.dump()),
+                        ContainsSubstring("stage 'a' is both a step and a nested pipeline"));
+  }
+  nlohmann::json split = duplicate;
+  split["ops"].push_back(op);
+  split["ops"][0]["stage"] = "a.b.x";
+  split["ops"][1]["stage"] = "a.bc.y";
+  split["ops"][2]["stage"] = "a.b.z";
+  REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(split.dump()),
+                      ContainsSubstring("the stages of nested pipeline 'a.b' are not consecutive"));
 
   nlohmann::json missing = manifest;
   missing["ops"][0].erase("params");

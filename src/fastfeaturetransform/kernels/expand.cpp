@@ -466,7 +466,7 @@ int64_t find_interval(const std::vector<double>& knots, std::size_t degree, doub
   // branch: a value anywhere in the base interval mispredicts it. NaN counts
   // none, as the scan stops at once.
   std::size_t ell = degree + 1;
-  for (std::size_t i = degree + 1; i < last; ++i) ell += x >= knots[i] ? 1 : 0;
+  for (std::size_t i = degree + 1; i < last; ++i) ell += static_cast<std::size_t>(x >= knots[i]);
   return static_cast<int64_t>(ell) - 1;
 }
 

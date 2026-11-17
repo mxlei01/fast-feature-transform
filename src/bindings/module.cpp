@@ -72,8 +72,8 @@ __extension__ typedef __int128 Int128;  // NOLINT(modernize-use-using): __extens
 // whole microseconds in its fields.
 int64_t epoch_microseconds(PyObject* value, const std::string& name) {
   using namespace std::chrono;
-  const sys_days date{year{PyDateTime_GET_YEAR(value)} / static_cast<unsigned>(PyDateTime_GET_MONTH(value)) /
-                      static_cast<unsigned>(PyDateTime_GET_DAY(value))};
+  const sys_days date{year{PyDateTime_GET_YEAR(value)} / month{static_cast<unsigned>(PyDateTime_GET_MONTH(value))} /
+                      day{static_cast<unsigned>(PyDateTime_GET_DAY(value))}};
   const int64_t seconds = (int64_t{PyDateTime_DATE_GET_HOUR(value)} * 60 + PyDateTime_DATE_GET_MINUTE(value)) * 60 +
                           PyDateTime_DATE_GET_SECOND(value);
   const int64_t micros = duration_cast<microseconds>(date.time_since_epoch()).count() + seconds * 1'000'000 +

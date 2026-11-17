@@ -1053,14 +1053,17 @@ class CountEncoder(Transformer):
     fitted row count, making the output f64 instead of i64. A null is a
     countable category under ``handle_missing="value"``, a null under
     ``"return_nan"``, and an error under ``"error"`` — refused at transform
-    as well as at fit, as category_encoders does. An unseen category yields 0
+    as well as at fit. Under ``"return_nan"`` the null stays null for every
+    ``handle_unknown`` setting. category_encoders fills it with an integer
+    ``handle_unknown`` and rejects it under ``"error"``. An unseen category yields 0
     under ``handle_unknown="value"`` (a null when ``handle_missing`` is
     ``"return_nan"``), that integer when an integer is given, a null under
     ``"return_nan"``, and an error under ``"error"``; an integer is the
     literal number you asked to see, so ``normalize=True`` scales a real
     count and leaves that number alone. A ``min_group_size`` group whose name
     is already a category that survived the fold is a fit-time error rather
-    than a silent overwrite.
+    than a silent overwrite. A fit with ``min_group_name`` set or with
+    ``combine_min_nan_groups`` set to False or "force" requires ``min_group_size``.
     """
 
     kernel_id: ClassVar[str] = "count_encode"

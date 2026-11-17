@@ -65,8 +65,8 @@ CountUnknown unknown_from_count(const nlohmann::json& params, const std::string&
 //   * every category's count is exact and order-independent; normalize=true
 //     divides by the fitted row count, so the output is f64 instead of i64
 //   * a null is a countable category under handle_missing='value' (one not
-//     seen at fit counts as unseen), a null under 'return_nan', and an error
-//     under 'error', at transform as well as at fit
+//     seen at fit counts as unseen), a null under 'return_nan' for every
+//     handle_unknown option, and an error under 'error' at fit and transform
 //   * an unseen category yields 0 under handle_unknown='value' (a null when
 //     handle_missing is 'return_nan', as upstream does), that integer under
 //     an integer, a null under 'return_nan', and an error under 'error'; an
@@ -160,7 +160,11 @@ class CountEncode final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
-  std::unique_ptr<AccState> make_state() const override { return std::make_unique<SeenState>(); }
+  std::unique_ptr<AccState> make_state() const override {
+    if (min_group_size_ < 0 && (min_group_name_.has_value() || combine_nan_ != CombineNan::Yes))
+      throw Error(stage + ": min_group_name and nondefault combine_min_nan_groups require min_group_size");
+    return std::make_unique<SeenState>();
+  }
 
   void consume(AccState& raw, const Batch& batch) const override {
     consume_categories(columns_, stage, static_cast<SeenState&>(raw), batch);
