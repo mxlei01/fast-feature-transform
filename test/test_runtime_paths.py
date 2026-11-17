@@ -519,8 +519,9 @@ def test_concurrent_artifact_saves_publish_one_complete_manifest(tmp_path: Path,
         source = tmp_path / f"{prefix}.parquet"
         pq.write_table(pa.table({"key": [f"{prefix}-{i:05d}" for i in range(2048)]}), source)
         pipeline = Pipeline([("encode", LabelEncoder(columns=["key"]))]).fit([source], threads=1)
-        assert pipeline._handle is not None
-        expected.append(pipeline._handle.manifest_json())
+        handle = pipeline._binding[0]
+        assert handle is not None
+        expected.append(handle.manifest_json())
         pipelines.append(pipeline)
     start = Barrier(2)
 
@@ -694,7 +695,7 @@ def test_batch_calls_let_other_threads_run(
     # stage_state's 38 ms for these 200,000 keys (Apple M4), too close to the
     # bound.
     pipeline = Pipeline.load(large_artifact, threads=1)
-    handle = pipeline._handle
+    handle = pipeline._binding[0]
     assert handle is not None
     keys = [large_keys] * 3
     numbers = [large_numbers] * 3

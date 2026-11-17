@@ -66,6 +66,17 @@ TransformOutput = dict[str, Any] | list[Path]
 
 Step = tuple[str, "Transformer | Pipeline"]
 
+# A pipeline's view of one fit: the fitted C++ pipeline, this pipeline's
+# dotted stage-name prefix in it ("" for a root), and the manifest of an
+# unpickled pipeline that is not loaded yet. An unfitted pipeline holds
+# (None, "", None), an unpickled one (None, prefix, manifest) and a bound one
+# (handle, prefix, None). A bind publishes the whole view in one assignment
+# and each reader takes everything it uses from one read of it, so a thread
+# that uses this pipeline while another fits it, or fits a pipeline that
+# holds it, sees the old fit or the new one, never the handle of one with
+# the prefix of the other.
+_PipelineBinding = tuple[_core.FittedPipeline | None, str, str | None]
+
 _SHELLS: dict[str, type[Transformer]] = {
     "select": Select,
     "cast": Cast,
@@ -205,9 +216,7 @@ class Pipeline:
 
         """
         self._steps: list[Step] = _validated_steps(steps)
-        self._handle: _core.FittedPipeline | None = None
-        self._prefix: str = ""
-        self._manifest: str | None = None  # an unpickled artifact not yet loaded (see _ensure_bound)
+        self._binding: _PipelineBinding = (None, "", None)
         self._bind_lock: threading.Lock = threading.Lock()
 
     @property
@@ -247,7 +256,8 @@ class Pipeline:
         """
         # Checked without _ensure_bound: an unpickled artifact is fitted even
         # before it is loaded, and refusing must not load it just to refuse.
-        if self._handle is not None or self._manifest is not None:
+        handle, _, manifest = self._binding
+        if handle is not None or manifest is not None:
             raise RuntimeError(
                 "Pipeline is already fitted, so its steps cannot be reassigned; "
                 "build a new Pipeline with the steps you want and fit that"
@@ -309,8 +319,8 @@ class Pipeline:
         # the two frames _require_handle adds are a large share of that.
         # Anything but a bound root still goes through it, to load a deferred
         # artifact or to raise.
-        handle: _core.FittedPipeline | None = self._handle
-        if handle is None or self._prefix or self._manifest is not None:
+        handle, prefix, _ = self._binding
+        if handle is None or prefix:
             handle = self._require_handle()
         return handle.transform_row(X)
 
@@ -592,17 +602,16 @@ class Pipeline:
             State dict holding the steps, manifest JSON, and stage prefix.
 
         """
-        # REGRESSION: the manifest is read before the handle. Binding an
-        # unpickled pipeline sets the handle and then clears the manifest, so
-        # a pickle that finds the manifest cleared finds the handle set. It
-        # used to read the handle first, and a first use on another thread
-        # that bound the pipeline between the two reads left the pickle with
-        # neither, so it restored unfitted.
-        manifest: str | None = self._manifest
-        handle: _core.FittedPipeline | None = self._handle
+        # REGRESSION: the manifest and the prefix come from one read of the
+        # binding. The handle, the prefix and the manifest of an unpickled
+        # pipeline used to be read one after another, so a bind on another
+        # thread between two of the reads left the pickle with neither the
+        # handle nor the manifest, and it restored unfitted, or with the
+        # manifest of one fit and the prefix of the other.
+        handle, prefix, manifest = self._binding
         if handle is not None:
             manifest = _cached_manifest(handle)
-        return {"steps": self._steps, "manifest": manifest, "prefix": self._prefix}
+        return {"steps": self._steps, "manifest": manifest, "prefix": prefix}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore from the pickled artifact manifest.
@@ -616,18 +625,24 @@ class Pipeline:
 
         """
         self._steps = state["steps"]
-        self._handle = None
-        self._prefix = state.get("prefix", "")
-        self._manifest = state["manifest"]
+        self._binding = (None, state.get("prefix", ""), state["manifest"])
         self._bind_lock = threading.Lock()
 
-    def _ensure_bound(self) -> None:
-        """Load a deferred (unpickled) artifact and bind every step to it, once."""
-        if self._manifest is None:  # cleared last by _bind_stages, so a bound tree is fully bound
-            return
+    def _ensure_bound(self) -> _PipelineBinding:
+        """Load a deferred (unpickled) saved pipeline and bind every step to it, once.
+
+        Returns:
+            The binding, read once after any load, so it holds no manifest.
+
+        """
+        binding: _PipelineBinding = self._binding
+        if binding[2] is None:  # published last by _bind_stages, so a bound tree is fully bound
+            return binding
         with self._bind_lock:
-            if self._manifest is not None:
-                self._bind_stages(_core.FittedPipeline.load_json(self._manifest), prefix=self._prefix)
+            binding = self._binding
+            if binding[2] is not None:
+                binding = self._bind_stages(_core.FittedPipeline.load_json(binding[2]), prefix=binding[1])
+            return binding
 
     def _to_tree(self) -> dict[str, Any]:
         """Serialize the step tree for the C++ plan compiler.
@@ -654,12 +669,15 @@ class Pipeline:
         with self._bind_lock:
             self._bind_stages(handle, prefix="")
 
-    def _bind_stages(self, handle: _core.FittedPipeline, prefix: str) -> None:
+    def _bind_stages(self, handle: _core.FittedPipeline, prefix: str) -> _PipelineBinding:
         """Recursively give each transformer, then this pipeline, its fitted-state view.
 
         Args:
             handle: The fitted C++ pipeline.
             prefix: Dotted stage-name prefix for this nesting level.
+
+        Returns:
+            The binding it published.
 
         """
         for name, step in self._steps:
@@ -668,9 +686,16 @@ class Pipeline:
                 step._bind_stages(handle, prefix=stage)
             else:
                 step._bind(handle, stage, standalone=False)
-        self._handle = handle
-        self._prefix = prefix
-        self._manifest = None  # published last: nothing observes a half-bound tree
+        # REGRESSION: the handle, the prefix and the cleared manifest are
+        # published in one assignment, after every step: nothing observes a
+        # half-bound tree. They used to be three attributes written one after
+        # another, so a thread that used, copied or pickled a pipeline that
+        # was a root and a step of another between two of the writes got the
+        # handle of one fit with the prefix of the other, and the step
+        # answered for the whole larger pipeline.
+        binding: _PipelineBinding = (handle, prefix, None)
+        self._binding = binding
+        return binding
 
     def _require_handle(self) -> _core.FittedPipeline:
         """Return the fitted handle or raise if this pipeline cannot run on its own.
@@ -683,14 +708,16 @@ class Pipeline:
                 step of a larger pipeline (its stages cannot run in isolation).
 
         """
-        if self._prefix:
-            raise RuntimeError(
-                f"Pipeline {self._prefix!r} is a step of a larger pipeline; call this on the root pipeline"
-            )
-        self._ensure_bound()
-        if self._handle is None:
+        binding: _PipelineBinding = self._binding
+        if binding[2] is not None and not binding[1]:
+            # A nested pipeline is refused without loading what it would refuse.
+            binding = self._ensure_bound()
+        handle, prefix, _ = binding
+        if prefix:
+            raise RuntimeError(f"Pipeline {prefix!r} is a step of a larger pipeline; call this on the root pipeline")
+        if handle is None:
             raise RuntimeError("Pipeline is not fitted")
-        return self._handle
+        return handle
 
     @classmethod
     def _from_handle(cls, handle: _core.FittedPipeline) -> Pipeline:

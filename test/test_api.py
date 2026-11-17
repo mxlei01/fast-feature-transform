@@ -42,6 +42,7 @@ from fast_feature_transform import (
     JamesSteinEncoder,
     KBinsDiscretizer,
     LabelEncoder,
+    MaxAbsScaler,
     MEstimateEncoder,
     MinMaxScaler,
     Normalizer,
@@ -351,7 +352,7 @@ def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
             run(value)
         assert _listing(work, temporary) == before, value
     # A refused directory is refused before a fit starts.
-    assert unfitted._handle is None
+    assert unfitted._binding == (None, "", None)
     assert standalone._binding is None
 
 
@@ -407,6 +408,21 @@ def test_nested_pipeline_refuses_to_transform_on_its_own(train_files: list[str])
     assert outer.transform_dict({"device": "mob", "source": "a", "price": 1.0}) == {"device": MOB_INDEX, "source": 1}
 
 
+def test_an_unpickled_nested_pipeline_refuses_to_run_on_its_own_without_loading_its_manifest(
+    train_files: list[str],
+) -> None:
+    # A nested pipeline pickled on its own restores as a view over the whole
+    # saved pipeline, and it is refused without loading that manifest.
+    features = _nested().fit(train_files)["features"]
+    assert isinstance(features, Pipeline)
+    restored: Pipeline = pickle.loads(pickle.dumps(features))
+    with pytest.raises(RuntimeError, match=r"^Pipeline 'features' is a step of a larger pipeline"):
+        restored.stages_json()
+    with pytest.raises(RuntimeError, match=r"^Pipeline 'features' is a step of a larger pipeline"):
+        restored.transform_dict({"device": "mob", "source": "a"})
+    assert restored._binding[0] is None
+
+
 def test_stages_json_lists_every_step_in_execution_order(train_files: list[str]) -> None:
     pipeline: Pipeline = _nested().fit(train_files)
     assert json.loads(pipeline.stages_json()) == [
@@ -440,7 +456,7 @@ def test_stages_json_and_stages_state_survive_save_load_and_pickle(train_files: 
     payload: bytes = pickle.dumps(pipeline)
     for method in ("stages_json", "stages_state"):
         restored: Pipeline = pickle.loads(payload)
-        assert restored._handle is None
+        assert restored._binding[0] is None
         assert getattr(restored, method)() == getattr(pipeline, method)()
 
 
@@ -1195,7 +1211,7 @@ def test_nested_pipeline_pickle_stores_the_manifest_once(train_files: list[str])
     # The nested pipeline restored inside the root shares the root's handle.
     features = restored["features"]
     assert isinstance(features, Pipeline)
-    assert features._handle is restored._handle
+    assert features._binding[0] is restored._binding[0]
 
 
 def test_ownership_is_known_without_parsing_the_manifest(train_files: list[str]) -> None:
@@ -1369,6 +1385,250 @@ def test_a_fitted_attribute_read_that_binding_the_next_step_overtakes_leaves_no_
     assert encoder.label_maps_ == {"u": {"1": 1, "2": 2}}
 
 
+class _RefitsAtARead:
+    """A transformer mixin whose ``at``-th read of ``_binding`` runs ``refit`` right after the read.
+
+    The read returns the binding from before the refit, as a read does when
+    another thread fits the transformer again right after it, so the
+    interleaving is forced rather than hoped for. ``refit`` and ``at`` are
+    class attributes, and the read clears ``refit`` before it runs it.
+    """
+
+    refit: ClassVar[Callable[[], object] | None] = None
+    at: ClassVar[int] = 0
+
+    @override
+    def __getattribute__(self, name: str) -> Any:
+        value: Any = super().__getattribute__(name)
+        refit = _RefitsAtARead.refit
+        if name == "_binding" and refit is not None:
+            _RefitsAtARead.at -= 1
+            if _RefitsAtARead.at == 0:
+                _RefitsAtARead.refit = None
+                refit()
+        return value
+
+
+# The transformers whose fitted state is learned from the numbers of "x"; the
+# others learn it from the categories of "c".
+_NUMERIC: tuple[type[Transformer], ...] = (
+    KBinsDiscretizer,
+    MaxAbsScaler,
+    MinMaxScaler,
+    PowerTransformer,
+    QuantileTransformer,
+    RobustScaler,
+    SplineTransformer,
+    StandardScaler,
+)
+
+
+class _KeyText:
+    """A dict key that is not a str and finds the str it holds, as that str would."""
+
+    def __init__(self, text: str) -> None:
+        self.text: str = text
+
+    @override
+    def __hash__(self) -> int:
+        return hash(self.text)
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        return other == self.text
+
+    @override
+    def __repr__(self) -> str:
+        return f"_KeyText({self.text!r})"
+
+
+def _fitted_readers(transformer: type[Transformer]) -> dict[str, Callable[[Transformer], object]]:
+    """Name each fitted attribute of a transformer class, with a call that reads it.
+
+    Args:
+        transformer: The transformer class.
+
+    Returns:
+        The calls, by name.
+
+    """
+    readers: dict[str, Callable[[Transformer], object]] = {
+        name: operator.attrgetter(name)
+        for name in dir(transformer)
+        if name.endswith("_") and isinstance(getattr(transformer, name), property)
+    }
+    if transformer is LabelEncoder:
+        # Both fits encode "c"; only the new one encodes "d".
+        for column in ("c", "d", _KeyText("d")):
+            readers[f"vocab_size({column!r})"] = operator.methodcaller("vocab_size", column)
+    return readers
+
+
+_FITTED_TRANSFORMERS: list[type[Transformer]] = [each for each in _TRANSFORMERS if _fitted_readers(each)]
+
+
+def _refit_arguments(transformer: type[Transformer]) -> dict[str, Any]:
+    """Build constructor arguments that fit a transformer on both files of the refit test.
+
+    Args:
+        transformer: The transformer class.
+
+    Returns:
+        The arguments.
+
+    """
+    if transformer is GroupAgg:
+        return {"key": "c", "aggs": {"x": ["mean"]}}
+    if transformer is LabelEncoder:
+        return {}  # every utf8 column, so the new fit encodes "d" and the old one does not
+    if transformer in _NUMERIC:
+        return {"columns": ["x"]}
+    if "target" in inspect.signature(transformer).parameters:
+        return {"columns": ["c"], "target": "y"}
+    return {"columns": ["c"]}
+
+
+def _answer(read: Callable[[Any], object], subject: object) -> str:
+    """Read once, and give the answer or the RuntimeError or KeyError raised, as text.
+
+    Args:
+        read: Reads from the subject.
+        subject: A transformer or a pipeline.
+
+    Returns:
+        The repr of what _outcome gives.
+
+    """
+    return repr(_outcome(lambda: read(subject)))
+
+
+def _fit(subject: Transformer, path: Path, then: str) -> object:
+    """Fit a transformer on its own, or as the step "moved" of a new pipeline, which changes its stage name.
+
+    Args:
+        subject: The transformer.
+        path: The file to fit it on.
+        then: "standalone" or "step".
+
+    Returns:
+        What fit returns.
+
+    """
+    if then == "standalone":
+        return subject.fit([path], threads=1)
+    return Pipeline([("moved", subject)]).fit([path], threads=1)
+
+
+def _read_with_a_refit(
+    subject: Transformer, read: Callable[[Transformer], object], path: Path, then: str, at: int
+) -> str | None:
+    """Read once, fitting the transformer again right after its ``at``-th read of the binding.
+
+    Args:
+        subject: A transformer of a class that _RefitsAtARead is mixed into.
+        read: Reads a fitted attribute.
+        path: The file of the second fit.
+        then: How the second fit binds the transformer, as _fit takes it.
+        at: Which read of the binding the refit follows.
+
+    Returns:
+        The answer as _answer gives it, or None when the read made fewer
+        reads of the binding.
+
+    """
+    refits: list[object] = []
+    _RefitsAtARead.at = at
+    _RefitsAtARead.refit = lambda: refits.append(_fit(subject, path, then))
+    try:
+        answer: str = _answer(read, subject)
+    finally:
+        _RefitsAtARead.refit = None
+    return answer if refits else None
+
+
+@pytest.mark.parametrize("then", ["standalone", "step"], ids=["refit on its own", "refit as a pipeline step"])
+@pytest.mark.parametrize("transformer", _FITTED_TRANSFORMERS, ids=[each.__name__ for each in _FITTED_TRANSFORMERS])
+def test_every_fitted_attribute_takes_the_fit_it_answers_for_from_one_read_of_the_binding(
+    tmp_path: Path, transformer: type[Transformer], then: str
+) -> None:
+    # REGRESSION: a fitted attribute takes the handle, the stage name and the
+    # state from one read of the binding, so a refit on another thread right
+    # after that read leaves the answer for the old fit. data_range_ used to
+    # read data_max_ and data_min_ one after the other and answered with one
+    # from each fit, and vocab_size answered a column the old fit did not
+    # encode from the new fit's state.
+    old: Path = tmp_path / "old.parquet"
+    new: Path = tmp_path / "new.parquet"
+    pq.write_table(
+        pa.table({"c": ["a", "b", "a", "b"], "x": [0.0, 1.0, 2.0, 4.0], "y": [0.0, 1.0, 1.0, 0.0], "d": [1, 2, 3, 4]}),
+        old,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "c": ["b", "c", "c", "d", None],
+                "x": [10.0, 20.0, 40.0, 110.0, 70.0],
+                "y": [1.0, 0.0, 1.0, 1.0, 1.0],
+                "d": ["p", "q", "p", "r", "q"],
+            }
+        ),
+        new,
+    )
+    refitted: type[Transformer] = type(f"Refitted{transformer.__name__}", (_RefitsAtARead, transformer), {})
+    arguments: dict[str, Any] = _refit_arguments(transformer)
+    for name, read in _fitted_readers(transformer).items():
+        old_answer: str = _answer(read, refitted(**arguments).fit([old], threads=1))
+        fresh: Transformer = refitted(**arguments)
+        _fit(fresh, new, then)
+        new_answer: str = _answer(read, fresh)
+        assert old_answer != new_answer, name
+        for warm in (False, True):
+            at: int = 1
+            while True:
+                subject: Transformer = refitted(**arguments).fit([old], threads=1)
+                if warm:
+                    _answer(read, subject)  # fills the cache of the old fit's state
+                answer: str | None = _read_with_a_refit(subject, read, new, then, at)
+                if answer is None:
+                    break
+                # The first read of the binding fixes the fit; a refit after a
+                # later read leaves the answer whole for one of the two.
+                assert answer == old_answer if at == 1 else answer in (old_answer, new_answer), (name, warm, at)
+                at += 1
+            assert at > 1, (name, warm)  # the read took the binding at least once
+
+
+class _RefittedLabelEncoder(_RefitsAtARead, LabelEncoder):
+    """A LabelEncoder whose reads of the binding can run a refit, as _RefitsAtARead describes."""
+
+
+def test_vocab_size_takes_the_handle_and_the_stage_name_from_one_read_of_the_binding(tmp_path: Path) -> None:
+    # In the old fit, the step named as the encoder is named in the new fit
+    # encodes the same column, through a Cast that turns the codes into text,
+    # and keeps one of their three values. A handle of one fit with the stage
+    # name of the other would answer with that step's vocabulary, 2, rather
+    # than raise the error that sends vocab_size to the state of one fit.
+    old: Path = tmp_path / "old.parquet"
+    new: Path = tmp_path / "new.parquet"
+    pq.write_table(pa.table({"c": ["a", "b", "a", "e"]}), old)
+    pq.write_table(pa.table({"c": ["b", "c"]}), new)
+    read: Callable[[Transformer], object] = operator.methodcaller("vocab_size", "c")
+    at: int = 1
+    while True:
+        encoder: _RefittedLabelEncoder = _RefittedLabelEncoder(columns=["c"])
+        text: Cast = Cast({"c": "utf8"})
+        Pipeline([("encode", encoder), ("text", text), ("moved", LabelEncoder(columns=["c"], min_count=2))]).fit(
+            [old], threads=1
+        )
+        answer: str | None = _read_with_a_refit(encoder, read, new, "step", at)
+        if answer is None:
+            break
+        # 4 for the old fit (a, b, e), 3 for the new one (b, c).
+        assert answer == "4" if at == 1 else answer in ("4", "3"), at
+        at += 1
+    assert at > 1
+
+
 def test_generator_steps_are_materialized_before_validation() -> None:
     pipeline: Pipeline = Pipeline((name, Select(columns=["a"])) for name in ("s", "t"))
     assert len(pipeline) == 2
@@ -1382,7 +1642,7 @@ def test_unpickled_root_binds_on_any_public_path(train_files: list[str]) -> None
     assert encoder.label_maps_["device"]["mob"] == MOB_INDEX
     features = restored.steps[0][1]
     assert isinstance(features, Pipeline)
-    assert features._handle is restored._handle
+    assert features._binding[0] is restored._binding[0]
 
 
 def test_unpickled_root_binds_safely_under_concurrent_first_use(train_files: list[str]) -> None:
@@ -1403,7 +1663,7 @@ def test_unpickled_root_binds_safely_under_concurrent_first_use(train_files: lis
         assert results == [MOB_INDEX, 4] * 8
         features = restored["features"]
         assert isinstance(features, Pipeline)
-        assert features._handle is restored._handle
+        assert features._binding[0] is restored._binding[0]
 
 
 class _BindsAtARead(Pipeline):
@@ -1427,7 +1687,7 @@ class _BindsAtARead(Pipeline):
         return value
 
 
-@pytest.mark.parametrize("bind_at", ["_manifest", "_handle", "_steps", "_prefix"])
+@pytest.mark.parametrize("bind_at", ["_binding", "_steps"])
 def test_a_pickle_of_an_unpickled_pipeline_stays_fitted_whichever_read_its_first_use_binds_it_at(
     train_files: list[str], bind_at: str
 ) -> None:
@@ -1438,7 +1698,7 @@ def test_a_pickle_of_an_unpickled_pipeline_stays_fitted_whichever_read_its_first
         payload: bytes = pickle.dumps(restored)
     finally:
         _BindsAtARead.bind_at = None
-    assert restored._manifest is None  # the read bound it
+    assert restored._binding[2] is None  # the read bound it
     again = pickle.loads(payload)
     assert again.transform_dict({"device": "mob", "source": "a"}) == {"device": MOB_INDEX, "source": 1}
 
@@ -1453,7 +1713,7 @@ def test_pickle_after_refit_serializes_the_current_fit(train_files: list[str], t
     outer.fit([str(other)])
     restored: Pipeline = pickle.loads(pickle.dumps(inner))
     assert isinstance(restored["select"], Select)  # binds the view to its artifact
-    handle = restored._handle
+    handle = restored._binding[0]
     assert handle is not None
     assert json.loads(handle.manifest_json())["ops"][1]["state"]["label_maps"]["device"] == {"desk": 1, "zzz": 2}
 
@@ -1462,10 +1722,204 @@ def test_shallow_copy_shares_the_handle_and_leaves_the_original_bound(train_file
     pipeline: Pipeline = _nested().fit(train_files)
     clone: Pipeline = copy.copy(pipeline)
     assert clone.transform_dict({"device": "mob", "source": "a"}) == {"device": MOB_INDEX, "source": 1}
-    assert clone._handle is pipeline._handle
+    assert clone._binding[0] is pipeline._binding[0]
     encoder = pipeline["encode"]
     assert isinstance(encoder, LabelEncoder)
-    assert encoder._require_handle() is pipeline._handle
+    assert encoder._require_handle() is pipeline._binding[0]
+
+
+class _InterleavedPipeline(Pipeline):
+    """A Pipeline that calls ``hook`` before each attribute write, as _Interleaved does.
+
+    ``hook`` is a class attribute, so copies and pickles carry none of it,
+    and it is off while it runs.
+    """
+
+    hook: ClassVar[Callable[[str, Any], None] | None] = None
+
+    @override
+    def __setattr__(self, name: str, value: Any) -> None:
+        cls = type(self)
+        hook = cls.hook
+        cls.hook = None
+        try:
+            if hook is not None:
+                hook(name, value)
+            super().__setattr__(name, value)
+        finally:
+            cls.hook = hook
+
+
+class _RebindsAtARead(Pipeline):
+    """A Pipeline whose ``at``-th read of an attribute of ``subject`` runs ``rebind`` right after the read.
+
+    The read returns the value from before the rebind, as a read does when
+    another thread fits the pipeline, or one that holds it, right after it,
+    so the interleaving is forced rather than hoped for. Every attribute in
+    the instance dict counts, whichever of them a bind writes. ``subject``,
+    ``rebind`` and ``at`` are class attributes, and the read clears
+    ``rebind`` before it runs it.
+    """
+
+    subject: ClassVar[Pipeline | None] = None
+    rebind: ClassVar[Callable[[], object] | None] = None
+    at: ClassVar[int] = 0
+
+    @override
+    def __getattribute__(self, name: str) -> Any:
+        value: Any = super().__getattribute__(name)
+        rebind = _RebindsAtARead.rebind
+        if rebind is not None and self is _RebindsAtARead.subject and name in object.__getattribute__(self, "__dict__"):
+            _RebindsAtARead.at -= 1
+            if _RebindsAtARead.at == 0:
+                _RebindsAtARead.rebind = None
+                rebind()
+        return value
+
+
+def _two_files(tmp_path: Path) -> tuple[Path, Path]:
+    """Write the file of the first fit and the file of the second.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+
+    Returns:
+        The two paths.
+
+    """
+    first: Path = tmp_path / "first.parquet"
+    second: Path = tmp_path / "second.parquet"
+    pq.write_table(pa.table({"u": ["a", "b"], "v": ["p", "q"]}), first)
+    pq.write_table(pa.table({"u": ["b", "c"], "v": ["q", "r"]}), second)
+    return first, second
+
+
+def _root_and_step(kind: type[Pipeline]) -> dict[str, Pipeline]:
+    """Build a pipeline of ``kind`` that is also the step "inner" of another pipeline.
+
+    Args:
+        kind: Pipeline or a subclass of it.
+
+    Returns:
+        The pipeline as "inner" and the pipeline that holds it as "outer".
+
+    """
+    inner: Pipeline = kind([("enc", LabelEncoder(columns=["u"]))])
+    return {"inner": inner, "outer": Pipeline([("inner", inner), ("other", LabelEncoder(columns=["v"]))])}
+
+
+# Which of "inner" and "outer" is fitted first, and which then binds "inner"
+# again. Between the two, "inner" turns from a root into a step or back.
+_REBINDS: dict[str, tuple[str, str]] = {
+    "root refit": ("inner", "inner"),
+    "root to a step": ("inner", "outer"),
+    "step to root": ("outer", "inner"),
+}
+
+_PIPELINE_RECORD: dict[str, object] = {"u": "b", "v": "q"}
+
+# Every way to use, copy or pickle a pipeline; each answers with a record or
+# the error a pipeline that is a step of another raises.
+_PIPELINE_READERS: dict[str, Callable[[Pipeline], object]] = {
+    "transform_dict": lambda pipeline: pipeline.transform_dict(_PIPELINE_RECORD),
+    "stages_state": lambda pipeline: pipeline.stages_state(),
+    "copy": lambda pipeline: copy.copy(pipeline).transform_dict(_PIPELINE_RECORD),
+    "deepcopy": lambda pipeline: copy.deepcopy(pipeline).transform_dict(_PIPELINE_RECORD),
+    "pickle": lambda pipeline: pickle.loads(pickle.dumps(pipeline)).transform_dict(_PIPELINE_RECORD),
+}
+
+
+@pytest.mark.parametrize("rebind", list(_REBINDS))
+def test_a_pipeline_answers_for_the_old_fit_or_the_new_one_between_any_two_writes_of_a_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rebind: str
+) -> None:
+    # REGRESSION: a bind publishes the handle and the prefix of a pipeline in
+    # one assignment. They used to be separate attributes, and a pipeline
+    # that turned from a root into a step of another, between two of the
+    # writes, answered for the whole larger pipeline, and so did a copy or a
+    # pickle taken there.
+    first, second = _two_files(tmp_path)
+    owners: dict[str, Pipeline] = _root_and_step(_InterleavedPipeline)
+    inner: Pipeline = owners["inner"]
+    owners[_REBINDS[rebind][0]].fit([first], threads=1)
+
+    def read_all() -> list[str]:
+        return [_answer(read, inner) for read in _PIPELINE_READERS.values()]
+
+    before: list[str] = read_all()
+    seen: list[list[str]] = []
+    monkeypatch.setattr(_InterleavedPipeline, "hook", lambda name, value: seen.append(read_all()))
+    owners[_REBINDS[rebind][1]].fit([second], threads=1)
+    monkeypatch.setattr(_InterleavedPipeline, "hook", None)
+    after: list[str] = read_all()
+    assert seen
+    for answers in seen:
+        for answer, old_answer, new_answer, name in zip(answers, before, after, _PIPELINE_READERS, strict=True):
+            assert old_answer != new_answer, name
+            assert answer in (old_answer, new_answer), name
+
+
+def _read_with_a_rebind(
+    owners: dict[str, Pipeline], read: Callable[[Pipeline], object], then: str, path: Path, at: int
+) -> str | None:
+    """Read "inner" once, fitting ``owners[then]`` on ``path`` right after the ``at``-th read of an attribute of "inner".
+
+    Args:
+        owners: The pipeline as "inner", a _RebindsAtARead, and the pipeline
+            that holds it as "outer".
+        read: Uses, copies or pickles the pipeline.
+        then: The owner to fit again.
+        path: The file of the second fit.
+        at: Which read the rebind follows.
+
+    Returns:
+        The answer as _answer gives it, or None when the read made fewer
+        reads.
+
+    """
+    rebinds: list[Pipeline] = []
+    _RebindsAtARead.subject = owners["inner"]
+    _RebindsAtARead.at = at
+    _RebindsAtARead.rebind = lambda: rebinds.append(owners[then].fit([path], threads=1))
+    try:
+        answer: str = _answer(read, owners["inner"])
+    finally:
+        _RebindsAtARead.rebind = None
+        _RebindsAtARead.subject = None
+    return answer if rebinds else None
+
+
+# A shallow copy reads the instance dict in one step, which no read of an
+# attribute precedes; the test of the writes above covers it.
+@pytest.mark.parametrize("reader", [name for name in _PIPELINE_READERS if name != "copy"])
+@pytest.mark.parametrize("rebind", list(_REBINDS))
+def test_a_pipeline_answers_for_the_old_fit_or_the_new_one_whichever_read_a_bind_follows(
+    tmp_path: Path, rebind: str, reader: str
+) -> None:
+    # REGRESSION: every reader of a pipeline takes the handle and the prefix
+    # from one read of its binding. transform_dict, stages_state and a pickle
+    # used to read them one after the other, so a bind between the reads
+    # gave a pipeline that turned from a step of another into a root, or back,
+    # the answers of the whole larger pipeline.
+    read: Callable[[Pipeline], object] = _PIPELINE_READERS[reader]
+    first_owner, then_owner = _REBINDS[rebind]
+    first, second = _two_files(tmp_path)
+    owners: dict[str, Pipeline] = _root_and_step(_RebindsAtARead)
+    owners[first_owner].fit([first], threads=1)
+    old_answer: str = _answer(read, owners["inner"])
+    owners[then_owner].fit([second], threads=1)
+    new_answer: str = _answer(read, owners["inner"])
+    assert old_answer != new_answer
+    at: int = 1
+    while True:
+        owners = _root_and_step(_RebindsAtARead)
+        owners[first_owner].fit([first], threads=1)
+        answer: str | None = _read_with_a_rebind(owners, read, then_owner, second, at)
+        if answer is None:
+            break
+        assert answer in (old_answer, new_answer), at
+        at += 1
+    assert at > 1  # the reader read the pipeline at least once
 
 
 def test_numpy_integers_are_accepted_for_counts_and_threads(train_files: list[str]) -> None:

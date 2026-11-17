@@ -207,10 +207,10 @@ def test_a_fitted_pipeline_refuses_to_have_its_steps_replaced(train_files: list[
     # An unpickled pipeline is fitted before its manifest is loaded, and
     # refusing must not load it just to refuse.
     restored: Pipeline = pickle.loads(pickle.dumps(pipeline))
-    assert restored._manifest is not None
+    assert restored._binding[2] is not None
     with pytest.raises(RuntimeError, match="already fitted"):
         restored.steps = [("select", Select(columns=["source"]))]
-    assert restored._manifest is not None
+    assert restored._binding[2] is not None
     # A nested step is fitted too, so the root cannot be hollowed out through it.
     inner = pipeline["features"]
     assert isinstance(inner, Pipeline)
