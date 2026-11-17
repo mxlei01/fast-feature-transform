@@ -186,8 +186,10 @@ def test_a_failed_batch_call_removes_the_temporary_directory_it_made(
     with pytest.raises(EngineError):
         calls[call]([tmp_path / "missing.parquet"])
     assert list(temporary.iterdir()) == []
-    with pytest.raises(TypeError, match="not a single path"):
-        calls[call](str(numbers))
+    with monkeypatch.context() as context:
+        context.setattr(tempfile, "mkdtemp", lambda **_: pytest.fail("invalid X created a directory"))
+        with pytest.raises(TypeError, match="not a single path"):
+            calls[call](str(numbers))
     assert list(temporary.iterdir()) == []
 
     # A call that succeeds keeps the directory, which holds what it wrote.
@@ -197,20 +199,19 @@ def test_a_failed_batch_call_removes_the_temporary_directory_it_made(
     assert {path.parent for path in ([written] if call == "memmap" else written)} == {made}
 
 
-def _interrupted_call(made: list[Path], *, wrote: bool) -> None:
-    with _output_directory(None) as directory:
+def _interrupted_call(made: list[Path], *, wrote: bool, output_dir: Path | None = None) -> None:
+    with _output_directory(output_dir) as directory:
         made.append(Path(directory))
         if wrote:
             (made[-1] / "part-00000.parquet").write_bytes(b"rows")
         raise KeyboardInterrupt
 
 
-def test_an_interrupt_removes_the_temporary_directory_only_while_it_is_empty(
+def test_an_interrupt_removes_the_temporary_directory_and_any_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # An interrupt, which is not an Exception, removes the directory too. One
-    # that lands while the engine runs is raised when the engine returns, after
-    # it has written its output, and rmdir leaves that output where it is.
+    # An interrupt raised after the engine writes its output still removes
+    # the temporary directory. The caller never received its path.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     made: list[Path] = []
     with pytest.raises(KeyboardInterrupt):
@@ -218,7 +219,11 @@ def test_an_interrupt_removes_the_temporary_directory_only_while_it_is_empty(
     assert not made[0].exists()
     with pytest.raises(KeyboardInterrupt):
         _interrupted_call(made, wrote=True)
-    assert [path.name for path in made[1].iterdir()] == ["part-00000.parquet"]
+    assert not made[1].exists()
+
+    with pytest.raises(KeyboardInterrupt):
+        _interrupted_call(made, wrote=True, output_dir=tmp_path)
+    assert (tmp_path / "part-00000.parquet").read_bytes() == b"rows"
 
 
 class _PathLike:

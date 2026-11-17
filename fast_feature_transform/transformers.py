@@ -13,6 +13,7 @@ import math
 import numbers
 import operator
 import os
+import shutil
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -188,7 +189,7 @@ def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
 
     Yields:
         The directory's path. A temporary directory made here is removed
-        again if the call raises and leaves it empty.
+        with all its output if the call raises.
 
     Raises:
         TypeError: If output_dir is not None and is neither a str nor an
@@ -203,11 +204,8 @@ def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
     try:
         yield created
     except BaseException:
-        # rmdir removes the directory only while it is empty. A call that
-        # fails in the engine leaves no file in it, and an interrupt raised
-        # once the engine has written its output leaves that output in place.
-        with contextlib.suppress(OSError):
-            os.rmdir(created)
+        # The caller never received the path to this directory.
+        shutil.rmtree(created, ignore_errors=True)
         raise
 
 
@@ -475,7 +473,7 @@ class Transformer:
         Args:
             X: List of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted, and removed again if the run fails.
+                is created when omitted and removed with its files if the call raises.
                 Existing ``part-NNNNN.parquet`` files in it are replaced once
                 the run starts, and a run that fails midway leaves none.
 
@@ -495,8 +493,9 @@ class Transformer:
 
         """
         handle: _core.FittedPipeline = self._standalone_handle()
+        sources: list[str] = _source_paths(X)
         with _output_directory(output_dir) as out_dir:
-            return [Path(path) for path in handle.transform_batch(_source_paths(X), out_dir)]
+            return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
     def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
         """Transform Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
@@ -542,7 +541,7 @@ class Transformer:
         Args:
             X: A single record dict, or a list of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
-                directory is created when omitted.
+                directory is created when omitted and removed with its files if the call raises.
 
         Returns:
             A transformed record dict, or the list of written part-file paths.
