@@ -56,6 +56,7 @@ def test_leave_one_out_takes_the_category_mean_and_collapses_a_singleton(events:
     assert encoder.values_ == {"device": {"ios": IOS_MEAN, "tv": PRIOR, "web": PRIOR}}
     rows: list[dict[str, Any]] = read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))
     assert rows[0] == {"device": pytest.approx(IOS_MEAN), "clicks": 1.0}  # the target passes through
+    assert encoder.null_values_ == {"device": pytest.approx(NULL_MEAN)}
     assert rows[3]["device"] == pytest.approx(NULL_MEAN)
     assert encoder.transform_dict({"device": "ios"}) == {"device": pytest.approx(IOS_MEAN)}
     assert encoder.transform_dict({"device": "nobody"}) == {"device": pytest.approx(PRIOR)}
@@ -63,6 +64,7 @@ def test_leave_one_out_takes_the_category_mean_and_collapses_a_singleton(events:
 
 def test_cat_boost_smooths_toward_the_prior(events: list[str]) -> None:
     encoder: CatBoostEncoder = CatBoostEncoder(columns=["device"], target="clicks").fit(events)
+    assert encoder.null_values_ == {"device": pytest.approx((13 + PRIOR) / 3)}
     assert encoder.values_["device"]["ios"] == pytest.approx((6 + PRIOR) / (3 + 1))
     assert encoder.values_["device"]["web"] == pytest.approx(PRIOR)  # a singleton takes the raw prior
     assert encoder.transform_dict({"device": None}) == {"device": pytest.approx((13 + PRIOR) / (2 + 1))}
@@ -77,6 +79,7 @@ def test_james_stein_shrinks_by_the_model(events: list[str]) -> None:
     independent: JamesSteinEncoder = JamesSteinEncoder(columns=["device"], target="clicks").fit(events)
     # ios: within-category variance 1, four categories, so B = 1/(gvar + 1) * (4 - 3)/(4 - 1).
     weight: float = 1 - (1 / (GLOBAL_VAR + 1)) / 3
+    assert independent.null_values_ == independent.transform_dict({"device": None})
     assert independent.values_["device"]["ios"] == pytest.approx(weight * IOS_MEAN + (1 - weight) * PRIOR)
     # web has one row, so no variance and no shrinkage: it keeps its own mean,
     # 4, which is also the prior.

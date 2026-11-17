@@ -17,9 +17,14 @@ import shutil
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Self, TypeGuard, overload, override
+from typing import Any, ClassVar, Self, TypeGuard, TypeVar, overload, override
 
 from fast_feature_transform import _core
+
+_StrPath = str | os.PathLike[str]
+_PathT = TypeVar("_PathT", bound=_StrPath)
+_ParquetPaths = list[_PathT] | tuple[_PathT, ...]
+_ColumnNames = list[str] | tuple[str, ...]
 
 
 def _cached_manifest(handle: _core.FittedPipeline) -> str:
@@ -144,8 +149,22 @@ def _source_paths(X: object) -> list[str]:
     for item in X:
         if not isinstance(item, (str, os.PathLike)):
             raise TypeError(f"X must be a list of Parquet paths; element {item!r} is a {type(item).__name__}")
-        paths.append(os.fspath(item))
+        paths.append(_utf8_path(item, "X"))
     return paths
+
+
+def _utf8_path(path: object, what: str) -> str:
+    """Return the path as the UTF-8 text the engine accepts."""
+    text: object = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
+    if isinstance(text, bytes):
+        raise TypeError(f"{what} must be a str path, got bytes; decode it with os.fsdecode")
+    if not isinstance(text, str):
+        raise TypeError(f"{what} must be a str or os.PathLike, got {type(path).__name__}")
+    try:
+        str.encode(text, "utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{what} must be a UTF-8 path, got {text!r}") from None
+    return text
 
 
 def _directory_path(path: object, what: str) -> str:
@@ -168,11 +187,7 @@ def _directory_path(path: object, what: str) -> str:
         ValueError: If path is empty or holds a NUL character.
 
     """
-    text: object = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
-    if isinstance(text, bytes):
-        raise TypeError(f"{what} must be a str path, got bytes; decode it with os.fsdecode")
-    if not isinstance(text, str):
-        raise TypeError(f"{what} must be a str or os.PathLike, got {type(path).__name__}")
+    text: str = _utf8_path(path, what)
     if not text:
         raise ValueError(f"{what} must not be empty; pass '.' for the current directory")
     if "\0" in text:
@@ -181,7 +196,7 @@ def _directory_path(path: object, what: str) -> str:
 
 
 @contextlib.contextmanager
-def _output_directory(output_dir: str | Path | None) -> Iterator[str]:
+def _output_directory(output_dir: _StrPath | None) -> Iterator[str]:
     """Give a batch call the directory it writes into.
 
     Args:
@@ -232,7 +247,7 @@ def _check_threads(threads: int) -> int:
     return value
 
 
-def _fit_engine(threads: int, temp_dir: str | Path | None) -> _core.Engine:
+def _fit_engine(threads: int, temp_dir: _StrPath | None) -> _core.Engine:
     """Construct the native engine with an optional spill directory.
 
     Args:
@@ -286,7 +301,7 @@ def _target(target: object, what: str) -> str:
     return str.__str__(target)
 
 
-def _target_outside(target: str, columns: list[str] | None, what: str) -> None:
+def _target_outside(target: str, columns: _ColumnNames | None, what: str) -> None:
     """Refuse a target that is also one of the columns to encode.
 
     Args:
@@ -391,18 +406,16 @@ class Transformer:
 
     def fit(
         self,
-        X: Sequence[str | Path],
+        X: _ParquetPaths[_PathT],
         y: Any = None,
         *,
         threads: int = 0,
-        temp_dir: str | Path | None = None,
+        temp_dir: _StrPath | None = None,
     ) -> Self:
-        """Fit this transformer standalone by wrapping it in a one-stage pipeline.
+        """Fit on the given Parquet files.
 
-        A transformer is a view of one fit at a time: fitting it again, or
-        fitting a Pipeline that holds it, rebinds it to the newest fit in one
-        step, so a thread that uses it meanwhile sees the old fit or the new
-        one.
+        Fitting again replaces the fitted state. Each read sees one fit, even
+        when another thread fits the same object.
 
         Fit reads Parquet in batches. Steps that need every value (exact
         medians, quantiles, k-means and power fits) keep those values within a
@@ -412,7 +425,7 @@ class Transformer:
         buffers take memory too. Nothing is sampled.
 
         Args:
-            X: List of Parquet file paths.
+            X: A list or tuple of Parquet file paths.
             y: Ignored; present to match scikit-learn's ``fit(X, y)``.
             threads: Worker threads for the engine; 0 uses all cores.
             temp_dir: Existing parent directory for private temporary spill files;
@@ -430,6 +443,7 @@ class Transformer:
             ValueError: If threads is not an integer from 0 to 2**32 - 1, or
                 temp_dir holds a NUL character or is not an existing
                 directory.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         from fast_feature_transform.pipeline import Pipeline
@@ -444,7 +458,7 @@ class Transformer:
         return self
 
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
-        """Transform a single record through this standalone-fitted transformer.
+        """Transform a single record through the record path.
 
         Args:
             X: One record as a flat dict of str, int, float, bool, datetime,
@@ -456,7 +470,7 @@ class Transformer:
 
         Raises:
             EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
-            RuntimeError: If unfitted, or fitted as part of a Pipeline.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is not a dict.
 
         """
@@ -468,11 +482,11 @@ class Transformer:
             return binding[0].transform_row(X)
         return self._standalone_handle().transform_row(X)
 
-    def transform_parquet(self, X: Sequence[str | Path], *, output_dir: str | Path | None = None) -> list[Path]:
-        """Transform Parquet files through this standalone-fitted transformer.
+    def transform_parquet(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None) -> list[Path]:
+        """Transform Parquet files through the streaming batch path.
 
         Args:
-            X: List of Parquet file paths.
+            X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
                 is created when omitted and removed with its files if the call raises.
                 Existing ``part-NNNNN.parquet`` files in it are replaced once
@@ -486,11 +500,12 @@ class Transformer:
             EngineError: If the input cannot be read, does not match the fitted schema, or
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
-            RuntimeError: If unfitted, or fitted as part of a Pipeline.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is a single path instead of a list of paths, or
                 output_dir is not None and is neither a str nor an os.PathLike
                 that gives a str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         handle: _core.FittedPipeline = self._standalone_handle()
@@ -498,12 +513,12 @@ class Transformer:
         with _output_directory(output_dir) as out_dir:
             return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
-    def transform_memmap(self, X: Sequence[str | Path], *, output_dir: str | Path) -> Path:
-        """Transform Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
+    def transform_memmap(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath) -> Path:
+        """Write transformed training records without intermediate Parquet files.
 
         Args:
-            X: Input Parquet files.
-            output_dir: Directory for ``data.mmap`` and ``index.json``.
+            X: Input Parquet files, in their desired row order.
+            output_dir: Directory for packed data.mmap and index.json.
 
         Returns:
             The path of ``index.json``. The memmap has the layout that
@@ -514,11 +529,12 @@ class Transformer:
                 fitted schema, or the output has no columns or holds a string
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
-            RuntimeError: If this transformer does not own a fitted pipeline.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is a single path instead of a list of paths, or
                 output_dir is neither a str nor an os.PathLike that gives a
                 str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         return Path(
@@ -529,18 +545,18 @@ class Transformer:
     def transform(self, X: dict[str, Any]) -> dict[str, Any]: ...
 
     @overload
-    def transform(self, X: Sequence[str | Path], *, output_dir: str | Path | None = None) -> list[Path]: ...
+    def transform(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None) -> list[Path]: ...
 
     def transform(
-        self, X: dict[str, Any] | Sequence[str | Path], *, output_dir: str | Path | None = None
+        self, X: dict[str, Any] | _ParquetPaths[_PathT], *, output_dir: _StrPath | None = None
     ) -> dict[str, Any] | list[Path]:
-        """Transform a record dict or a list of Parquet paths through this transformer.
+        """Transform a record dict or a list of Parquet paths.
 
         Dispatches on input type: a dict goes to transform_dict, and a list or
         tuple of paths to transform_parquet.
 
         Args:
-            X: A single record dict, or a list of Parquet file paths.
+            X: A record dict, or a list or tuple of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
                 directory is created when omitted and removed with its files if the call raises.
 
@@ -549,11 +565,12 @@ class Transformer:
 
         Raises:
             EngineError: If the engine rejects the input.
-            RuntimeError: If unfitted, or fitted as part of a Pipeline.
+            RuntimeError: If unfitted or fitted as a step of another pipeline.
             TypeError: If X is neither a dict nor a list of paths, or
                 output_dir is not None and is neither a str nor an os.PathLike
                 that gives a str.
             ValueError: If output_dir is empty or holds a NUL character.
+                A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
         if isinstance(X, dict):
@@ -720,7 +737,7 @@ class Select(Transformer):
 
     kernel_id: ClassVar[str] = "select"
 
-    def __init__(self, columns: list[str]) -> None:
+    def __init__(self, columns: _ColumnNames) -> None:
         """Initialize the projection.
 
         Args:
@@ -751,7 +768,7 @@ class LabelEncoder(Transformer):
 
     kernel_id: ClassVar[str] = "label_encode"
 
-    def __init__(self, columns: list[str] | None = None, min_count: int = 1) -> None:
+    def __init__(self, columns: _ColumnNames | None = None, min_count: int = 1) -> None:
         """Initialize the encoder.
 
         Args:
@@ -1067,7 +1084,7 @@ class CountEncoder(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         normalize: bool = False,
         min_group_size: float | None = None,
@@ -1179,7 +1196,7 @@ class OrdinalEncoder(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         index_start: int = 1,
         handle_unknown: str = "value",
@@ -1233,7 +1250,7 @@ class _Expanding(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         use_cat_names: bool = False,
         handle_unknown: str = "value",
@@ -1335,7 +1352,7 @@ class _Positional(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         handle_unknown: str = "value",
         handle_missing: str = "value",
@@ -1407,7 +1424,7 @@ class BaseNEncoder(_Positional):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         base: int = 2,
         handle_unknown: str = "value",
@@ -1477,7 +1494,7 @@ class _Contrast(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         handle_unknown: str = "value",
         handle_missing: str = "value",
@@ -1627,7 +1644,7 @@ class HashingEncoder(Transformer):
 
     kernel_id: ClassVar[str] = "hash_encode"
 
-    def __init__(self, columns: list[str], *, n_components: int = 8, hash_method: str = "md5") -> None:
+    def __init__(self, columns: _ColumnNames, *, n_components: int = 8, hash_method: str = "md5") -> None:
         """Initialize the encoder.
 
         Args:
@@ -1692,7 +1709,7 @@ class _TargetBlend(Transformer):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None,
+        columns: _ColumnNames | None,
         handle_unknown: str,
         handle_missing: str,
     ) -> None:
@@ -1809,7 +1826,7 @@ class TargetEncoder(_TargetBlend):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         min_samples_leaf: int = 20,
         smoothing: float = 10.0,
@@ -1870,7 +1887,7 @@ class MEstimateEncoder(_TargetBlend):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         m: float = 1.0,
         handle_unknown: str = "value",
@@ -1928,7 +1945,7 @@ class WOEEncoder(_TargetBlend):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         regularization: float = 1.0,
         handle_unknown: str = "value",
@@ -1977,7 +1994,7 @@ class _ShrinkageEncoder(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None,
+        columns: _ColumnNames | None,
         target: str,
         handle_unknown: str,
         handle_missing: str,
@@ -2036,6 +2053,16 @@ class _ShrinkageEncoder(Transformer):
         """
         return self._state()["values"]
 
+    @property
+    def null_values_(self) -> dict[str, float | None]:
+        """The value of each column's null category, or None where it has none.
+
+        Returns:
+            Mapping of column name to the null category's value.
+
+        """
+        return self._state()["null_values"]
+
 
 JAMES_STEIN_MODELS: frozenset[str] = frozenset({"independent", "pooled", "beta"})
 _JAMES_STEIN_BINARY: frozenset[str] = frozenset({"binary"})  # category_encoders' model this package refuses
@@ -2075,7 +2102,7 @@ class JamesSteinEncoder(_ShrinkageEncoder):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         target: str,
         model: str = "independent",
@@ -2133,7 +2160,7 @@ class LeaveOneOutEncoder(_ShrinkageEncoder):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         target: str,
         handle_unknown: str = "value",
@@ -2180,7 +2207,7 @@ class CatBoostEncoder(_ShrinkageEncoder):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         target: str,
         a: float = 1.0,
@@ -2291,7 +2318,7 @@ class QuantileEncoder(Transformer):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         quantile: float = 0.5,
         m: float = 1.0,
@@ -2388,7 +2415,7 @@ class SummaryEncoder(Transformer):
     def __init__(
         self,
         target: str,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         quantiles: Sequence[float] = (0.25, 0.75),
         m: float = 1.0,
@@ -2550,7 +2577,7 @@ class _Scaler(Transformer):
     column becomes f64 whatever width it arrived as.
     """
 
-    def __init__(self, columns: list[str] | None = None) -> None:
+    def __init__(self, columns: _ColumnNames | None = None) -> None:
         """Initialize the scaler.
 
         Args:
@@ -2616,7 +2643,7 @@ class StandardScaler(_Scaler):
 
     kernel_id: ClassVar[str] = "standard_scale"
 
-    def __init__(self, columns: list[str] | None = None, *, with_mean: bool = True, with_std: bool = True) -> None:
+    def __init__(self, columns: _ColumnNames | None = None, *, with_mean: bool = True, with_std: bool = True) -> None:
         """Initialize the scaler.
 
         Args:
@@ -2693,7 +2720,7 @@ class MinMaxScaler(_Scaler):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         feature_range: Sequence[float] = (0.0, 1.0),
         clip: bool = False,
@@ -2808,7 +2835,7 @@ class MaxAbsScaler(_Scaler):
 
     kernel_id: ClassVar[str] = "max_abs_scale"
 
-    def __init__(self, columns: list[str] | None = None, *, clip: bool = False) -> None:
+    def __init__(self, columns: _ColumnNames | None = None, *, clip: bool = False) -> None:
         """Initialize the scaler.
 
         Args:
@@ -2867,7 +2894,7 @@ class Binarizer(Transformer):
 
     kernel_id: ClassVar[str] = "binarize"
 
-    def __init__(self, columns: list[str], *, threshold: float = 0.0) -> None:
+    def __init__(self, columns: _ColumnNames, *, threshold: float = 0.0) -> None:
         """Initialize the binarizer.
 
         Args:
@@ -2919,7 +2946,7 @@ class Normalizer(Transformer):
 
     kernel_id: ClassVar[str] = "normalize"
 
-    def __init__(self, columns: list[str], *, norm: str = "l2") -> None:
+    def __init__(self, columns: _ColumnNames, *, norm: str = "l2") -> None:
         """Initialize the normalizer.
 
         Args:
@@ -3019,7 +3046,7 @@ class RobustScaler(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         with_centering: bool = True,
         with_scaling: bool = True,
@@ -3124,7 +3151,7 @@ class QuantileTransformer(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         n_quantiles: int = 1000,
         output_distribution: str = "uniform",
@@ -3247,7 +3274,7 @@ class KBinsDiscretizer(Transformer):
 
     def __init__(
         self,
-        columns: list[str] | None = None,
+        columns: _ColumnNames | None = None,
         *,
         n_bins: int = 5,
         encode: str = "onehot",
@@ -3402,7 +3429,7 @@ class PolynomialFeatures(Transformer):
 
     def __init__(
         self,
-        columns: list[str],
+        columns: _ColumnNames,
         *,
         degree: int | tuple[int, int] = 2,
         interaction_only: bool = False,
@@ -3546,7 +3573,7 @@ class SplineTransformer(Transformer):
 
     def __init__(
         self,
-        columns: list[str],
+        columns: _ColumnNames,
         *,
         n_knots: int = 5,
         degree: int = 3,
@@ -3689,7 +3716,7 @@ class PowerTransformer(Transformer):
 
     kernel_id: ClassVar[str] = "power_transform"
 
-    def __init__(self, columns: list[str], *, method: str = "yeo-johnson", standardize: bool = True) -> None:
+    def __init__(self, columns: _ColumnNames, *, method: str = "yeo-johnson", standardize: bool = True) -> None:
         """Initialize the transformer.
 
         Args:

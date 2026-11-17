@@ -166,7 +166,7 @@ def test_unfitted_pipeline_raises() -> None:
 
 def test_fit_rejects_a_bare_path(train_files: list[str]) -> None:
     with pytest.raises(TypeError, match="wrap it in a list"):
-        _build_pipeline().fit(train_files[0])
+        _build_pipeline().fit(train_files[0])  # ty: ignore[invalid-argument-type]
 
 
 def test_duplicate_step_names_rejected() -> None:
