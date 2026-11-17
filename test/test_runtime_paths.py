@@ -386,6 +386,74 @@ def test_parquet_dictionary_indices_outside_a_nested_dictionary_are_refused(tmp_
         parquet_to_memmap([corrupt], output_dir=tmp_path / "converted")
 
 
+def _repeating_page_table(layout: str) -> tuple[pa.Table, bytes, bytes, dict[str, Any]]:
+    """A table whose string column 'c' is written in a dictionary page, and how to make that page repeat a value.
+
+    Args:
+        layout: "last value unused", "last value used", "list" or "plain pages after".
+
+    Returns:
+        The table; the value of the page to overwrite and the value, of the same length, to overwrite it with; and
+        the options for pq.write_table.
+    """
+    entries = pa.array(_NESTED_ENTRIES)
+    if layout == "plain pages after":
+        # 3,000 values, each its own: the 600-byte page holds the first few
+        # dozen, and the plain pages that hold the rest add more new values to
+        # the reader's dictionary than the page repeats.
+        strings = pa.array([f"u{row:04d}" for row in range(3000)])
+        options = {"dictionary_pagesize_limit": 600, "write_batch_size": 50, "data_page_size": 400}
+        return pa.table({"c": strings, "x": np.arange(3000.0)}), b"u0001", b"u0000", options
+    # The 13 entries are written to the page whether a row uses them or not.
+    used = 13 if layout == "last value used" else 12
+    strings = pa.DictionaryArray.from_arrays(pa.array([i % used for i in range(240)], pa.int32()), entries)
+    if layout == "list":
+        strings = pa.ListArray.from_arrays(pa.array(range(0, 241, 3), pa.int32()), strings)
+    return pa.table({"c": strings, "x": np.arange(float(len(strings)))}), b"bb", b"aa", {}
+
+
+# REGRESSION: Arrow's reader of strings as a dictionary keeps each value of a
+# dictionary page once and the indices as they stand, so a page that holds a
+# value twice used to shift every value after the repeat. That passed without
+# an error while no row used the page's last value, or while plain pages
+# after the page added new values, and failed as an index outside the
+# dictionary otherwise.
+@pytest.mark.parametrize("layout", ["last value unused", "last value used", "list", "plain pages after"])
+def test_parquet_dictionary_page_that_repeats_a_value_is_refused(tmp_path: Path, layout: str) -> None:
+    table, old, new, options = _repeating_page_table(layout)
+    clean, corrupt = tmp_path / "clean.parquet", tmp_path / "corrupt.parquet"
+    pq.write_table(table, clean, compression="NONE", write_statistics=False, store_schema=False, **options)
+    chunk = pq.ParquetFile(clean).metadata.row_group(0).column(0)
+    # A PLAIN value is its length in 4 little-endian bytes, then its bytes.
+    page = slice(chunk.dictionary_page_offset, chunk.data_page_offset)
+    data = bytearray(clean.read_bytes())
+    value = len(old).to_bytes(4, "little") + old
+    assert bytes(data[page]).count(value) == 1
+    at = page.start + bytes(data[page]).index(value) + 4
+    data[at : at + len(new)] = new
+    corrupt.write_bytes(bytes(data))
+    # pyarrow's plain read looks every index up in the page itself.
+    held = pq.read_table(corrupt).column("c").to_pylist()
+    assert held != table.column("c").to_pylist()
+
+    model = Pipeline([("s", StandardScaler(columns=["x"]))]).fit([clean])
+    (part,) = model.transform_parquet([clean], output_dir=tmp_path / "clean-out")
+    assert pq.read_table(part).column("c").to_pylist() == table.column("c").to_pylist()
+    message = f"{corrupt}: failed to read row group 0: column 'c' has a dictionary page that repeats a value"
+    with pytest.raises(EngineError, match=re.escape(message)):
+        model.transform_parquet([corrupt], output_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+    with pytest.raises(EngineError, match=re.escape(message)):
+        Pipeline([("keep", Select(["c", "x"])), ("s", StandardScaler(columns=["x"]))]).fit([corrupt])
+    if layout == "list":
+        return
+    encoder = OrdinalEncoder(columns=["c"]).fit([clean])
+    with pytest.raises(EngineError, match=re.escape(message)):
+        encoder.transform_memmap([corrupt], output_dir=tmp_path / "memmap")
+    with pytest.raises(EngineError, match=re.escape(message)):
+        CountEncoder(columns=["c"]).fit([corrupt])
+
+
 # REGRESSION: EngineError was raised from a C string, so a message ended at a
 # NUL byte in a name, and one holding a byte that is not UTF-8, here a Parquet
 # column name, surfaced as UnicodeDecodeError instead.
