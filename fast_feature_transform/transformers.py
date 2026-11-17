@@ -609,9 +609,8 @@ class Transformer:
         # changed size during iteration") or, on the free-threaded build,
         # crashed the process.
         state: dict[str, Any] = self.__dict__.copy()
-        state.pop("_binding", None)
+        binding: _Binding | None = state.pop("_binding", None)
         state.pop("_state_cache", None)
-        binding: _Binding | None = self._binding
         if binding is not None and binding[2]:
             state["_manifest"] = _cached_manifest(binding[0])
             state["_stage_name"] = binding[1]
@@ -673,14 +672,43 @@ class Transformer:
     def _state(self) -> dict[str, Any]:
         """Read this transformer's fitted state from the C++ core (once per binding).
 
+        A reader that takes two values from the state takes both from the
+        dict this returns, so that a refit on another thread between them
+        cannot give it one value from each fit.
+
+        Returns:
+            The fitted state as a plain dict.
+
+        Raises:
+            RuntimeError: If the transformer has not been fitted.
+
+        """
+        # A cached state is returned here rather than through _state_of:
+        # the two calls made a cached fitted attribute read take 81 ns
+        # instead of 59 ns (Apple M4, one thread). An unfitted transformer
+        # goes through _require_binding for its error.
+        binding: _Binding | None = self._binding
+        cached: tuple[_Binding, dict[str, Any]] | None = self._state_cache
+        if cached is not None and cached[0] is binding:
+            return cached[1]
+        return self._state_of(self._require_binding() if binding is None else binding)
+
+    def _state_of(self, binding: _Binding) -> dict[str, Any]:
+        """Read the fitted state of one binding of this transformer (once per binding).
+
+        A reader that also uses the handle or the stage name passes the
+        binding it took them from, so that the state belongs to the same fit.
+
+        Args:
+            binding: A binding read from this transformer.
+
         Returns:
             The fitted state as a plain dict.
 
         """
         cached: tuple[_Binding, dict[str, Any]] | None = self._state_cache
-        if cached is not None and cached[0] is self._binding:
+        if cached is not None and cached[0] is binding:
             return cached[1]
-        binding: _Binding = self._require_binding()
         handle, stage, _ = binding
         state: dict[str, Any] = json.loads(handle.stage_state(stage))
         self._state_cache = (binding, state)
@@ -771,16 +799,17 @@ class LabelEncoder(Transformer):
             RuntimeError: If the encoder is not fitted.
 
         """
-        handle, stage, _ = self._require_binding()
+        binding: _Binding = self._require_binding()
         if not isinstance(column, str):
             # Preserve Python dict key semantics for unusual invalid arguments.
-            return self._state()["vocab_sizes"][column]
+            return self._state_of(binding)["vocab_sizes"][column]
+        handle, stage, _ = binding
         try:
             return handle.vocab_size(stage, column)
         except _core.EngineError:
             # A column this encoder does not encode raises KeyError, as its
-            # docstring says, from a lookup in the materialized state.
-            return self._state()["vocab_sizes"][column]
+            # docstring says, from a lookup in the state of the same fit.
+            return self._state_of(binding)["vocab_sizes"][column]
 
 
 TYPE_TAGS: frozenset[str] = frozenset({"utf8", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"})
@@ -2735,8 +2764,12 @@ class MinMaxScaler(_Scaler):
             Mapping of column name to its range.
 
         """
-        highs: dict[str, float] = self.data_max_
-        return {column: highs[column] - low for column, low in self.data_min_.items()}
+        # REGRESSION: both bounds come from one read of the state. They used
+        # to be read through data_max_ and then data_min_, so a refit on
+        # another thread between the two gave a range of neither fit.
+        state: dict[str, Any] = self._state()
+        highs: dict[str, float] = state["data_max"]
+        return {column: highs[column] - low for column, low in state["data_min"].items()}
 
     @property
     def min_(self) -> dict[str, float]:
