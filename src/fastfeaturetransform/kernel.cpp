@@ -72,6 +72,9 @@ std::unique_ptr<Kernel> make_kernel(const std::string& id, const nlohmann::json&
   // constructor reads the names it knows and never looks at another one, so
   // a misspelled name would otherwise leave its parameter at the default. A
   // manifest's params were written by params(), so a saved pipeline passes.
+  // Cast has one required parameter. Rebuilding its entire column-to-type
+  // table to check that single name costs as much as reading it.
+  if (id == "cast" && params.size() == 1 && params.contains("types")) return kernel;
   if (params.is_object()) {
     const nlohmann::json accepted = kernel->params();
     for (const auto& [name, value] : params.items()) {

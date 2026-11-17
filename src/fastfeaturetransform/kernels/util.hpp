@@ -56,6 +56,16 @@ struct TransparentStringEqual {
     return true;
   }
 
+  // Most fields in a scan miss. For long names, compare the ends before
+  // calling memcmp on the middle. The cursor and hash maps usually hit.
+  static bool scan_match(std::string_view field, std::string_view wanted) noexcept {
+    const std::size_t size = wanted.size();
+    if (size != field.size()) return false;
+    if (size > 16)
+      return same_ends<uint64_t>(field, wanted) && std::memcmp(field.data() + 8, wanted.data() + 8, size - 16) == 0;
+    return TransparentStringEqual{}(field, wanted);
+  }
+
  private:
   template <typename Word>
   static bool same_ends(std::string_view left, std::string_view right) noexcept {
@@ -114,7 +124,7 @@ class RecordLookup {
     const std::string_view wanted = name;
     if (next_ < row_.size() && same(row_[next_].first, wanted)) return &row_[next_++].second;
     for (std::size_t i = 0; i < row_.size(); ++i) {
-      if (same(row_[i].first, wanted)) {
+      if (TransparentStringEqual::scan_match(row_[i].first, wanted)) {
         next_ = i + 1;
         return &row_[i].second;
       }
