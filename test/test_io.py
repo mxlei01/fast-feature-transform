@@ -189,9 +189,25 @@ def test_transform_parquet_replaces_stale_parts(tmp_path: Path) -> None:
     encoder: LabelEncoder = LabelEncoder(columns=["device"]).fit([big])
     out: Path = tmp_path / "out"
     assert len(encoder.transform_parquet([big], output_dir=out)) == 2
+    (out / "part-000001.parquet").touch()
+    (out / "part-100000.parquet.tmp").touch()
     parts: list[Path] = encoder.transform_parquet([small], output_dir=out)
     assert sorted(os.listdir(out)) == [part.name for part in parts] == ["part-00000.parquet"]
     assert pq.read_table(str(out)).num_rows == 1
+
+
+def test_output_statistics_use_only_values_in_the_row_group(tmp_path: Path) -> None:
+    values = ["a"] + ["z" if i % 2 else None for i in range(1, 65_636)]
+    table = pa.table({"s": values, "tags": [[value] for value in values], "pair": [{"s": value} for value in values]})
+    source = write_parquet(tmp_path / "input.parquet", table)
+    parts = Select(columns=table.column_names).fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    file = pq.ParquetFile(parts[0])
+    assert file.num_row_groups > 1
+    for group in range(file.num_row_groups):
+        nonnull = file.read_row_group(group).column("s").drop_null().to_pylist()
+        for leaf in range(3):
+            stats = file.metadata.row_group(group).column(leaf).statistics
+            assert (stats.min, stats.max) == (min(nonnull), max(nonnull))
 
 
 def test_transform_parquet_refuses_a_source_inside_the_output_dir(tmp_path: Path) -> None:
