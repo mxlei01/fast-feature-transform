@@ -353,9 +353,8 @@ std::vector<std::string> schema_delta(const Schema& before, const Schema& after)
   return delta;
 }
 
-// Exactly the shape write_part emits — part-NNNNN.parquet, optionally .tmp —
-// so a directory holding other writers' parts (Spark's
-// part-00000-<uuid>-c000.snappy.parquet) never loses them.
+// Match only this writer's part names, including temporary files. Part
+// numbers have at least five digits. Other writers' parts stay in place.
 bool is_part_file(const std::filesystem::path& path) {
   std::string name = path.filename().string();
   if (name.ends_with(".tmp")) name.resize(name.size() - 4);
@@ -622,7 +621,8 @@ std::vector<std::string> FittedPipeline::transform_batch(const std::vector<std::
   std::vector<std::unique_ptr<PartWriter>> writers(n_threads);
   const Sink sink{[&](unsigned worker, std::size_t task, int64_t, const Batch& batch) {
                     if (!writers[worker])
-                      writers[worker] = std::make_unique<PartWriter>(output_dir, task, source->task_rows()[task]);
+                      writers[worker] =
+                          std::make_unique<PartWriter>(output_dir, task, task_rows[task], paths.size() - 1);
                     writers[worker]->append(batch);
                   },
                   [&](unsigned worker, std::size_t task) {

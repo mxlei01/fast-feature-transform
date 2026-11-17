@@ -2,6 +2,7 @@
 
 #include <arrow/api.h>
 #include <arrow/array/array_dict.h>
+#include <arrow/array/concatenate.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
 #include <arrow/chunked_array.h>
@@ -26,7 +27,6 @@
 #include <bit>
 #include <cctype>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -469,17 +469,35 @@ std::shared_ptr<arrow::Array> take_entries(const arrow::Array& entries, const st
 // it is not followed, and the row is written with index 0. When a row's
 // index lies outside the dictionary the column stays as it is; the reader
 // refuses such a batch before this (check_dictionary_indices).
-std::shared_ptr<arrow::Array> trim_dictionary(const std::shared_ptr<arrow::Array>& column, const std::string& name) {
+std::shared_ptr<arrow::Array> trim_dictionary(const std::shared_ptr<arrow::Array>& column, const std::string& name,
+                                              bool for_statistics = false) {
   if (column->type_id() != arrow::Type::DICTIONARY) return column;
   const auto& array = static_cast<const arrow::DictionaryArray&>(*column);
   const arrow::Array& entries = *array.dictionary();
   const arrow::ArrayData& indices = *array.indices()->data();
   const int64_t rows = column->length();
-  if (entries.length() <= rows - column->null_count() || indices.type->id() != arrow::Type::INT32 ||
+  if ((!for_statistics && entries.length() <= rows - column->null_count()) || entries.length() == 0 ||
+      (for_statistics && entries.null_count() != 0) || indices.type->id() != arrow::Type::INT32 ||
       !arrow::is_base_binary_like(entries.type_id()) || array.dict_type()->ordered()) {
     return column;
   }
   const int32_t* values = indices.GetValues<int32_t>(1);
+  if (for_statistics && entries.length() <= rows - column->null_count()) {
+    // Low-cardinality columns usually cover the whole dictionary within
+    // the first few rows. Keep their existing buffers and numbering.
+    int64_t missing = entries.length();
+    std::vector<bool> seen(static_cast<std::size_t>(missing));
+    for (int64_t row = 0; row < rows; ++row) {
+      if (column->IsNull(row)) continue;
+      const int32_t index = values[row];
+      if (index < 0 || index >= entries.length()) return column;
+      const auto slot = static_cast<std::size_t>(index);
+      if (!seen[slot]) {
+        seen[slot] = true;
+        if (--missing == 0) return column;
+      }
+    }
+  }
   // Visits the rows that hold a value, a run of them at a time, so a batch
   // of mostly nulls costs its values, not its rows.
   const uint8_t* validity = column->null_bitmap_data();
@@ -540,6 +558,48 @@ std::shared_ptr<arrow::Array> trim_dictionary(const std::shared_ptr<arrow::Array
       column->null_count());
   data->dictionary = kept->data();
   return arrow::MakeArray(data);
+}
+
+bool has_nullable_dictionary(const arrow::ArrayData& data) {
+  if (data.type->id() == arrow::Type::DICTIONARY) return data.GetNullCount() != 0;
+  return std::any_of(data.child_data.begin(), data.child_data.end(),
+                     [](const auto& child) { return has_nullable_dictionary(*child); });
+}
+
+std::shared_ptr<arrow::ArrayData> trim_children(const std::shared_ptr<arrow::ArrayData>& data,
+                                                const std::string& name) {
+  if (data->type->id() == arrow::Type::DICTIONARY) {
+    return trim_dictionary(arrow::MakeArray(data), name, true)->data();
+  }
+  if (data->child_data.empty()) return data;
+  auto result = data->Copy();
+  for (auto& child : result->child_data) child = trim_children(child, name);
+  return result;
+}
+
+// Arrow counts null among the distinct indices used for Parquet statistics.
+// If one row is null, trim every chunk before unifying their dictionaries:
+// an unused entry from any chunk could become the reported minimum or maximum.
+std::shared_ptr<arrow::ChunkedArray> trim_for_statistics(const std::shared_ptr<arrow::ChunkedArray>& column,
+                                                         const std::string& name) {
+  const auto& chunks = column->chunks();
+  if (!std::any_of(chunks.begin(), chunks.end(),
+                   [](const auto& chunk) { return has_nullable_dictionary(*chunk->data()); })) {
+    return column;
+  }
+  arrow::ArrayVector trimmed;
+  for (const auto& chunk : chunks) {
+    if (chunk->data()->child_data.empty()) {
+      trimmed.push_back(trim_dictionary(chunk, name, true));
+    } else {
+      // A sliced list or struct can share its children with rows outside
+      // this chunk. Gather only the ranges that belong to these rows.
+      auto gathered = arrow::Concatenate({chunk});
+      if (!gathered.ok()) throw Error("column '" + name + "': " + gathered.status().ToString());
+      trimmed.push_back(arrow::MakeArray(trim_children((*gathered)->data(), name)));
+    }
+  }
+  return std::make_shared<arrow::ChunkedArray>(std::move(trimmed), column->type());
 }
 
 // A string_view column as large_string, which every kernel and cast read.
@@ -967,30 +1027,33 @@ struct PartWriter::Impl {
       auto combined = arrow::ConcatenateTables(pending);
       if (!combined.ok()) throw Error(path + ": " + combined.status().ToString());
       group = *combined;
-      // The Parquet writer keeps a column's dictionary through a row group
-      // only while every batch brings an equal one. When a batch brings
-      // another, it writes the rest of the row group's values plain, and
-      // batches do differ: a column read from plain pages comes with a
-      // dictionary that grows from batch to batch. So the batches of a row
-      // group are given one dictionary first. A column goes to the writer as
-      // it came in three cases: a null row of it holds an index outside its
-      // dictionary, which the unifier would follow; its index type is too
-      // narrow to count the entries of the one dictionary; or its dictionary
-      // holds a null, which the Parquet writer then refuses, as it does in a
-      // row group of one batch.
-      arrow::ChunkedArrayVector columns = group->columns();
-      for (std::shared_ptr<arrow::ChunkedArray>& column : columns) {
-        const arrow::ArrayVector& chunks = column->chunks();
-        if (!std::all_of(chunks.begin(), chunks.end(), [](const std::shared_ptr<arrow::Array>& chunk) {
-              return indices_inside_dictionaries(*chunk->data());
-            })) {
-          continue;
-        }
-        auto unified = arrow::DictionaryUnifier::UnifyChunkedArray(column);
-        if (unified.ok()) column = *unified;
-      }
-      group = arrow::Table::Make(group->schema(), std::move(columns), pending_rows);
     }
+    // The Parquet writer keeps a column's dictionary through a row group
+    // only while every batch brings an equal one. When a batch brings
+    // another, it writes the rest of the row group's values plain, and
+    // batches do differ: a column read from plain pages comes with a
+    // dictionary that grows from batch to batch. So the batches of a row
+    // group are given one dictionary first. A column goes to the writer as
+    // it came in three cases: a null row of it holds an index outside its
+    // dictionary, which the unifier would follow; its index type is too
+    // narrow to count the entries of the one dictionary; or its dictionary
+    // holds a null, which the Parquet writer then refuses, as it does in a
+    // row group of one batch.
+    arrow::ChunkedArrayVector columns = group->columns();
+    for (int i = 0; i < group->num_columns(); ++i) {
+      auto& column = columns[static_cast<std::size_t>(i)];
+      column = trim_for_statistics(column, group->field(i)->name());
+      if (pending.size() == 1) continue;
+      const arrow::ArrayVector& chunks = column->chunks();
+      if (!std::all_of(chunks.begin(), chunks.end(), [](const std::shared_ptr<arrow::Array>& chunk) {
+            return indices_inside_dictionaries(*chunk->data());
+          })) {
+        continue;
+      }
+      auto unified = arrow::DictionaryUnifier::UnifyChunkedArray(column);
+      if (unified.ok()) column = *unified;
+    }
+    group = arrow::Table::Make(group->schema(), std::move(columns), pending_rows);
     const auto status = writer->WriteTable(*group, pending_rows);
     if (!status.ok()) throw Error(path + ": " + status.ToString());
     pending.clear();
@@ -999,12 +1062,13 @@ struct PartWriter::Impl {
   }
 };
 
-PartWriter::PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows)
+PartWriter::PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows, std::size_t last_index)
     : impl_(std::make_unique<Impl>()) {
   if (expected_rows < 0) throw Error(dir + ": expected row count must not be negative");
-  char name[32];
-  std::snprintf(name, sizeof(name), "part-%05zu.parquet", index);
-  impl_->path = dir + "/" + name;
+  std::string digits = std::to_string(index);
+  const std::size_t width = std::max<std::size_t>(5, std::to_string(last_index).size());
+  if (digits.size() < width) digits.insert(0, width - digits.size(), '0');
+  impl_->path = dir + "/part-" + digits + ".parquet";
   impl_->temp = impl_->path + ".tmp";
   impl_->expected_rows = expected_rows;
 }

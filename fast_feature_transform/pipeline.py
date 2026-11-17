@@ -347,8 +347,10 @@ class Pipeline:
             X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
                 is created when omitted and removed with its files if the call raises.
-                Existing ``part-NNNNN.parquet`` files in it are replaced once
+                Existing numbered ``part-*.parquet`` files are replaced once
                 the run starts, and a run that fails midway leaves none.
+                Each number has the width of the last part number,
+                with at least five digits.
 
         Returns:
             The paths of the part files written, one per input row group, in

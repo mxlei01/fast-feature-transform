@@ -116,7 +116,7 @@ class ParquetSource final : public RecordBatchSource {
 // bytes.
 class PartWriter {
  public:
-  PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows);
+  PartWriter(const std::string& dir, std::size_t index, int64_t expected_rows, std::size_t last_index = 0);
   ~PartWriter();
   PartWriter(const PartWriter&) = delete;
   PartWriter& operator=(const PartWriter&) = delete;

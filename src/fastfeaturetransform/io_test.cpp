@@ -1514,6 +1514,20 @@ TEST_CASE("write_part refuses rows without columns") {
   REQUIRE_THROWS_WITH(fft::write_part(dir.path.string(), 0, batch), ContainsSubstring("no columns"));
 }
 
+TEST_CASE("part names sort in task order across decimal widths") {
+  TempDir dir;
+  const fft::Batch row = make_batch({"x"}, {f64_column({1})});
+  const auto write = [&](std::size_t index, std::size_t last) {
+    fft::PartWriter writer(dir.path.string(), index, 1, last);
+    writer.append(row);
+    return std::filesystem::path(writer.finish()).filename().string();
+  };
+  REQUIRE(write(0, 99999) == "part-00000.parquet");
+  REQUIRE(write(0, 100000) == "part-000000.parquet");
+  REQUIRE(write(99999, 100000) == "part-099999.parquet");
+  REQUIRE(write(100000, 100000) == "part-100000.parquet");
+}
+
 TEST_CASE("PartWriter writes its batches as one ordered part and keeps one only until its row group is written") {
   TempDir dir;
   fft::PartWriter writer(dir.path.string(), 7, 5);
