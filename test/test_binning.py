@@ -534,3 +534,15 @@ def test_a_fitted_table_naming_no_columns_is_refused(prices: list[str], tmp_path
         del dropped_list["ops"][0]["state"]["columns"]
         with pytest.raises(EngineError, match="state must hold a 'columns' list"):
             _core.FittedPipeline.load_json(json.dumps(dropped_list))
+
+
+def test_kbins_quantile_refuses_extreme_finite_span_overflow(tmp_path: Path) -> None:
+    """An extreme finite span whose linear quantile overflows is refused instead of dropping a bin.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    source: str = write_parquet(tmp_path / "extreme.parquet", pa.table({"x": [-1e308, -1e308, 1e308, 1e308]}))
+    with pytest.raises(EngineError, match="bin edge that is not finite"):
+        KBinsDiscretizer(columns=["x"], n_bins=2, strategy="quantile", quantile_method="linear").fit([source])

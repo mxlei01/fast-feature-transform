@@ -3451,7 +3451,7 @@ class PolynomialFeatures(Transformer):
                 or a pair of them, or a flag is not a bool.
             ValueError: If columns is empty, a column name would make a
                 generated name ambiguous, degree is negative or inverted,
-                degree 0 is asked for without a bias, or the expansion would
+                the combination generates no columns, or the expansion would
                 be wider than ``MAX_OUTPUTS`` (4096) columns.
 
         """
@@ -3469,6 +3469,11 @@ class PolynomialFeatures(Transformer):
         if maximum == 0 and not include_bias:
             raise ValueError("PolynomialFeatures: degree 0 with include_bias False would generate no columns")
         names: list[str] = _monomial_names(self.columns, self.degree, self.interaction_only, self.include_bias)
+        if not names:
+            raise ValueError(
+                f"PolynomialFeatures: {len(self.columns)} columns with degree {self.degree!r}, "
+                "interaction_only True and include_bias False would generate no columns"
+            )
         if include_bias and "1" in names[1:]:
             raise ValueError(
                 "PolynomialFeatures: column '1' has the bias column's name; rename it or set include_bias=False"

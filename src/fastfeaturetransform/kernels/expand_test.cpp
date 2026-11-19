@@ -1077,3 +1077,52 @@ TEST_CASE("polynomial suffix reuse distinguishes a source named 1 from the bias"
     REQUIRE(std::get<double>(*fft::row_find(row, "1^2")) == value * value);
   }
 }
+
+TEST_CASE("polynomial_features refuses interaction_only ranges that generate no columns") {
+  REQUIRE_THROWS_WITH(
+      (fft::make_kernel(
+          "polynomial_features",
+          {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", false}})),
+      ContainsSubstring("would generate no columns"));
+  // With a bias column, the same range still emits the constant column "1".
+  auto bias_only = fft::make_kernel(
+      "polynomial_features",
+      {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", true}});
+  REQUIRE(bias_only->outputs == std::vector<std::string>{"1"});
+}
+
+TEST_CASE("spline_transform extrapolates degree 0 and tied boundary knots faithfully") {
+  const fft::Schema schema{{{"x", "f64"}}};
+
+  // degree=0 with extrapolation="constant" holds the boundary basis functions.
+  auto zero_const =
+      fitted("spline_transform", {{"columns", {"x"}}, {"n_knots", 5}, {"degree", 0}, {"extrapolation", "constant"}},
+             schema, {make_batch({"x"}, {f64_column({0.0, 1.0, 2.0, 3.0, 4.0})})});
+  const fft::Batch zero_out = zero_const->transform(make_batch({"x"}, {f64_column({-1.0, 0.0, 4.0, 5.0})}));
+  REQUIRE(column_of(zero_out, "x_sp_0") == std::vector<double>{1.0, 1.0, 0.0, 0.0});
+  REQUIRE(column_of(zero_out, "x_sp_1") == std::vector<double>{0.0, 0.0, 0.0, 0.0});
+  REQUIRE(column_of(zero_out, "x_sp_2") == std::vector<double>{0.0, 0.0, 0.0, 0.0});
+  REQUIRE(column_of(zero_out, "x_sp_3") == std::vector<double>{0.0, 0.0, 1.0, 1.0});
+  auto low_row = zero_const->transform_row({{"x", -1.0}});
+  REQUIRE(std::get<double>(*fft::row_find(low_row, "x_sp_0")) == 1.0);
+  auto high_row = zero_const->transform_row({{"x", 5.0}});
+  REQUIRE(std::get<double>(*fft::row_find(high_row, "x_sp_3")) == 1.0);
+
+  // Quantile knots [0, 0, 0, 0, 4] at degree=3 place the non-zero boundary
+  // basis function at index 3 (>= degree) with slope -3/4.
+  std::vector<double> skewed(10, 0.0);
+  skewed.push_back(4.0);
+  for (const std::string mode : {"constant", "linear"}) {
+    CAPTURE(mode);
+    auto tied =
+        fitted("spline_transform",
+               {{"columns", {"x"}}, {"n_knots", 5}, {"degree", 3}, {"knots", "quantile"}, {"extrapolation", mode}},
+               schema, {make_batch({"x"}, {f64_column(skewed)})});
+    const fft::Batch out = tied->transform(make_batch({"x"}, {f64_column({-1.0, 0.0})}));
+    const double expected_extrap = mode == "constant" ? 1.0 : 1.0 + (-1.0) * (-0.75);
+    REQUIRE(column_of(out, "x_sp_3")[0] == Catch::Approx(expected_extrap));
+    REQUIRE(column_of(out, "x_sp_3")[1] == Catch::Approx(1.0));
+    auto row = tied->transform_row({{"x", -1.0}});
+    REQUIRE(std::get<double>(*fft::row_find(row, "x_sp_3")) == Catch::Approx(expected_extrap));
+  }
+}

@@ -159,6 +159,9 @@ def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_pat
         PolynomialFeatures(columns=["a"], degree=(3, 2))
     with pytest.raises(ValueError, match="degree 0 with include_bias False"):
         PolynomialFeatures(columns=["a"], degree=0, include_bias=False)
+    with pytest.raises(ValueError, match="would generate no columns"):
+        PolynomialFeatures(columns=["a", "b"], degree=(3, 4), interaction_only=True, include_bias=False)
+    assert PolynomialFeatures(columns=["a", "b"], degree=(3, 4), interaction_only=True).output_columns == ["1"]
     with pytest.raises(TypeError, match="interaction_only must be True or False"):
         PolynomialFeatures(columns=["a"], interaction_only=not_a_flag)
     with pytest.raises(TypeError, match="include_bias must be True or False"):
@@ -517,3 +520,40 @@ def test_spline_knots_do_not_depend_on_the_row_group_split(tmp_path: Path) -> No
             states.add(json.dumps(fitted._state(), sort_keys=True))
     assert len(states) == 1, states
     assert "-0.0" not in states.pop()
+
+
+def test_spline_extrapolation_holds_boundary_basis_for_degree_zero_and_tied_knots(tmp_path: Path) -> None:
+    """Constant and linear extrapolation keep non-zero boundary functions at degree 0 and tied knots.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    uniform: str = write_parquet(tmp_path / "uniform.parquet", pa.table({"x": [0.0, 1.0, 2.0, 3.0, 4.0]}))
+    zero_deg: SplineTransformer = SplineTransformer(columns=["x"], n_knots=5, degree=0, extrapolation="constant").fit(
+        [uniform]
+    )
+    probe: str = write_parquet(tmp_path / "probe.parquet", pa.table({"x": [-1.0, 0.0, 4.0, 5.0]}))
+    expected_zero: list[dict[str, float]] = [
+        {"x_sp_0": 1.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 0.0},
+        {"x_sp_0": 1.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 0.0},
+        {"x_sp_0": 0.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 1.0},
+        {"x_sp_0": 0.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 1.0},
+    ]
+    assert read_rows(zero_deg.transform_parquet([probe], output_dir=tmp_path / "zero-out")) == expected_zero
+    assert [zero_deg.transform_dict({"x": value}) for value in (-1.0, 0.0, 4.0, 5.0)] == expected_zero
+
+    skewed: str = write_parquet(tmp_path / "skewed.parquet", pa.table({"x": [0.0] * 10 + [4.0]}))
+    skewed_probe: str = write_parquet(tmp_path / "skewed-probe.parquet", pa.table({"x": [-1.0, 0.0]}))
+    for mode, expected_low in (("constant", 1.0), ("linear", 1.75)):
+        tied: SplineTransformer = SplineTransformer(
+            columns=["x"], n_knots=5, degree=3, knots="quantile", extrapolation=mode
+        ).fit([skewed])
+        assert tied.knots_ == {"x": [0.0, 0.0, 0.0, 0.0, 4.0]}
+        rows: list[dict[str, Any]] = read_rows(
+            tied.transform_parquet([skewed_probe], output_dir=tmp_path / f"tied-{mode}")
+        )
+        assert rows[0]["x_sp_3"] == pytest.approx(expected_low)
+        assert rows[1]["x_sp_3"] == pytest.approx(1.0)
+        assert tied.transform_dict({"x": -1.0})["x_sp_3"] == pytest.approx(expected_low)
+        assert tied.transform_dict({"x": 0.0})["x_sp_3"] == pytest.approx(1.0)
