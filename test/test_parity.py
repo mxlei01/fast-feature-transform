@@ -118,8 +118,10 @@ def _same(ours: Any, theirs: Any, tolerance: float | None = None, relative: floa
     return float(ours) == float(theirs)
 
 
-def _assert_ordered_schema(ours: list[str], source: list[str], expected: list[str], where: str) -> None:
-    """Assert our output columns are the case's, in order, with nothing extra.
+def _assert_ordered_schema(
+    ours: list[str], source: list[str], expected: list[str], expected_survivors: set[str], where: str
+) -> None:
+    """Assert our output columns are the case's, in order, with nothing extra or dropped.
 
     Two ordered sequences pin the frame: the columns a step passes through keep
     the order the input had them in, and the columns a step generates keep the
@@ -134,11 +136,12 @@ def _assert_ordered_schema(ours: list[str], source: list[str], expected: list[st
         ours: Our output column names, in output order.
         source: The transformed dataset's column names, in input order.
         expected: The library's output column names, in its order.
+        expected_survivors: Source columns expected to survive into the output.
         where: The case name, for the assertion message.
 
     """
     generated: list[str] = [name for name in expected if name not in source]
-    survivors: list[str] = [name for name in source if name in set(ours)]
+    survivors: list[str] = [name for name in source if name in expected_survivors]
     assert set(ours) == set(generated) | set(survivors), f"{where}: output columns differ"
     assert [name for name in ours if name in set(generated)] == generated, f"{where}: generated columns out of order"
     assert [name for name in ours if name in set(survivors)] == survivors, f"{where}: pass-through columns out of order"
@@ -212,8 +215,9 @@ def test_matches_category_encoders(case: dict[str, Any], tmp_path: Path) -> None
     # is in our output and never in the library's; it passes through in place,
     # so the ordered check counts it among the source columns.
     target: set[str] = {case["target"]} if "target" in case else set()
-    assert set(rows[0]) - target == set(expected), "output columns differ"
-    _assert_ordered_schema(list(rows[0]), list(source), list(expected), case["name"])
+    assert set(rows[0]) == set(expected) | target, "output columns differ"
+    expected_survivors: set[str] = (set(expected) | target) & set(source)
+    _assert_ordered_schema(list(rows[0]), list(source), list(expected), expected_survivors, case["name"])
     for column, values in expected.items():
         got: list[Any] = [row[column] for row in rows]
         assert len(got) == len(values)
@@ -255,9 +259,14 @@ def test_matches_sklearn(case: dict[str, Any], tmp_path: Path) -> None:
     source: dict[str, list[Any]] = SKLEARN["datasets"][transform_name]
     # scikit-learn transforms the frame it was handed, so a column the case did
     # not name is ours alone and passes through; every column it did name has
-    # to be here, and a column that is neither is one we invented.
+    # to be here, every untouched source column must survive, and a column that
+    # is neither is one we invented.
     assert set(expected) <= set(rows[0]), "an expected column is missing from our output"
-    _assert_ordered_schema(list(rows[0]), list(source), list(expected), case["name"])
+    transformed_columns: set[str] = (
+        set(case["params"]["columns"]) if case["params"].get("columns") is not None else set(source)
+    )
+    expected_survivors: set[str] = (set(source) - transformed_columns) | (set(expected) & set(source))
+    _assert_ordered_schema(list(rows[0]), list(source), list(expected), expected_survivors, case["name"])
     for column, values in expected.items():
         got: list[Any] = [row[column] for row in rows]
         assert len(got) == len(values)
