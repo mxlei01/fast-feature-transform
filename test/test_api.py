@@ -350,6 +350,14 @@ def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
     unfitted: Pipeline = Pipeline([("select", Select(columns=["x"]))])
     standalone: Select = Select(columns=["x"])
     what, needs_directory, run = _path_call(call, source, unfitted, standalone)
+
+    class _SneakyPath(str):
+        def __bool__(self) -> bool:
+            return True
+
+        def __contains__(self, item: object) -> bool:
+            return False
+
     refused: list[tuple[Any, type[Exception], str]] = [
         (7, TypeError, "must be a str or os.PathLike, got int"),
         (b"tgt", TypeError, "must be a str path, got bytes; decode it with os.fsdecode"),
@@ -357,10 +365,13 @@ def test_a_path_that_names_no_directory_is_refused_before_anything_is_written(
         ("bad\ud800", ValueError, "must be a UTF-8 path, got 'bad\\ud800'"),
         ("new\0junk", ValueError, "must not hold a NUL character, got 'new\\x00junk'"),
         ("kept\0junk", ValueError, "must not hold a NUL character, got 'kept\\x00junk'"),
+        (_SneakyPath("new\0junk"), ValueError, "must not hold a NUL character, got 'new\\x00junk'"),
+        (_PathLike(_SneakyPath("new\0junk")), ValueError, "must not hold a NUL character, got 'new\\x00junk'"),
     ]
     if what != "temp_dir":
         # An empty temp_dir means the system temporary directory, as None does.
         refused.append(("", ValueError, "must not be empty; pass '.' for the current directory"))
+        refused.append((_SneakyPath(""), ValueError, "must not be empty; pass '.' for the current directory"))
     if needs_directory:
         refused.append((None, TypeError, "must be a str or os.PathLike, got NoneType"))
     before: list[str] = _listing(work, temporary)

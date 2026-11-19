@@ -85,11 +85,15 @@ int64_t epoch_microseconds(PyObject* value, const std::string& name) {
   if (!PyDelta_Check(offset.ptr())) {
     throw fastfeaturetransform::Error("record value for '" + name + "' has a utcoffset() that is not a timedelta");
   }
-  const int64_t shift =
-      (int64_t{PyDateTime_DELTA_GET_DAYS(offset.ptr())} * 86'400 + PyDateTime_DELTA_GET_SECONDS(offset.ptr())) *
+  const Int128 shift =
+      (Int128{PyDateTime_DELTA_GET_DAYS(offset.ptr())} * 86'400 + PyDateTime_DELTA_GET_SECONDS(offset.ptr())) *
           1'000'000 +
       PyDateTime_DELTA_GET_MICROSECONDS(offset.ptr());
-  return micros - shift;
+  const Int128 adjusted = Int128{micros} - shift;
+  if (adjusted > std::numeric_limits<int64_t>::max() || adjusted < std::numeric_limits<int64_t>::min()) {
+    throw fastfeaturetransform::Error("record value for '" + name + "' is outside the range of int64 microseconds");
+  }
+  return static_cast<int64_t>(adjusted);
 }
 
 // Microseconds per unit of a numpy datetime64, as a fraction. Days and the

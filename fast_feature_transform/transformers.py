@@ -160,11 +160,12 @@ def _utf8_path(path: object, what: str) -> str:
         raise TypeError(f"{what} must be a str path, got bytes; decode it with os.fsdecode")
     if not isinstance(text, str):
         raise TypeError(f"{what} must be a str or os.PathLike, got {type(path).__name__}")
+    plain: str = str.__str__(text)
     try:
-        str.encode(text, "utf-8")
+        plain.encode("utf-8")
     except UnicodeEncodeError:
-        raise ValueError(f"{what} must be a UTF-8 path, got {text!r}") from None
-    return text
+        raise ValueError(f"{what} must be a UTF-8 path, got {plain!r}") from None
+    return plain
 
 
 def _directory_path(path: object, what: str) -> str:
@@ -825,9 +826,10 @@ class LabelEncoder(Transformer):
         handle, stage, _ = binding
         try:
             return handle.vocab_size(stage, column)
-        except _core.EngineError:
-            # A column this encoder does not encode raises KeyError, as its
-            # docstring says, from a lookup in the state of the same fit.
+        except _core.EngineError, TypeError:
+            # A column this encoder does not encode — or a lone surrogate that
+            # the UTF-8 binding refuses — raises KeyError, as its docstring
+            # says, from a lookup in the state of the same fit.
             return self._state_of(binding)["vocab_sizes"][column]
 
 
