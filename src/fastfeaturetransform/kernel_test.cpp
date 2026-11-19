@@ -1243,3 +1243,17 @@ TEST_CASE("group_agg refuses an integer sum that overflows and non-finite floats
                                                                       {std::numeric_limits<double>::infinity()})})})),
       ContainsSubstring("cannot aggregate NaN or infinity"));
 }
+
+TEST_CASE("group_agg count skips null entries stored inside a dictionary") {
+  // REGRESSION: count_only checked array.IsNull(row) alone, which only tests
+  // the index bitmap and counted rows pointing at a null dictionary entry.
+  auto dict_values = arrow::DictionaryArray::FromArrays(numeric_column<arrow::Int32Type>({0, 1, std::nullopt, 2, 1}),
+                                                        utf8_column({"a", std::nullopt, "b"}));
+  REQUIRE(dict_values.ok());
+  const fft::Schema schema{{{"k", "utf8"}, {"v", "utf8"}}};
+  const nlohmann::json params{{"key", "k"}, {"aggs", {{"v", {"count"}}}}};
+  const auto fitted =
+      fit_group_agg(params, schema, {make_batch({"k", "v"}, {utf8_column({"u", "u", "u", "v", "v"}), *dict_values})});
+  REQUIRE(fitted->state().at("keys") == nlohmann::json({"u", "v"}));
+  REQUIRE(fitted->state().at("values").at("v_count") == nlohmann::json({1, 1}));
+}
