@@ -72,7 +72,7 @@ def test_vocab_size_follows_a_refit_and_survives_a_pickle(tmp_path: Path) -> Non
     assert restored.vocab_size("key") == 3
 
 
-@pytest.mark.parametrize("column", [None, 0, ("key",), [], {}])
+@pytest.mark.parametrize("column", [None, 0, ("key",), "\ud800", [], {}])
 def test_vocab_size_preserves_dictionary_key_errors(tmp_path: Path, column: Any) -> None:
     encoder = LabelEncoder(columns=["key"])
     with pytest.raises(RuntimeError, match="not fitted"):

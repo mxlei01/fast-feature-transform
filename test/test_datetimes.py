@@ -8,7 +8,7 @@ import subprocess  # nosec B404
 import sys
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 import pyarrow as pa
@@ -461,3 +461,28 @@ def test_a_group_agg_saves_a_timestamp_column_as_an_integer(tmp_path: Path) -> N
     loaded_parts: list[Path] = loaded.transform_parquet([source], output_dir=tmp_path / "loaded")
     fresh_parts: list[Path] = fresh.transform_parquet([source], output_dir=tmp_path / "fresh")
     assert pq.read_table(loaded_parts).to_pylist() == pq.read_table(fresh_parts).to_pylist()
+
+
+def test_a_datetime_subclass_with_an_overflowing_utcoffset_is_refused(tmp_path: Path) -> None:
+    # REGRESSION: epoch_microseconds computed the utcoffset shift and
+    # subtraction in signed int64, overflowing on a datetime subclass whose
+    # utcoffset() returned a large timedelta.
+    class LargeOffsetDateTime(datetime):
+        _offset: timedelta
+
+        def __new__(cls, offset: timedelta) -> Self:
+            instance = super().__new__(cls, 2020, 1, 1, tzinfo=UTC)
+            instance._offset = offset
+            return instance
+
+        def utcoffset(self) -> timedelta:
+            return self._offset
+
+    pipeline: Pipeline = _scaler(tmp_path)
+    for offset in (timedelta(days=999_999_999), timedelta(days=-999_999_999)):
+        with pytest.raises(EngineError, match="outside the range of int64 microseconds"):
+            pipeline.transform_dict({"x": 1.0, "t": LargeOffsetDateTime(offset)})
+    # An offset that fits in int64 after subtraction still converts accurately.
+    in_range: timedelta = timedelta(days=100_000)
+    expected: int = (datetime(2020, 1, 1) - in_range - EPOCH) // ONE_US
+    assert pipeline.transform_dict({"x": 1.0, "t": LargeOffsetDateTime(in_range)})["t"] == expected
