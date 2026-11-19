@@ -43,6 +43,7 @@
 #include <numeric>
 #include <optional>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 
@@ -511,18 +512,22 @@ void watch_dictionary_leaves(const parquet::arrow::SchemaField& field, const par
 bool shows_dictionary_page(const arrow::ArrayData& dictionary, const DictionaryChunk& chunk) {
   if (!chunk.last || dictionary.length < chunk.entries) return false;
   const int64_t at = chunk.entries - 1;
-  const auto& data = dictionary.buffers[2];
-  const char* bytes = data && data->data() ? reinterpret_cast<const char*>(data->data()) : "";
   std::string_view value;
   switch (dictionary.type->id()) {
     case arrow::Type::STRING:
     case arrow::Type::BINARY: {
+      if (dictionary.buffers.size() < 3) return false;
+      const auto& data = dictionary.buffers[2];
+      const char* bytes = data && data->data() ? reinterpret_cast<const char*>(data->data()) : "";
       const int32_t* offsets = dictionary.GetValues<int32_t>(1);
       value = std::string_view(bytes + offsets[at], static_cast<std::size_t>(offsets[at + 1] - offsets[at]));
       break;
     }
     case arrow::Type::LARGE_STRING:
     case arrow::Type::LARGE_BINARY: {
+      if (dictionary.buffers.size() < 3) return false;
+      const auto& data = dictionary.buffers[2];
+      const char* bytes = data && data->data() ? reinterpret_cast<const char*>(data->data()) : "";
       const int64_t* offsets = dictionary.GetValues<int64_t>(1);
       value = std::string_view(bytes + offsets[at], static_cast<std::size_t>(offsets[at + 1] - offsets[at]));
       break;
@@ -1529,6 +1534,14 @@ std::string write_part(const std::string& dir, std::size_t index, const Batch& b
   return writer.finish();
 }
 
+namespace {
+
+// Thread-safe errno formatting (std::strerror is not required to be
+// thread-safe, and write_slice / flush_to_disk run on worker threads).
+std::string errno_message(int error) { return std::error_code(error, std::generic_category()).message(); }
+
+}  // namespace
+
 int sync_to_disk(int fd) {
 #ifdef F_FULLFSYNC
   if (::fcntl(fd, F_FULLFSYNC) == 0) return 0;
@@ -1540,14 +1553,15 @@ void flush_to_disk(const std::string& path, bool directory) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (directory ? O_DIRECTORY : 0));
   if (fd < 0 && errno == EACCES && !directory) fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
   if (fd < 0) {
-    if (directory && errno == EACCES) return;
-    throw Error(path + ": cannot open to flush: " + std::strerror(errno));
+    const int error = errno;
+    if (directory && error == EACCES) return;
+    throw Error(path + ": cannot open to flush: " + errno_message(error));
   }
   const int result = sync_to_disk(fd);
   const int error = errno;
   ::close(fd);
   if (result != 0 && !(directory && (error == EINVAL || error == ENOTSUP))) {
-    throw Error(path + ": flush failed: " + std::strerror(error));
+    throw Error(path + ": flush failed: " + errno_message(error));
   }
 }
 
@@ -1730,13 +1744,13 @@ MemmapSink::MemmapSink(const std::string& dir, const Schema& schema, const std::
   std::filesystem::create_directories(dir_, ec);
   if (ec) throw Error(dir_ + ": cannot create output directory: " + ec.message());
   files_->fd = ::open(files_->temp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (files_->fd < 0) throw Error(files_->temp + ": cannot create: " + std::strerror(errno));
+  if (files_->fd < 0) throw Error(files_->temp + ": cannot create: " + errno_message(errno));
   files_->owns_temp = true;
   struct stat info{};
-  if (::fstat(files_->fd, &info) != 0) throw Error(files_->temp + ": cannot inspect: " + std::strerror(errno));
+  if (::fstat(files_->fd, &info) != 0) throw Error(files_->temp + ": cannot inspect: " + errno_message(errno));
   if (!S_ISREG(info.st_mode)) throw Error(files_->temp + ": cannot preallocate: output is not a regular file");
   if (::ftruncate(files_->fd, static_cast<off_t>(rows_) * static_cast<off_t>(itemsize_)) != 0) {
-    throw Error(files_->temp + ": cannot preallocate: " + std::strerror(errno));
+    throw Error(files_->temp + ": cannot preallocate: " + errno_message(errno));
   }
 }
 
@@ -1839,7 +1853,7 @@ void MemmapSink::write_slice(std::size_t task, int64_t row_offset, const Batch& 
       const ssize_t written = ::pwrite(files_->fd, cursor, std::min(remaining, std::size_t{1} << 30), position);
       if (written < 0) {
         if (errno == EINTR) continue;
-        throw Error(temp_path(dir_) + ": write failed: " + std::strerror(errno));
+        throw Error(temp_path(dir_) + ": write failed: " + errno_message(errno));
       }
       if (written == 0) throw Error(temp_path(dir_) + ": write failed: zero-byte write");
       cursor += written;
@@ -1869,11 +1883,11 @@ std::string MemmapSink::finish() {
                                {"byte_order", "little"},
                                {"columns", std::move(columns)}};
     const std::string metadata = index.dump(2);
-    if (sync_to_disk(files.fd) != 0) throw Error(files.temp + ": flush failed: " + std::strerror(errno));
-    if (Files::close(files.fd) != 0) throw Error(files.temp + ": close failed: " + std::strerror(errno));
+    if (sync_to_disk(files.fd) != 0) throw Error(files.temp + ": flush failed: " + errno_message(errno));
+    if (Files::close(files.fd) != 0) throw Error(files.temp + ": close failed: " + errno_message(errno));
 
     files.index_fd = ::open(files.index_temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (files.index_fd < 0) throw Error(files.index_temp + ": cannot write: " + std::strerror(errno));
+    if (files.index_fd < 0) throw Error(files.index_temp + ": cannot write: " + errno_message(errno));
     files.owns_index_temp = true;
     std::size_t offset = 0;
     while (offset < metadata.size()) {
@@ -1881,23 +1895,23 @@ std::string MemmapSink::finish() {
           ::write(files.index_fd, metadata.data() + offset, std::min(metadata.size() - offset, std::size_t{1} << 30));
       if (written < 0) {
         if (errno == EINTR) continue;
-        throw Error(files.index_temp + ": write failed: " + std::strerror(errno));
+        throw Error(files.index_temp + ": write failed: " + errno_message(errno));
       }
       if (written == 0) throw Error(files.index_temp + ": write failed: zero-byte write");
       offset += static_cast<std::size_t>(written);
     }
-    if (sync_to_disk(files.index_fd) != 0) throw Error(files.index_temp + ": flush failed: " + std::strerror(errno));
-    if (Files::close(files.index_fd) != 0) throw Error(files.index_temp + ": close failed: " + std::strerror(errno));
+    if (sync_to_disk(files.index_fd) != 0) throw Error(files.index_temp + ": flush failed: " + errno_message(errno));
+    if (Files::close(files.index_fd) != 0) throw Error(files.index_temp + ": close failed: " + errno_message(errno));
 
     // Publish data first, then its index. The pair is not atomic: an index
     // rename failure leaves the new data in place. Release each temporary
     // immediately so later cleanup cannot unlink a subsequent writer's file.
     if (::rename(files.temp.c_str(), files.data.c_str()) != 0) {
-      throw Error(files.data + ": " + std::strerror(errno));
+      throw Error(files.data + ": " + errno_message(errno));
     }
     files.owns_temp = false;
     if (::rename(files.index_temp.c_str(), files.index.c_str()) != 0) {
-      throw Error(files.index + ": " + std::strerror(errno));
+      throw Error(files.index + ": " + errno_message(errno));
     }
     files.owns_index_temp = false;
     flush_to_disk(dir_, true);  // both new names, so they survive once finish returns

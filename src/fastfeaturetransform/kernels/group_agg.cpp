@@ -274,10 +274,20 @@ class GroupAgg final : public Kernel {
         const auto slot = static_cast<std::size_t>(slots[static_cast<std::size_t>(row)]);
         return state.buffers[slot * medians_ + static_cast<std::size_t>(column.median)];
       };
-      if (column.count_only) {  // the null bitmap is all it needs, whatever the type
-        for (int64_t row = 0; row < array.length(); ++row) {
-          if (array.IsNull(row)) continue;
-          if (Acc* acc = acc_at(row); acc != nullptr) ++acc->count;
+      if (column.count_only) {  // the null bitmap is all it needs, plus dictionary entries when nullable
+        if (array.type_id() == arrow::Type::DICTIONARY &&
+            static_cast<const arrow::DictionaryArray&>(array).dictionary()->null_count() != 0) {
+          const auto& dictionary = static_cast<const arrow::DictionaryArray&>(array);
+          const arrow::Array& values = *dictionary.dictionary();
+          for (int64_t row = 0; row < array.length(); ++row) {
+            if (array.IsNull(row) || values.IsNull(dictionary.GetValueIndex(row))) continue;
+            if (Acc* acc = acc_at(row); acc != nullptr) ++acc->count;
+          }
+        } else {
+          for (int64_t row = 0; row < array.length(); ++row) {
+            if (array.IsNull(row)) continue;
+            if (Acc* acc = acc_at(row); acc != nullptr) ++acc->count;
+          }
         }
       } else if (column.family == Family::Integer) {
         for_each_integer(array, stage, column.name, [&](int64_t row, bool is_null, int64_t value) {
