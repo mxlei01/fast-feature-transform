@@ -125,6 +125,21 @@ def sink_layout(parts: Iterable[str | Path]) -> list[list[int]]:
     return layout
 
 
+def part_name(index: int, parts: int) -> str:
+    """Format one output part filename using PartWriter's dynamic zero-padded width.
+
+    Args:
+        index: Zero-based part index.
+        parts: Total number of parts in the output directory.
+
+    Returns:
+        Filename such as ``part-00000.parquet`` (or wider past 99,999 parts).
+
+    """
+    width: int = max(5, len(str(max(parts - 1, 0))))
+    return f"part-{index:0{width}d}.parquet"
+
+
 def write_parts(table: pa.Table, directory: Path, layout: Sequence[Sequence[int]]) -> None:
     """Write an Arrow table the way our C++ sink wrote the same transform's output.
 
@@ -156,7 +171,7 @@ def write_parts(table: pa.Table, directory: Path, layout: Sequence[Sequence[int]
     start: int = 0
     for index, row_groups in enumerate(layout):
         with (
-            pa.output_stream(directory / f"part-{index:05d}.parquet", buffer_size=PART_BUFFER_BYTES) as part,
+            pa.output_stream(directory / part_name(index, len(layout)), buffer_size=PART_BUFFER_BYTES) as part,
             pq.ParquetWriter(
                 part,
                 table.schema,

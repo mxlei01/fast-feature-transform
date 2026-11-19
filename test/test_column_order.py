@@ -81,35 +81,37 @@ _SCHEMA: list[str] = [*_TEXT, *_NUMBERS, *_TARGET]
 
 # Every transformer whose `columns` may be None, so its list is resolved from
 # the schema at fit and must come back out of the artifact in that order.
-_DERIVING: list[Transformer] = [
-    LabelEncoder(),
-    CountEncoder(),
-    OrdinalEncoder(),
-    OneHotEncoder(),
-    OneHotEncoder(use_cat_names=True),
-    RankHotEncoder(),
-    BaseNEncoder(base=3),
-    BinaryEncoder(),
-    GrayEncoder(),
-    BackwardDifferenceEncoder(),
-    HelmertEncoder(),
-    SumEncoder(),
-    PolynomialEncoder(),
-    TargetEncoder(target="y"),
-    MEstimateEncoder(target="y"),
-    WOEEncoder(target="y"),
-    JamesSteinEncoder(target="y"),
-    LeaveOneOutEncoder(target="y"),
-    CatBoostEncoder(target="y"),
-    QuantileEncoder(target="y"),
-    SummaryEncoder(target="y"),
-    StandardScaler(),
-    MinMaxScaler(),
-    MaxAbsScaler(),
-    RobustScaler(),
-    QuantileTransformer(n_quantiles=3),
-    KBinsDiscretizer(n_bins=2, encode="ordinal", strategy="uniform"),
-    KBinsDiscretizer(n_bins=2, encode="onehot", strategy="uniform"),
+# Factories rather than module-level instances, so fitted pipeline handles do
+# not stay alive in module globals past interpreter shutdown.
+_DERIVING: list[tuple[str, Callable[[], Transformer]]] = [
+    ("LabelEncoder", LabelEncoder),
+    ("CountEncoder", CountEncoder),
+    ("OrdinalEncoder", OrdinalEncoder),
+    ("OneHotEncoder", OneHotEncoder),
+    ("OneHotEncoder-cat-names", lambda: OneHotEncoder(use_cat_names=True)),
+    ("RankHotEncoder", RankHotEncoder),
+    ("BaseNEncoder", lambda: BaseNEncoder(base=3)),
+    ("BinaryEncoder", BinaryEncoder),
+    ("GrayEncoder", GrayEncoder),
+    ("BackwardDifferenceEncoder", BackwardDifferenceEncoder),
+    ("HelmertEncoder", HelmertEncoder),
+    ("SumEncoder", SumEncoder),
+    ("PolynomialEncoder", PolynomialEncoder),
+    ("TargetEncoder", lambda: TargetEncoder(target="y")),
+    ("MEstimateEncoder", lambda: MEstimateEncoder(target="y")),
+    ("WOEEncoder", lambda: WOEEncoder(target="y")),
+    ("JamesSteinEncoder", lambda: JamesSteinEncoder(target="y")),
+    ("LeaveOneOutEncoder", lambda: LeaveOneOutEncoder(target="y")),
+    ("CatBoostEncoder", lambda: CatBoostEncoder(target="y")),
+    ("QuantileEncoder", lambda: QuantileEncoder(target="y")),
+    ("SummaryEncoder", lambda: SummaryEncoder(target="y")),
+    ("StandardScaler", StandardScaler),
+    ("MinMaxScaler", MinMaxScaler),
+    ("MaxAbsScaler", MaxAbsScaler),
+    ("RobustScaler", RobustScaler),
+    ("QuantileTransformer", lambda: QuantileTransformer(n_quantiles=3)),
+    ("KBinsDiscretizer-ordinal", lambda: KBinsDiscretizer(n_bins=2, encode="ordinal", strategy="uniform")),
+    ("KBinsDiscretizer-onehot", lambda: KBinsDiscretizer(n_bins=2, encode="onehot", strategy="uniform")),
 ]
 
 # The steps that take every number when given no columns, and steps whose
@@ -223,32 +225,32 @@ def test_a_step_given_no_columns_takes_the_columns_known_when_the_fit_starts(
     assert waiting.transform_dict(_RECORD) == alone.transform_dict(_RECORD)
 
 
-@pytest.mark.parametrize("transformer", _DERIVING, ids=lambda t: type(t).__name__)
+@pytest.mark.parametrize(("label", "make_transformer"), _DERIVING, ids=[label for label, _ in _DERIVING])
 def test_a_derived_column_list_survives_an_artifact_and_a_pickle_in_fit_order(
-    transformer: Transformer, mixed: str, tmp_path: Path
+    label: str, make_transformer: Callable[[], Transformer], mixed: str, tmp_path: Path
 ) -> None:
     """Every ``columns=None`` step serves the same names, in the same order, after a round trip.
 
     Args:
-        transformer: A transformer whose ``columns`` may be None.
+        label: Case label for assertion messages.
+        make_transformer: Factory for a transformer whose ``columns`` may be None.
         mixed: The Parquet fixture with a non-alphabetical column order.
         tmp_path: pytest temporary directory.
 
     """
-    name: str = type(transformer).__name__
-    pipeline: Pipeline = Pipeline([("step", transformer)]).fit([mixed])
+    pipeline: Pipeline = Pipeline([("step", make_transformer())]).fit([mixed])
     fitted: list[tuple[str, Any]] = list(pipeline.transform_dict(dict(_RECORD)).items())
     # The fit order is the schema order, which is not the alphabetical one.
-    assert fitted != sorted(fitted), name
+    assert fitted != sorted(fitted), label
     for restored in _round_trips(pipeline, tmp_path, "artifact"):
-        assert list(restored.transform_dict(dict(_RECORD)).items()) == fitted, name
+        assert list(restored.transform_dict(dict(_RECORD)).items()) == fitted, label
     # An in-place step serves the same record whatever order it walks, so the
     # manifest is asserted directly too: the list it records is the resolved
     # one, never a sorted one.
     manifest: dict[str, Any] = json.loads((tmp_path / "artifact" / "manifest.json").read_text())
     recorded: list[str] = manifest["ops"][0]["state"]["columns"]
-    assert recorded == [column for column in _SCHEMA if column in set(recorded)], name
-    assert recorded != sorted(recorded), name
+    assert recorded == [column for column in _SCHEMA if column in set(recorded)], label
+    assert recorded != sorted(recorded), label
 
 
 def test_the_manifest_records_the_resolved_order_not_a_sorted_one(mixed: str, tmp_path: Path) -> None:
@@ -310,33 +312,33 @@ def test_an_artifact_without_a_column_order_is_refused(mixed: str, tmp_path: Pat
 # the source. group_agg is the one to watch: nlohmann sorts JSON object keys,
 # so its aggregate block is ordered by sorted column name both at fit and at
 # load, which is stable but is not the order `aggs` was written in.
-_EXPLICIT: list[Transformer] = [
-    GroupAgg(key="z_text", aggs={"z_num": ["mean", "sum"], "a_num": ["max"]}),
-    HashingEncoder(columns=["z_text", "a_text"], n_components=3),
-    PolynomialFeatures(columns=["z_num", "a_num"], degree=2),
-    SplineTransformer(columns=["z_num", "a_num"], n_knots=3, degree=1),
-    PowerTransformer(columns=["z_num", "a_num"]),
-    Binarizer(columns=["z_num", "a_num"], threshold=2.0),
-    Normalizer(columns=["z_num", "a_num"]),
-    Cast(types={"z_num": "f64", "a_num": "f64"}),
-    Select(columns=["z_num", "a_num", "z_text"]),
+_EXPLICIT: list[tuple[str, Callable[[], Transformer]]] = [
+    ("GroupAgg", lambda: GroupAgg(key="z_text", aggs={"z_num": ["mean", "sum"], "a_num": ["max"]})),
+    ("HashingEncoder", lambda: HashingEncoder(columns=["z_text", "a_text"], n_components=3)),
+    ("PolynomialFeatures", lambda: PolynomialFeatures(columns=["z_num", "a_num"], degree=2)),
+    ("SplineTransformer", lambda: SplineTransformer(columns=["z_num", "a_num"], n_knots=3, degree=1)),
+    ("PowerTransformer", lambda: PowerTransformer(columns=["z_num", "a_num"])),
+    ("Binarizer", lambda: Binarizer(columns=["z_num", "a_num"], threshold=2.0)),
+    ("Normalizer", lambda: Normalizer(columns=["z_num", "a_num"])),
+    ("Cast", lambda: Cast(types={"z_num": "f64", "a_num": "f64"})),
+    ("Select", lambda: Select(columns=["z_num", "a_num", "z_text"])),
 ]
 
 
-@pytest.mark.parametrize("transformer", _EXPLICIT, ids=lambda t: type(t).__name__)
+@pytest.mark.parametrize(("label", "make_transformer"), _EXPLICIT, ids=[label for label, _ in _EXPLICIT])
 def test_a_required_column_list_survives_an_artifact_and_a_pickle_too(
-    transformer: Transformer, mixed: str, tmp_path: Path
+    label: str, make_transformer: Callable[[], Transformer], mixed: str, tmp_path: Path
 ) -> None:
     """A step whose column list comes from its params serves the same output after a round trip.
 
     Args:
-        transformer: A transformer whose ``columns`` (or equivalent) is required.
+        label: Case label for assertion messages.
+        make_transformer: Factory for a transformer whose ``columns`` (or equivalent) is required.
         mixed: The Parquet fixture with a non-alphabetical column order.
         tmp_path: pytest temporary directory.
 
     """
-    name: str = type(transformer).__name__
-    pipeline: Pipeline = Pipeline([("step", transformer)]).fit([mixed])
+    pipeline: Pipeline = Pipeline([("step", make_transformer())]).fit([mixed])
     fitted: list[tuple[str, Any]] = list(pipeline.transform_dict(dict(_RECORD)).items())
     for restored in _round_trips(pipeline, tmp_path, "artifact"):
-        assert list(restored.transform_dict(dict(_RECORD)).items()) == fitted, name
+        assert list(restored.transform_dict(dict(_RECORD)).items()) == fitted, label

@@ -206,12 +206,15 @@ jobs:
         version = versions.pop()
         # A release names its tag in the event, which stays right when GitHub
         # leaves the run's ref empty; a hand run on a tag takes it from the ref.
+        # A hand run on a branch builds a dev version after a tag, or a release
+        # version when the branch tip itself carries a release tag.
         if os.environ["EVENT_NAME"] == "release":
             assert version == os.environ["TAG"].removeprefix("v"), (version, os.environ["TAG"])
         elif os.environ["REF_TYPE"] == "tag":
             assert version == os.environ["REF_NAME"].removeprefix("v"), (version, os.environ["REF_NAME"])
         else:
-            assert re.fullmatch(r"\d+\.\d+\.\d+\.dev\d+\+g[0-9a-f]+", version), version
+            release = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?"
+            assert re.fullmatch(rf"{release}(?:\.dev\d+\+g[0-9a-f]+)?", version), version
         # Every wheel ships the license files its metadata declares, the same
         # set in all six, including LICENSE and THIRD_PARTY_NOTICES.txt.
         shipped = set()
@@ -332,6 +335,10 @@ jobs:
         print(f"{tag} is still a published release of {built}")
         PY
     - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+      with:
+        # A re-run after a partial upload skips wheels PyPI already took; the
+        # attach job verifies every file on PyPI by sha256 against the build.
+        skip-existing: true
 
   attach:
     name: Attach to the release and compare

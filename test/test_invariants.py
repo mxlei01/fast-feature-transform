@@ -809,9 +809,11 @@ def test_tracked_stub_matches_the_generated_one(tmp_path: Path) -> None:
     ]
     ruff: list[str] = [sys.executable, "-m", "ruff"]
     config: list[str] = ["--config", str(repo / "pyproject.toml"), "--quiet"]
+    ruff_check: list[str] = [*ruff, "check", *config, "--select", "PYI009", "--fix", str(generated)]
+    ruff_format: list[str] = [*ruff, "format", *config, str(generated)]
     subprocess.run(stubgen, check=True, capture_output=True)  # nosec B603
-    subprocess.run([*ruff, "check", *config, "--select", "PYI009", "--fix", str(generated)], check=True)  # nosec B603
-    subprocess.run([*ruff, "format", *config, str(generated)], check=True)  # nosec B603
+    subprocess.run(ruff_check, check=True)  # nosec B603
+    subprocess.run(ruff_format, check=True)  # nosec B603
     assert generated.read_text() == (repo / "fast_feature_transform" / "_core.pyi").read_text()
 
 

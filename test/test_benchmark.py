@@ -267,3 +267,10 @@ def test_as_table_takes_a_single_column_result():
     table = MEASURE.as_table(np.arange(6, dtype=np.int64))
     assert table.num_columns == 1
     assert table.num_rows == 6
+
+
+def test_part_name_widens_past_five_digits() -> None:
+    assert MEASURE.part_name(0, 1) == "part-00000.parquet"
+    assert MEASURE.part_name(99_999, 100_000) == "part-99999.parquet"
+    assert MEASURE.part_name(0, 100_001) == "part-000000.parquet"
+    assert MEASURE.part_name(100_000, 100_001) == "part-100000.parquet"
