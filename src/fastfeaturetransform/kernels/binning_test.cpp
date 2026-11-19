@@ -1203,3 +1203,18 @@ TEST_CASE("paired quantile interpolation retains mirrored searches at duplicate 
     }
   }
 }
+
+TEST_CASE("k_bins_discretize refuses a non-finite quantile edge before pruning narrow bins") {
+  // REGRESSION: lerp overflows high - low to +inf on [-1e308, -1e308, 1e308,
+  // 1e308], giving -inf at q=0.5. Narrow-bin deduplication used to run before
+  // fitted_number(), silently dropping -inf and collapsing two bins into one.
+  const fft::Schema schema{{{"x", "f64"}}};
+  const nlohmann::json params{{"columns", {"x"}},
+                              {"n_bins", 2},
+                              {"encode", "ordinal"},
+                              {"strategy", "quantile"},
+                              {"quantile_method", "linear"}};
+  const fft::Batch extreme = make_batch({"x"}, {f64_column({-1e308, -1e308, 1e308, 1e308})});
+  REQUIRE_THROWS_WITH(fit_binning("k_bins_discretize", params, schema, {extreme}),
+                      ContainsSubstring("bin edge that is not finite"));
+}

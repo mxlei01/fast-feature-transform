@@ -1288,6 +1288,10 @@ class KBinsDiscretize final : public Kernel {
       } else {
         edges = kmeans_edges(name, buffer, low, high);
       }
+      // Validate every computed edge before narrow-bin pruning: a -inf edge
+      // from lerp overflowing on an extreme finite span would otherwise fail
+      // the width check and disappear silently instead of failing the fit.
+      for (double edge : edges) (void)fitted_number(edge, stage, name, "bin edge");
       kept.push_back(edges.front());
       for (std::size_t i = 1; i < edges.size(); ++i) {
         if (edges[i] - edges[i - 1] > kMinWidth) kept.push_back(edges[i]);

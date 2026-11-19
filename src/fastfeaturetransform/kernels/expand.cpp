@@ -172,6 +172,11 @@ class PolynomialFeatures final : public Kernel {
     // an artifact-loaded kernel (which carries no state) declares what it
     // reads and writes without ever seeing a schema.
     build_monomials();
+    if (monomials_.empty()) {
+      throw Error("polynomial_features: " + std::to_string(columns_.size()) +
+                  " columns with interaction_only true, include_bias false and min degree " +
+                  std::to_string(min_degree_) + " would generate no columns");
+    }
     inputs = columns_;
     outputs = names_;
   }
@@ -1018,26 +1023,24 @@ class SplineTransform final : public Kernel {
       return;
     }
     std::fill(out.begin(), out.end(), 0.0);
+    const auto& boundary = value < low ? spline.low_values : spline.high_values;
     if (extrapolation_ == Extrapolation::Constant) {
-      // Only the first and last `degree` basis functions are non-zero at the
-      // boundary, so only those carry over.
-      if (value < low) {
-        for (std::size_t j = 0; j < degree; ++j) out[j] = spline.low_values[j];
-      } else {
-        for (std::size_t j = 0; j < degree; ++j) out[width - degree + j] = spline.high_values[width - degree + j];
-      }
+      // Copy every boundary basis function: at degree 0 (where degree is 0)
+      // and at tied boundary knots, non-zero entries sit outside the first or
+      // last `degree` positions.
+      std::copy_n(boundary.data(), width, out.data());
       return;
     }
-    // 'linear': continue each boundary basis function along its own slope.
-    // At degree 1 the second basis function still has a slope at the
-    // boundary, so sklearn widens the reach by one there, and at degree 0 too.
-    const std::size_t reach = degree <= 1 ? degree + 1 : degree;
-    for (std::size_t j = 0; j < reach; ++j) {
-      if (value < low) {
-        out[j] = spline.low_values[j] + (value - low) * spline.low_slopes[j];
-      } else {
-        const std::size_t index = width - 1 - j;
-        out[index] = spline.high_values[index] + (value - high) * spline.high_slopes[index];
+    // 'linear': continue every boundary basis function along its own slope.
+    // Skip zero slopes so a far value whose delta overflows does not multiply
+    // infinity by zero.
+    const auto& slopes = value < low ? spline.low_slopes : spline.high_slopes;
+    const double delta = value < low ? value - low : value - high;
+    for (std::size_t j = 0; j < width; ++j) {
+      if (slopes[j] != 0.0) {
+        out[j] = boundary[j] + delta * slopes[j];
+      } else if (boundary[j] != 0.0) {
+        out[j] = boundary[j];
       }
     }
   }
