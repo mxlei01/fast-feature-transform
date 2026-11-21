@@ -133,7 +133,8 @@ def part_name(index: int, parts: int) -> str:
         parts: Total number of parts in the output directory.
 
     Returns:
-        Filename such as ``part-00000.parquet`` (or wider past 99,999 parts).
+        Filename such as ``part-00000.parquet``, with six digits or more from
+        100,001 parts on.
 
     """
     width: int = max(5, len(str(max(parts - 1, 0))))

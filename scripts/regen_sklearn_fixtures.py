@@ -964,9 +964,6 @@ CASES: list[dict[str, Any]] = [
         "tolerance": SPLINE_TOLERANCE,
     },
     {
-        # Linear extrapolation below degree 2 is a single-column case: there,
-        # scikit-learn 1.9.0 gets the second and later columns of a call wrong
-        # or raises IndexError.
         "name": "spline/extrapolation-linear",
         "transformer": "SplineTransformer",
         "params": {"columns": ["price", "height"], "extrapolation": "linear"},
@@ -975,6 +972,9 @@ CASES: list[dict[str, Any]] = [
         "tolerance": SPLINE_TOLERANCE,
     },
     {
+        # Linear extrapolation below degree 2 is a single-column case: there,
+        # scikit-learn 1.9.0 gets the second and later columns of a call wrong
+        # or raises IndexError.
         "name": "spline/extrapolation-linear-degree-1",
         "transformer": "SplineTransformer",
         "params": {"columns": ["price"], "extrapolation": "linear", "degree": 1},

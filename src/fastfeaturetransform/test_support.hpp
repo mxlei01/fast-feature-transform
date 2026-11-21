@@ -5,12 +5,14 @@
 
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_primitive.h>
+#include <arrow/buffer.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -95,6 +97,17 @@ std::shared_ptr<arrow::Array> numeric_column(const std::vector<std::optional<typ
   std::shared_ptr<arrow::Array> array;
   (void)builder.Finish(&array);
   return array;
+}
+
+// An Arrow buffer holding a copy of `values`, for an array whose bytes a test
+// lays out itself, such as values under null rows or around a slice. Arrow's
+// Buffer::FromVector names std::is_trivial_v, which C++26 deprecates.
+template <typename T>
+std::shared_ptr<arrow::Buffer> buffer_of(const std::vector<T>& values) {
+  const std::size_t size = values.size() * sizeof(T);
+  std::shared_ptr<arrow::Buffer> buffer = arrow::AllocateBuffer(static_cast<int64_t>(size)).ValueOrDie();
+  if (size > 0) std::memcpy(buffer->mutable_data(), values.data(), size);
+  return buffer;
 }
 
 // A timestamp column of the given unit and time zone ("" for none) from its

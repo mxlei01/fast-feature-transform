@@ -97,8 +97,8 @@ make cpp-sanitize  # the C++ tests under AddressSanitizer and UndefinedBehaviorS
   Homebrew to install `bison` and `pkg-config`, which Arrow's build needs. The triplets in `triplets/` are vcpkg's own
   plus two settings: Parquet encryption is off, which keeps OpenSSL out of the extension, and macOS builds target macOS
   26. Changing a triplet rebuilds every dependency.
-- **The extension** links its own static Arrow and keeps it private, so it can share a process with pyarrow. It exports only
-  the Python module initialization function on Linux and macOS.
+- **The extension** links its own static Arrow and keeps it private, so it can share a process with pyarrow. It exports
+  only the Python module initialization function on Linux and macOS.
 
 ### Pinned versions
 

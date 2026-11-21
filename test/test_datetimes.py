@@ -494,9 +494,10 @@ def test_an_aware_datetime_converts_up_to_each_bound_of_int64_microseconds(tmp_p
 
 
 def test_a_datetime_subclass_with_an_overflowing_utcoffset_is_refused(tmp_path: Path) -> None:
-    # REGRESSION: epoch_microseconds computed the utcoffset shift and
-    # subtraction in signed int64, overflowing on a datetime subclass whose
-    # utcoffset() returned a large timedelta.
+    # REGRESSION: a datetime whose utcoffset() moves it outside int64
+    # microseconds is an EngineError. epoch_microseconds used to compute the
+    # utcoffset shift and subtraction in signed int64, which overflowed on a
+    # datetime subclass whose utcoffset() returned a large timedelta.
     class LargeOffsetDateTime(datetime):
         _offset: timedelta
 

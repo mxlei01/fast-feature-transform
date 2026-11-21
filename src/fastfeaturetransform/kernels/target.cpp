@@ -138,12 +138,12 @@ void add_whole(ExactSum& sum, Int128 value) {
 }
 
 // The doubles that total a category's sum exactly and depend on its value
-// alone, as ExactSum::terms() gives them.
-std::vector<double> sum_terms(const Acc& acc, Family family) {
-  if (family != Family::Integer) return acc.fsum.terms();
+// alone, as ExactSum::terms() gives them; `where` begins its error.
+std::vector<double> sum_terms(const Acc& acc, Family family, const std::string& where) {
+  if (family != Family::Integer) return acc.fsum.terms(where);
   ExactSum sum;
   add_whole(sum, acc.isum);
-  return sum.terms();
+  return sum.terms(where);
 }
 
 // An integer's square into an exact sum. Below 2^53 in magnitude the integer
@@ -429,6 +429,7 @@ class TargetBlend final : public Kernel {
     // back to a prior of zero, and a mis-joined label column would fit, save,
     // load and serve a constant with nothing anywhere saying so.
     Totals totals;
+    totals.where = stage + ": target column '" + target_ + "'";
     totals.rows = merged->total.count;
     if (totals.rows == 0) {
       throw Error(stage + ": target column '" + target_ + "' has no non-null values to learn from");
@@ -441,7 +442,7 @@ class TargetBlend final : public Kernel {
     }
     // Only james_stein_encode reads the variance, and only its bound keeps
     // the square of the sum inside f64.
-    if (formula_ == Formula::JamesStein) totals.variance = variance_of(merged->total);
+    if (formula_ == Formula::JamesStein) totals.variance = variance_of(merged->total, totals.where);
 
     tables_.clear();
     for (const std::string& name : columns_) {
@@ -593,6 +594,7 @@ class TargetBlend final : public Kernel {
     double variance = 0.0;
     std::size_t levels = 0;
     double pooled = 0.0;
+    std::string where;  // "<stage>: target column '<target>'", for the errors of its sums
   };
 
   // Every target value of one batch, plus which rows carry one at all. The
@@ -744,7 +746,7 @@ class TargetBlend final : public Kernel {
       case Model::Independent: {
         double weight = 1.0;  // a single category is its own prior, whatever the weight
         if (levels >= 2) {
-          const double variance = variance_of(acc);
+          const double variance = variance_of(acc, totals.where);
           const double total = totals.variance + variance;
           const double shrinkage = (total == 0.0 ? 0.0 : variance / total) * (levels - 3) / (levels - 1);
           weight = std::clamp(1.0 - shrinkage, 0.0, 1.0);
@@ -794,14 +796,14 @@ class TargetBlend final : public Kernel {
   // their values alone. They used to be formed from the partials, which two
   // workers can leave split differently than one. Near 1e-155 the products
   // underflow and round, so a category's value depended on the thread count
-  // in its last bits.
-  double variance_of(const Acc& acc) const {
+  // in its last bits. `where` begins the error of a sum past f64.
+  double variance_of(const Acc& acc, const std::string& where) const {
     if (acc.count < 2) return 0.0;
     const auto n = static_cast<double>(acc.count);
     ExactSum scaled;
     bool held = true;
-    const std::vector<double> squares = acc.squares.terms();
-    const std::vector<double> sums = sum_terms(acc, target_family_);
+    const std::vector<double> squares = acc.squares.terms(where);
+    const std::vector<double> sums = sum_terms(acc, target_family_, where);
     for (double square : squares) held = held && add_product(scaled, n, square);
     for (double left : sums) {
       for (double right : sums) held = held && add_product(scaled, -left, right);

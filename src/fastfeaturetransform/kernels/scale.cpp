@@ -558,14 +558,14 @@ class StandardScale final : public Kernel {
   // full size forms.
   static double population_variance(const Accumulator& accumulator, double mean, double rows,
                                     const std::string& where) {
-    const std::vector<double> terms = accumulator.sum.terms();
+    const std::vector<double> terms = accumulator.sum.terms(where);
     ExactSum residual = accumulator.squares;
     if (add_deviations(residual, terms, mean, rows)) {
       if (const std::optional<double> variance = divided(residual, rows)) return *variance;
     }
     ExactSum quarter;
     bool held = true;
-    for (double term : accumulator.squares.terms()) held = held && quarter.add(term * 0.25);
+    for (double term : accumulator.squares.terms(where)) held = held && quarter.add(term * 0.25);
     std::vector<double> quarters = terms;
     for (double& term : quarters) term *= 0.25;
     held = held && add_deviations(quarter, quarters, mean, rows * 0.25);
@@ -575,7 +575,9 @@ class StandardScale final : public Kernel {
   }
 
   // Adds -2*mean*Sum x + count*mean^2 to `residual`, Sum x given by its
-  // terms; false when a step of the sum passes the largest double.
+  // terms; false when one of the products overflows f64. ExactSum::add
+  // refuses only a value that is not finite, and every other input here is
+  // finite.
   static bool add_deviations(ExactSum& residual, const std::vector<double>& terms, double mean, double count) {
     bool held = true;
     for (double term : terms) held = held && add_product(residual, -2.0 * mean, term);

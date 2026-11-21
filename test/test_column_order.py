@@ -79,10 +79,12 @@ _TARGET: dict[str, list[float]] = {"y": [0.0, 1.0, 1.0, 0.0]}
 _RECORD: dict[str, Any] = {"z_text": "u", "a_text": "q", "z_num": 2.0, "a_num": 30.0, "y": 1.0}
 _SCHEMA: list[str] = [*_TEXT, *_NUMBERS, *_TARGET]
 
-# Every transformer whose `columns` may be None, so its list is resolved from
+# Every transformer that takes `columns=None`, so its list is resolved from
 # the schema at fit and must come back out of the artifact in that order.
-# Factories rather than module-level instances, so fitted pipeline handles do
-# not stay alive in module globals past interpreter shutdown.
+# Factories rather than instances: pytest keeps each parametrize value until
+# the session ends, and once a hypothesis test has run in the session, past
+# interpreter shutdown. An instance fitted in a test would keep its fitted
+# pipeline handle alive there, and nanobind would report it as leaked.
 _DERIVING: list[tuple[str, Callable[[], Transformer]]] = [
     ("LabelEncoder", LabelEncoder),
     ("CountEncoder", CountEncoder),
@@ -233,7 +235,8 @@ def test_a_derived_column_list_survives_an_artifact_and_a_pickle_in_fit_order(
 
     Args:
         label: Case label for assertion messages.
-        make_transformer: Factory for a transformer whose ``columns`` may be None.
+        make_transformer: Factory for a transformer that takes
+            ``columns=None``.
         mixed: The Parquet fixture with a non-alphabetical column order.
         tmp_path: pytest temporary directory.
 

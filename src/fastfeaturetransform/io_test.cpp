@@ -1317,6 +1317,29 @@ void repeat_dictionary_value(const std::string& path, int group, int leaf, const
   write_contents(path, bytes);
 }
 
+// Adds one to the length that the uncompressed dictionary page of column
+// chunk (`group`, 0) of the file at `path` states for `last`, its last value,
+// so that the value runs one byte past the page.
+void lengthen_last_dictionary_value(const std::string& path, int group, const std::string& last) {
+  std::size_t start = 0;
+  std::size_t end = 0;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(group);
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(0);
+    REQUIRE(chunk->has_dictionary_page());
+    start = static_cast<std::size_t>(chunk->dictionary_page_offset());
+    end = static_cast<std::size_t>(chunk->data_page_offset());
+  }
+  std::string bytes = file_contents(path);
+  REQUIRE(last.size() < 255);
+  const std::string value = std::string{static_cast<char>(last.size()), '\0', '\0', '\0'} + last;
+  const std::size_t at = bytes.find(value, start);
+  REQUIRE(at + value.size() == end);
+  bytes[at] = static_cast<char>(last.size() + 1);
+  write_contents(path, bytes);
+}
+
 // The count of values that the dictionary page of column chunk (`group`,
 // `leaf`) of the file at `path` states.
 int32_t dictionary_page_count(const std::string& path, int group, int leaf) {
@@ -2022,7 +2045,9 @@ TEST_CASE("an extension column stored as a dictionary is refused by name, and th
     auto readers = source->readers(1, columns);
     REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], 7,
                                                  [](fft::Batch) { throw std::runtime_error("a batch arrived"); }),
-                        path + ": column 'e' has an extension with dictionary storage, which cannot be streamed");
+                        path +
+                            ": column 'e' has an extension with dictionary storage, which cannot be streamed; leave it "
+                            "out with a Select step");
   }
   const std::vector<std::string> only_x{"x"};
   const fft::Batch read = read_task(*source, 0, &only_x);
@@ -2193,6 +2218,58 @@ TEST_CASE("a dictionary page whose values a batch shows is read once") {
     // The copy now in its place is refused.
     REQUIRE_THROWS_WITH(fft::testing::read_task(*fft::open_source({path}), 0),
                         path + ": failed to read row group 0: column 'c' has a dictionary page that repeats a value");
+  }
+}
+
+TEST_CASE("a dictionary page that ends before its values when it is read again is refused with its column named") {
+  // Arrow's reader decodes a dictionary page whose last value runs past the
+  // page's bytes as an error of its own, so the second read of a page finds
+  // one only in a file that changed in between. Here the file is written over
+  // in place after the first batch with a copy whose page states its last
+  // value one byte longer. The chunk is smaller than the 64 KiB a reader
+  // buffers, so the reading holds the original's bytes from its first batch
+  // on, and only the second read of the page sees the copy. 600 distinct
+  // values with a dictionary page limit of 300 bytes put the first 50 in the
+  // page and the other 550 in plain pages, which are moved in front of the
+  // pages of indices. Batches of 7 rows then come as two batches where the
+  // plain rows end, and the first of them, of plain rows, does not show the
+  // page, which is read again.
+  TempDir dir;
+  const std::shared_ptr<arrow::Array> strings = strings_column(600, [](int64_t row) {
+    const std::string digits = std::to_string(row);
+    return "u" + std::string(4 - digits.size(), '0') + digits;
+  });
+  const std::string path = (dir.path / "page.parquet").string();
+  write_pages(path, *arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings}),
+              {1 << 20, 300, false, false});
+  REQUIRE(dictionary_page_count(path, 0, 0) == 50);
+  plain_pages_first(path, 0);
+  const std::string copy = (dir.path / "copy.parquet").string();
+  write_contents(copy, file_contents(path));
+  lengthen_last_dictionary_value(copy, 0, "u0049");
+  const std::string damaged = file_contents(copy);
+  // Read fresh, the copy is refused by Arrow's reader before the page could
+  // be read again.
+  REQUIRE_THROWS_WITH(
+      fft::testing::read_task(*fft::open_source({copy}), 0),
+      ContainsSubstring(copy + ": failed to read row group 0: ") && !ContainsSubstring("incomplete dictionary page"));
+  for (const bool changed : {false, true}) {
+    CAPTURE(changed);
+    const std::string original = file_contents(path);
+    auto source = fft::open_source({path});
+    auto readers = source->readers(1, nullptr);
+    std::size_t batches = 0;
+    const auto read = [&] {
+      readers[0]->read_batches(source->plan_tasks()[0], 7, [&](fft::Batch) {
+        if (batches++ == 0) write_contents(path, changed ? damaged : original);
+      });
+    };
+    if (!changed) {
+      REQUIRE_NOTHROW(read());
+      continue;
+    }
+    REQUIRE_THROWS_WITH(read(), path + ": failed to read row group 0: column 'c' has an incomplete dictionary page");
+    REQUIRE(batches > 1);
   }
 }
 

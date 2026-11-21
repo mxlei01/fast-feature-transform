@@ -660,11 +660,12 @@ def _repeating_page_table(layout: str) -> tuple[pa.Table, bytes, bytes, dict[str
     return pa.table({"c": strings, "x": np.arange(float(len(strings)))}), b"bb", b"aa", {}
 
 
-# REGRESSION: Arrow's reader of strings as a dictionary keeps each value of a
-# dictionary page once and the indices as they stand, so a page that holds a
-# value twice used to shift every value after the repeat. That passed without
-# an error while no row used the page's last value, or while plain pages
-# after the page added new values, and failed as an index outside the
+# REGRESSION: a dictionary page of strings that holds a value twice is an
+# EngineError naming the column. Arrow's reader of strings as a dictionary
+# keeps each value of a dictionary page once and the indices as they stand,
+# so such a page used to shift every value after the repeat. That passed
+# without an error while no row used the page's last value, or while plain
+# pages after the page added new values, and failed as an index outside the
 # dictionary otherwise.
 @pytest.mark.parametrize("layout", ["last value unused", "last value used", "list", "plain pages after"])
 def test_parquet_dictionary_page_that_repeats_a_value_is_refused(tmp_path: Path, layout: str) -> None:

@@ -120,8 +120,8 @@ std::shared_ptr<arrow::Array> dense_slice(int64_t offset, int64_t length) {
     values[static_cast<std::size_t>(offset + row)] = probes[static_cast<std::size_t>(row) % probes.size()];
   }
   const auto backing_length = static_cast<int64_t>(values.size());
-  auto array = std::make_shared<arrow::NumericArray<ArrowType>>(
-      backing_length, arrow::Buffer::FromVector(std::move(values)), nullptr, 0);
+  auto array =
+      std::make_shared<arrow::NumericArray<ArrowType>>(backing_length, fft::testing::buffer_of(values), nullptr, 0);
   return array->Slice(offset, length);
 }
 
@@ -208,7 +208,7 @@ void check_null_payloads() {
         }
       }
       const auto parent = std::make_shared<arrow::NumericArray<ArrowType>>(
-          kBackingLength, arrow::Buffer::FromVector(std::move(values)), arrow::Buffer::FromVector(std::move(bitmap)));
+          kBackingLength, fft::testing::buffer_of(values), fft::testing::buffer_of(bitmap));
       require_record_bits_and_unchanged_source<ArrowType>(*kernel, parent->Slice(kOffset, kLength));
     }
   }
@@ -226,8 +226,8 @@ void check_visible_nonfinite() {
         CAPTURE(position, invalid);
         std::vector<Scalar> values(39, static_cast<Scalar>(1));
         values[static_cast<std::size_t>(3 + position)] = invalid;
-        const auto parent = std::make_shared<arrow::NumericArray<ArrowType>>(
-            39, arrow::Buffer::FromVector(std::move(values)), nullptr, 0);
+        const auto parent =
+            std::make_shared<arrow::NumericArray<ArrowType>>(39, fft::testing::buffer_of(values), nullptr, 0);
         const auto source = parent->Slice(3, 33);
         const auto before = buffer_bytes(source->data()->buffers[1]);
         REQUIRE_THROWS_WITH(kernel->transform(make_batch({"x"}, {source})),

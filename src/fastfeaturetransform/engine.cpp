@@ -199,7 +199,10 @@ void flatten_node(const nlohmann::json& node, const std::string& prefix, std::ve
 }
 
 // The invariants every op list must satisfy, whether it came from a plan or
-// from an artifact: at least one op, and unique, well-formed stage names.
+// from a manifest: at least one op; unique, well-formed stage names; and
+// dotted names that form one tree in execution order, where no stage is
+// also a nested pipeline and the stages of each nested pipeline are
+// consecutive.
 void validate_ops(const std::vector<std::unique_ptr<Kernel>>& ops) {
   if (ops.empty()) throw Error("no ops to run");
   std::unordered_set<std::string> stages;

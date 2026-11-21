@@ -160,9 +160,17 @@ class CountEncode final : public Kernel {
 
   bool needs_fit() const override { return true; }
 
+  // A fit refuses a group option without the threshold that makes the
+  // group, naming the option that was set (min_group_name first). A saved
+  // pipeline that holds such options still loads.
   std::unique_ptr<AccState> make_state() const override {
-    if (min_group_size_ < 0 && (min_group_name_.has_value() || combine_nan_ != CombineNan::Yes))
-      throw Error(stage + ": min_group_name and nondefault combine_min_nan_groups require min_group_size");
+    if (min_group_size_ < 0 && min_group_name_.has_value()) {
+      throw Error(stage + ": min_group_name needs min_group_size; set min_group_size, or leave min_group_name unset");
+    }
+    if (min_group_size_ < 0 && combine_nan_ != CombineNan::Yes) {
+      throw Error(stage + ": combine_min_nan_groups=" + (combine_nan_ == CombineNan::Force ? "'force'" : "False") +
+                  " needs min_group_size; set min_group_size, or leave combine_min_nan_groups at True");
+    }
     return std::make_unique<SeenState>();
   }
 
