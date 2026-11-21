@@ -3,6 +3,7 @@
 import importlib.metadata
 import json
 import pickle
+from collections.abc import Iterator
 from pathlib import Path
 
 import pyarrow as pa
@@ -225,6 +226,21 @@ def test_a_fitted_pipeline_refuses_to_have_its_steps_replaced(train_files: list[
     assert pipeline.transform_dict({"device": "mob", "source": "a", "price": 1.0}) == before
     parts: list[Path] = pipeline.transform_parquet(train_files, output_dir=tmp_path / "out")
     assert pa.concat_tables([pq.read_table(part) for part in parts]).num_rows == NUM_ROWS
+
+
+def test_a_fitted_pipeline_refuses_new_steps_before_it_reads_them(train_files: list[str]) -> None:
+    pipeline: Pipeline = _build_pipeline().fit(train_files)
+
+    def new_steps() -> Iterator[tuple[str, Select]]:
+        yield ("select", Select(columns=["source"]))
+
+    given: Iterator[tuple[str, Select]] = new_steps()
+    with pytest.raises(RuntimeError, match="^Pipeline is already fitted"):
+        pipeline.steps = given
+    assert next(given)[0] == "select"  # nothing was taken from it
+    # Steps that are invalid as well get the same refusal.
+    with pytest.raises(RuntimeError, match="^Pipeline is already fitted"):
+        pipeline.steps = [("s", Select(columns=["a"])), ("s", Select(columns=["b"]))]
 
 
 def test_an_unfitted_pipeline_still_takes_new_steps(train_files: list[str]) -> None:

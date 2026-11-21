@@ -16,11 +16,12 @@ import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, ClassVar, override
+from types import SimpleNamespace, TracebackType
+from typing import Any, ClassVar, Self, override
 
 import numpy as np
 import pyarrow as pa
@@ -64,7 +65,7 @@ from fast_feature_transform import (
     _core,
     parquet_to_memmap,
 )
-from fast_feature_transform.transformers import _output_directory
+from fast_feature_transform.transformers import _fit_engine, _output_directory
 from helpers import NAME_KIND_IDS, NAME_KINDS
 
 # LabelEncoder numbers the sorted categories from 1: desk 1, mob 2, tab 3.
@@ -1949,6 +1950,404 @@ def test_a_pipeline_answers_for_the_old_fit_or_the_new_one_whichever_read_a_bind
         assert answer in (old_answer, new_answer), at
         at += 1
     assert at > 1  # the reader read the pipeline at least once
+
+
+class _ReadsAtItsBind(LabelEncoder):
+    """A LabelEncoder that runs ``hook`` right after a pipeline binds it.
+
+    ``hook`` is a class attribute, so a pickle carries none of it.
+    """
+
+    hook: ClassVar[Callable[[], None] | None] = None
+
+    @override
+    def _bind(self, handle: _core.FittedPipeline, stage: str, *, standalone: bool) -> None:
+        super()._bind(handle, stage, standalone=standalone)
+        hook = _ReadsAtItsBind.hook
+        if hook is not None:
+            hook()
+
+
+def test_a_pipeline_reads_as_fitted_only_once_every_step_in_it_is_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A bind publishes the binding of each pipeline after it binds every step
+    # in it, so a pipeline that reads as fitted has no unbound step. The
+    # first use of an unpickled pipeline relies on it: a thread that finds
+    # the binding published reads the steps without taking the bind lock.
+    first, _ = _two_files(tmp_path)
+    u_encoder: _ReadsAtItsBind = _ReadsAtItsBind(columns=["u"])
+    v_encoder: _ReadsAtItsBind = _ReadsAtItsBind(columns=["v"])
+    features: Pipeline = Pipeline([("u", u_encoder)])
+    root: Pipeline = Pipeline([("features", features), ("v", v_encoder)])
+    readers: dict[str, Callable[[], object]] = {
+        "root": lambda: root.transform_dict(_PIPELINE_RECORD),
+        "features": lambda: features.transform_dict(_PIPELINE_RECORD),
+        "u": lambda: u_encoder.label_maps_,
+        "v": lambda: v_encoder.label_maps_,
+    }
+    seen: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        _ReadsAtItsBind, "hook", lambda: seen.append({name: _outcome(read) for name, read in readers.items()})
+    )
+    root.fit([first], threads=1)
+    unfitted: str = "RuntimeError: Pipeline is not fitted"
+    # LabelEncoder numbers the sorted categories from 1.
+    u_map: dict[str, dict[str, int]] = {"u": {"a": 1, "b": 2}}
+    assert seen == [
+        {"root": unfitted, "features": unfitted, "u": u_map, "v": "RuntimeError: _ReadsAtItsBind is not fitted"},
+        {
+            "root": unfitted,
+            "features": "RuntimeError: Pipeline 'features' is a step of a larger pipeline; call this on the root pipeline",
+            "u": u_map,
+            "v": {"v": {"p": 1, "q": 2}},
+        },
+    ]
+    assert root.transform_dict(_PIPELINE_RECORD) == {"u": 2, "v": 2}
+
+
+# How long a test waits for another thread, in seconds. Each wait ends as
+# soon as the thread gets where the test needs it; this only bounds a hang.
+_WAIT: float = 60.0
+
+
+class _WatchedLock:
+    """A lock that sets an event when a thread finds it held and has to wait for it.
+
+    Put in a pipeline's ``_bind_lock``, it tells a test that another thread
+    is blocked on that lock, without timing.
+    """
+
+    def __init__(self, waited: threading.Event) -> None:
+        """Make the lock, unheld.
+
+        Args:
+            waited: Set when a thread has to wait for the lock.
+
+        """
+        self._lock: threading.Lock = threading.Lock()
+        self._waited: threading.Event = waited
+
+    def __enter__(self) -> None:
+        """Take the lock, setting the event first when another thread holds it."""
+        if not self._lock.acquire(blocking=False):
+            self._waited.set()
+            self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Release the lock.
+
+        Args:
+            *exc_info: The exception that left the block, if any.
+
+        """
+        self._lock.release()
+
+
+def test_a_thread_that_uses_an_unpickled_pipeline_while_another_binds_it_waits_for_every_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _ = _two_files(tmp_path)
+    fitted: Pipeline = Pipeline([("u", _ReadsAtItsBind(columns=["u"])), ("v", LabelEncoder(columns=["v"]))])
+    root: Pipeline = pickle.loads(pickle.dumps(fitted.fit([first], threads=1)))
+    reached: threading.Event = threading.Event()
+    vars(root)["_bind_lock"] = _WatchedLock(reached)
+    answers: list[object] = []
+
+    def read_the_last_step() -> object:
+        encoder = root["v"]
+        assert isinstance(encoder, LabelEncoder)
+        return encoder.label_maps_
+
+    def reader() -> None:
+        answers.append(_outcome(read_the_last_step))
+        reached.set()
+
+    thread: threading.Thread = threading.Thread(target=reader)
+
+    def start_the_reader() -> None:
+        thread.start()
+        assert reached.wait(_WAIT)  # the reader waits for the bind lock, or has read
+
+    monkeypatch.setattr(_ReadsAtItsBind, "hook", start_the_reader)
+    root.transform_dict(_PIPELINE_RECORD)  # the first use binds the tree, "u" first
+    thread.join(_WAIT)
+    assert not thread.is_alive()
+    assert answers == [{"v": {"p": 1, "q": 2}}]
+
+
+class _HeldFit:
+    """Fits a pipeline on another thread and holds the fit in its engine call until the block ends.
+
+    The engine call comes after the fit has read the steps. ``moved`` is set
+    when the fit reaches the engine call, or when it has to wait for a
+    _WatchedLock built on ``moved``. Leaving the block lets the engine call
+    run and waits for the fit; when the block raised nothing, it checks that
+    the fit raised nothing either.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, pipeline: Pipeline, path: Path) -> None:
+        """Prepare the fit, which ``start`` starts.
+
+        Args:
+            monkeypatch: Replaces the engine the pipeline module builds, for the test.
+            pipeline: The pipeline to fit.
+            path: The file to fit it on.
+
+        """
+        self.moved: threading.Event = threading.Event()
+        self._release: threading.Event = threading.Event()
+        self._errors: list[BaseException] = []
+
+        def held_engine(threads: int, temp_dir: Any) -> SimpleNamespace:
+            engine: _core.Engine = _fit_engine(threads, temp_dir)
+
+            def fit(plan: str, paths: list[str]) -> _core.FittedPipeline:
+                self.moved.set()
+                assert self._release.wait(_WAIT)
+                return engine.fit(plan, paths)
+
+            return SimpleNamespace(fit=fit)
+
+        monkeypatch.setattr("fast_feature_transform.pipeline._fit_engine", held_engine)
+        self._thread: threading.Thread = threading.Thread(target=self._fit, args=(pipeline, path), daemon=True)
+
+    def __enter__(self) -> Self:
+        """Give the fit, not started yet.
+
+        Returns:
+            This object.
+
+        """
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        """Let the engine call run and wait for the fit to return.
+
+        Args:
+            exc_type: The type of the exception that left the block, if any.
+            exc: That exception.
+            traceback: Its traceback.
+
+        """
+        self._release.set()
+        if self._thread.ident is not None:
+            self._thread.join(_WAIT)
+        if exc_type is None:
+            assert not self._thread.is_alive()
+            assert self._errors == []
+
+    def _fit(self, pipeline: Pipeline, path: Path) -> None:
+        """Fit, keeping what it raises for the end of the block.
+
+        Args:
+            pipeline: The pipeline to fit.
+            path: The file to fit it on.
+
+        """
+        try:
+            pipeline.fit([path], threads=1)
+        except BaseException as error:  # noqa: BLE001
+            self._errors.append(error)
+
+    def start(self) -> None:
+        """Start the fit and wait until it is in the engine call or waits for a watched lock."""
+        self._thread.start()
+        assert self.moved.wait(_WAIT)
+
+
+def _scaled_file(tmp_path: Path) -> Path:
+    """Write a file whose column "x" holds 0, 1 and 4.
+
+    A MinMaxScaler fitted on it maps 4.0 exactly onto the high end of its
+    feature_range: the scale is (high - low) / 4, and a division and a
+    multiplication by 4 are exact.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+
+    Returns:
+        The path.
+
+    """
+    path: Path = tmp_path / "scaled.parquet"
+    pq.write_table(pa.table({"x": [0.0, 1.0, 4.0]}), path)
+    return path
+
+
+def _new_steps() -> list[tuple[str, Transformer]]:
+    """Give the steps a test assigns: a MinMaxScaler of "x" onto (0, 10).
+
+    Returns:
+        The step list.
+
+    """
+    return [("scale", MinMaxScaler(columns=["x"], feature_range=(0, 10)))]
+
+
+def _listed_stages(pipeline: Pipeline, prefix: str = "") -> list[dict[str, Any]]:
+    """Give the stages_json entries that the steps a pipeline lists compile to.
+
+    Args:
+        pipeline: A pipeline.
+        prefix: The dotted stage-name prefix of its steps.
+
+    Returns:
+        One entry per transformer, in execution order.
+
+    """
+    stages: list[dict[str, Any]] = []
+    for name, step in pipeline.steps:
+        if isinstance(step, Pipeline):
+            stages.extend(_listed_stages(step, f"{prefix}{name}."))
+        else:
+            params: dict[str, Any] = json.loads(json.dumps(step.params()))
+            stages.append({"kernel": step.kernel_id, "params": params, "stage": f"{prefix}{name}"})
+    return stages
+
+
+def _assert_runs_the_steps_it_lists(pipeline: Pipeline, high: float) -> None:
+    """Check that a fitted pipeline runs the plan its steps describe, which scales 4.0 to ``high``.
+
+    Args:
+        pipeline: A fitted root whose one transformer is a MinMaxScaler of
+            "x", fitted on _scaled_file.
+        high: The high end of the feature_range the test expects.
+
+    """
+    listed: list[dict[str, Any]] = _listed_stages(pipeline)
+    assert json.loads(pipeline.stages_json()) == listed  # the plan, from the fitted C++ pipeline
+    assert listed[0]["params"]["feature_range"][1] == high
+    assert pipeline.transform_dict({"x": 4.0}) == {"x": high}
+
+
+@pytest.mark.parametrize("assigned", ["root", "nested"])
+def test_steps_assigned_while_a_fit_runs_raise_and_the_fit_binds_the_steps_it_compiled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, assigned: str
+) -> None:
+    # REGRESSION: a fit compiles and binds one reading of the steps, and a
+    # pipeline it has read refuses new steps until it returns or raises. The
+    # setter used to take steps while the engine ran, and the fit bound them
+    # to the plan compiled from the old ones: the pipeline listed a range of
+    # (0, 10) and scaled to (0, 1).
+    nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    root: Pipeline = Pipeline([("nested", nested)])
+    target: Pipeline = root if assigned == "root" else nested
+    with _HeldFit(monkeypatch, root, _scaled_file(tmp_path)) as fit:
+        fit.start()
+        with pytest.raises(
+            RuntimeError,
+            match="^Pipeline is being fitted, so its steps cannot be reassigned; "
+            "build a new Pipeline with the steps you want and fit that$",
+        ):
+            target.steps = _new_steps()
+    _assert_runs_the_steps_it_lists(root, 1.0)
+    with pytest.raises(RuntimeError, match="^Pipeline is already fitted"):
+        target.steps = _new_steps()
+
+
+def test_an_assignment_raises_when_a_fit_reads_the_steps_while_it_reads_the_new_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The setter checks before it reads the new steps, and again under the
+    # bind lock that a fit reads the steps under.
+    pipeline: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    with _HeldFit(monkeypatch, pipeline, _scaled_file(tmp_path)) as fit:
+
+        def steps_that_start_the_fit() -> Iterator[tuple[str, Transformer]]:
+            fit.start()  # the fit reads the steps and waits in the engine call
+            yield from _new_steps()
+
+        with pytest.raises(RuntimeError, match="^Pipeline is being fitted"):
+            pipeline.steps = steps_that_start_the_fit()
+    _assert_runs_the_steps_it_lists(pipeline, 1.0)
+
+
+class _AssignsWithAHook(Pipeline):
+    """A Pipeline whose steps setter runs ``hook`` right before it assigns, while it holds the bind lock.
+
+    ``hook`` is a class attribute, cleared before it runs.
+    """
+
+    hook: ClassVar[Callable[[], None] | None] = None
+
+    @override
+    def __setattr__(self, name: str, value: Any) -> None:
+        hook = _AssignsWithAHook.hook
+        if name == "_steps" and hook is not None:
+            _AssignsWithAHook.hook = None
+            hook()
+        super().__setattr__(name, value)
+
+
+def test_a_fit_that_starts_while_the_setter_assigns_waits_and_runs_the_new_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline: _AssignsWithAHook = _AssignsWithAHook([("scale", MinMaxScaler(columns=["x"]))])
+    with _HeldFit(monkeypatch, pipeline, _scaled_file(tmp_path)) as fit:
+        vars(pipeline)["_bind_lock"] = _WatchedLock(fit.moved)
+        # The fit starts once the setter has checked, and waits for the lock.
+        monkeypatch.setattr(_AssignsWithAHook, "hook", fit.start)
+        pipeline.steps = _new_steps()
+        assert _AssignsWithAHook.hook is None  # it ran
+    _assert_runs_the_steps_it_lists(pipeline, 10.0)
+
+
+class _UnreadableScaler(MinMaxScaler):
+    """A MinMaxScaler whose parameters raise ValueError when a fit reads them."""
+
+    @override
+    def params(self) -> dict[str, Any]:
+        raise ValueError("the parameters cannot be read")
+
+
+@pytest.mark.parametrize("failure", ["read", "engine", "threads"])
+def test_a_fit_that_raises_leaves_every_pipeline_in_its_tree_taking_new_steps(tmp_path: Path, failure: str) -> None:
+    nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["missing"]))])
+    # The tree lists the nested pipeline twice: the fit counts it once and
+    # takes its count back once.
+    steps: list[tuple[str, Transformer | Pipeline]] = [("nested", nested), ("again", nested)]
+    if failure == "read":
+        steps.append(("last", _UnreadableScaler(columns=["x"])))
+    root: Pipeline = Pipeline(steps)
+    path: Path = _scaled_file(tmp_path)
+    if failure == "read":
+        with pytest.raises(ValueError, match="^the parameters cannot be read$"):
+            root.fit([path], threads=1)  # raised after the fit has read both pipelines
+    elif failure == "engine":
+        with pytest.raises(EngineError, match="missing"):
+            root.fit([path], threads=1)
+    else:
+        with pytest.raises(ValueError, match="^threads must be"):
+            root.fit([path], threads=-1)  # refused after the fit has read the steps
+    nested.steps = _new_steps()
+    root.steps = [("nested", nested)]
+    root.fit([path], threads=1)
+    _assert_runs_the_steps_it_lists(root, 10.0)
+
+
+_DUPLICATES: dict[str, Callable[[Pipeline], Pipeline]] = {
+    "copy": copy.copy,
+    "deepcopy": copy.deepcopy,
+    "pickle": lambda pipeline: pickle.loads(pickle.dumps(pipeline)),
+}
+
+
+@pytest.mark.parametrize("duplicate", list(_DUPLICATES))
+def test_a_copy_taken_while_a_fit_runs_takes_new_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duplicate: str
+) -> None:
+    pipeline: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    path: Path = _scaled_file(tmp_path)
+    with _HeldFit(monkeypatch, pipeline, path) as fit:
+        fit.start()
+        clone: Pipeline = _DUPLICATES[duplicate](pipeline)
+        clone.steps = _new_steps()
+    _assert_runs_the_steps_it_lists(pipeline, 1.0)
+    clone.fit([path], threads=1)
+    _assert_runs_the_steps_it_lists(clone, 10.0)
 
 
 def test_numpy_integers_are_accepted_for_counts_and_threads(train_files: list[str]) -> None:

@@ -80,6 +80,11 @@ Step = tuple[str, "Transformer | Pipeline"]
 # the prefix of the other.
 _PipelineBinding = tuple[_core.FittedPipeline | None, str, str | None]
 
+# One fit's reading of a step tree: each pipeline in the tree, by its id,
+# with the step list the fit read from it. The fit compiles these lists and
+# binds these lists.
+_Reading = dict[int, tuple["Pipeline", list[Step]]]
+
 _SHELLS: dict[str, type[Transformer]] = {
     "select": Select,
     "cast": Cast,
@@ -221,6 +226,10 @@ class Pipeline:
         self._steps: list[Step] = _validated_steps(steps)
         self._binding: _PipelineBinding = (None, "", None)
         self._bind_lock: threading.Lock = threading.Lock()
+        # The fits that have read the steps and not yet returned or raised;
+        # the steps setter refuses while there is one. Changed under
+        # _bind_lock, as _steps is.
+        self._fitting: int = 0
 
     @property
     def steps(self) -> list[Step]:
@@ -230,8 +239,8 @@ class Pipeline:
         lives in C++ and cannot be edited from Python, so a list that reached
         back into the pipeline would let ``steps.append(...)`` change what the
         pipeline says it does without changing what it runs. Change the steps
-        by assigning to this property, which validates them — and which an
-        already-fitted pipeline refuses.
+        by assigning to this property, which validates them, and which a
+        pipeline that is fitted or being fitted refuses.
 
         Returns:
             The step list.
@@ -242,30 +251,37 @@ class Pipeline:
 
     @steps.setter
     def steps(self, steps: Iterable[Step]) -> None:
-        """Replace the steps of a pipeline that has not been fitted.
+        """Replace the steps of a pipeline that is neither fitted nor being fitted.
+
+        A fit reads the steps of its pipeline and of every pipeline nested in
+        it once, as it starts, and compiles and binds what it read. An
+        assignment on another thread either lands before that read, and the
+        fit runs the new steps, or raises.
 
         Args:
             steps: Ordered (name, transformer-or-pipeline) pairs.
 
         Raises:
-            RuntimeError: If this pipeline is fitted. The fitted plan and
-                every transformer bound to it belong to the steps that were
-                compiled; swapping the Python list would leave the pipeline
-                describing one plan and executing another. Build a new
-                Pipeline and fit that.
+            RuntimeError: If this pipeline is fitted, or is being fitted: a
+                fit of this pipeline, or of a pipeline that holds it, has read
+                the steps of this pipeline and has not yet returned or raised.
+                The fitted plan and every transformer bound to it belong to
+                the steps that were compiled; swapping the Python list would
+                leave the pipeline describing one plan and executing another.
+                Build a new Pipeline and fit that.
             TypeError: If a step is not a (name, Transformer or Pipeline instance) pair.
             ValueError: On an empty, dotted, or duplicated step name.
 
         """
-        # Checked without _ensure_bound: an unpickled artifact is fitted even
-        # before it is loaded, and refusing must not load it just to refuse.
-        handle, _, manifest = self._binding
-        if handle is not None or manifest is not None:
-            raise RuntimeError(
-                "Pipeline is already fitted, so its steps cannot be reassigned; "
-                "build a new Pipeline with the steps you want and fit that"
-            )
-        self._steps = _validated_steps(steps)
+        # Checked before the new steps are read, so that a fitted pipeline
+        # refuses whatever it is given, and again under the lock that a fit
+        # reads the steps under, so that the assignment raises when a fit read
+        # them in between.
+        self._refuse_new_steps()
+        validated: list[Step] = _validated_steps(steps)
+        with self._bind_lock:
+            self._refuse_new_steps()
+            self._steps = validated
 
     def fit(
         self,
@@ -309,9 +325,22 @@ class Pipeline:
                 A path that cannot be encoded as UTF-8 raises ValueError.
 
         """
-        plan: str = json.dumps(self._to_tree())
-        engine: _core.Engine = _fit_engine(threads, temp_dir)
-        self._adopt(engine.fit(plan, _source_paths(X)))
+        # REGRESSION: the fit compiles and binds one reading of the steps, and
+        # every pipeline in the tree refuses new steps from that reading until
+        # the fit returns or raises. The steps used to be read again for the
+        # bind, after the engine returned, and the setter refused only a
+        # fitted pipeline: steps assigned in between were bound to the plan
+        # compiled from the old ones, and the pipeline listed one plan and ran
+        # another.
+        reading: _Reading = {}
+        try:
+            plan: str = json.dumps(self._to_tree(reading))
+            engine: _core.Engine = _fit_engine(threads, temp_dir)
+            self._adopt(engine.fit(plan, _source_paths(X)), reading)
+        finally:
+            for pipeline, _ in reading.values():
+                with pipeline._bind_lock:
+                    pipeline._fitting -= 1
         return self
 
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
@@ -610,6 +639,9 @@ class Pipeline:
         clone: Pipeline = type(self).__new__(type(self))
         clone.__dict__.update(self.__dict__)
         clone._bind_lock = threading.Lock()
+        # The copy is not being fitted: a fit of the original takes its count
+        # back from the original only.
+        clone._fitting = 0
         return clone
 
     def __getstate__(self) -> dict[str, Any]:
@@ -649,6 +681,7 @@ class Pipeline:
         self._steps = state["steps"]
         self._binding = (None, state.get("prefix", ""), state["manifest"])
         self._bind_lock = threading.Lock()
+        self._fitting = 0
 
     def _ensure_bound(self) -> _PipelineBinding:
         """Load a deferred (unpickled) saved pipeline and bind every step to it, once.
@@ -663,49 +696,88 @@ class Pipeline:
         with self._bind_lock:
             binding = self._binding
             if binding[2] is not None:
-                binding = self._bind_stages(_core.FittedPipeline.load_json(binding[2]), prefix=binding[1])
+                binding = self._bind_stages(_core.FittedPipeline.load_json(binding[2]), prefix=binding[1], reading=None)
             return binding
 
-    def _to_tree(self) -> dict[str, Any]:
-        """Serialize the step tree for the C++ plan compiler.
+    def _refuse_new_steps(self) -> None:
+        """Raise if this pipeline is fitted or being fitted.
+
+        Raises:
+            RuntimeError: If it is.
+
+        """
+        # Checked without _ensure_bound: an unpickled pipeline is fitted even
+        # before its manifest is loaded, and refusing must not load it just to
+        # refuse.
+        handle, _, manifest = self._binding
+        if handle is not None or manifest is not None:
+            raise RuntimeError(
+                "Pipeline is already fitted, so its steps cannot be reassigned; "
+                "build a new Pipeline with the steps you want and fit that"
+            )
+        if self._fitting:
+            raise RuntimeError(
+                "Pipeline is being fitted, so its steps cannot be reassigned; "
+                "build a new Pipeline with the steps you want and fit that"
+            )
+
+    def _to_tree(self, reading: _Reading) -> dict[str, Any]:
+        """Read the step tree for a fit and serialize it for the C++ plan compiler.
+
+        Each pipeline in the tree is read once, under its bind lock, and
+        counts the fit in ``_fitting`` from then on, which refuses new steps;
+        the fit takes the count back when it returns or raises.
+
+        Args:
+            reading: Collects each pipeline read, with its steps.
 
         Returns:
             The nested plan tree as JSON-compatible data.
 
         """
+        with self._bind_lock:
+            if id(self) not in reading:
+                reading[id(self)] = (self, self._steps)
+                self._fitting += 1
         serialized_steps: list[list[Any]] = []
-        for name, step in self._steps:
+        for name, step in reading[id(self)][1]:
             if isinstance(step, Pipeline):
-                serialized_steps.append([name, step._to_tree()])
+                serialized_steps.append([name, step._to_tree(reading)])
             else:
                 serialized_steps.append([name, {"kernel": step.kernel_id, "params": step.params()}])
         return {"type": "pipeline", "steps": serialized_steps}
 
-    def _adopt(self, handle: _core.FittedPipeline) -> None:
+    def _adopt(self, handle: _core.FittedPipeline, reading: _Reading | None) -> None:
         """Take ownership of a fitted C++ handle and bind every stage's shell.
 
         Args:
             handle: The fitted C++ pipeline.
+            reading: The steps the plan was compiled from, or None to bind
+                the steps of a loaded pipeline, which cannot change.
 
         """
         with self._bind_lock:
-            self._bind_stages(handle, prefix="")
+            self._bind_stages(handle, prefix="", reading=reading)
 
-    def _bind_stages(self, handle: _core.FittedPipeline, prefix: str) -> _PipelineBinding:
+    def _bind_stages(self, handle: _core.FittedPipeline, prefix: str, reading: _Reading | None) -> _PipelineBinding:
         """Recursively give each transformer, then this pipeline, its fitted-state view.
 
         Args:
             handle: The fitted C++ pipeline.
             prefix: Dotted stage-name prefix for this nesting level.
+            reading: The steps the plan was compiled from, or None to bind
+                the steps of an unpickled or loaded pipeline, which cannot
+                change.
 
         Returns:
             The binding it published.
 
         """
-        for name, step in self._steps:
+        steps: list[Step] = self._steps if reading is None else reading[id(self)][1]
+        for name, step in steps:
             stage: str = name if prefix == "" else f"{prefix}.{name}"
             if isinstance(step, Pipeline):
-                step._bind_stages(handle, prefix=stage)
+                step._bind_stages(handle, prefix=stage, reading=reading)
             else:
                 step._bind(handle, stage, standalone=False)
         # REGRESSION: the handle, the prefix and the cleared manifest are
@@ -753,7 +825,7 @@ class Pipeline:
 
         """
         pipeline: Pipeline = cls(cls._steps_from_ops(json.loads(handle.stages_json())))
-        pipeline._adopt(handle)
+        pipeline._adopt(handle, None)
         return pipeline
 
     @classmethod
