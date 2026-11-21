@@ -450,8 +450,8 @@ def test_kmeans_stops_after_its_first_pass_when_its_squares_sum_past_f64(tmp_pat
     values is exact. Each square is below 2**1000, so only more than 2**24
     squares can sum past f64's range, and m is the smallest count whose
     squares do: in sorted order they stay within range until the last one.
-    The refused sum then reads negative infinity, not NaN, so a fit that
-    turned only a NaN tolerance into infinity would run on here.
+    Their exact sum rounds to infinity, and with every value under 2**512
+    from the mean that makes the tolerance infinite.
     scikit-learn's variance overflows to infinity, and so does its
     tolerance, so its run stops after the first pass, and these are that
     pass's edges, to the bit. On the second pass the values at -a / 1024

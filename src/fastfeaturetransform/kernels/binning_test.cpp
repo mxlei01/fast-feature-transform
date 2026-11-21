@@ -379,36 +379,99 @@ TEST_CASE("k_bins_discretize's kmeans scales a column far from its mean by a pow
     for (double& value : values) value = std::ldexp(value, exponent);
     return values;
   };
-  // At 2^520 the tolerance is infinite. The first pass puts the five
-  // lowest values together, then the next two, then the highest three.
+  // A column of ordinary spread, and one of 2^600 beside -17, -8 and 9,
+  // whose small values would underflow if the scaling went further. Both
+  // lie past 2^512 from their mean and run to convergence. The edges are
+  // scikit-learn 1.9.0's on narrow and on wide divided by 2^101, times 2^520
+  // and 2^101, and the 0.0.2 wheel's on the columns as written.
   const std::vector<double> narrow{-2.0, -1.5, -1.0, -0.75, 0.0, 0.5, 1.0, 2.5, 3.0, 4.0};
-  const std::vector<double> first = scaled(edges(scaled(narrow, 520), 3), -520);
-  REQUIRE(first.size() == 4);
-  REQUIRE(first[0] == -2.0);
-  REQUIRE(first[1] == Approx(-0.15));
-  REQUIRE(first[2] == Approx(47.0 / 24.0));
-  REQUIRE(first[3] == 4.0);
+  REQUIRE(edges(scaled(narrow, 520), 3) ==
+          std::vector<double>{-0x1p521, -0x1.a000000000002p+518, 0x1.d555555555554p+520, 0x1p522});
   const std::vector<double> wide{-std::ldexp(1.0, 600), -17.0, -8.0, 9.0, std::ldexp(1.0, 600)};
-  const std::vector<double> wide_edges = edges(wide, 4);
-  REQUIRE(wide_edges.size() == 5);
-  REQUIRE(wide_edges.front() == -0x1p600);
-  REQUIRE(wide_edges[1] == -0x1p599);
-  REQUIRE(wide_edges[2] == Approx(-112.0 / 15.0));
-  REQUIRE(wide_edges[3] == 0x1p599);
-  REQUIRE(wide_edges.back() == 0x1p600);
-  // The cubes of 0 to 63, scaled near the overflow threshold for the
-  // variance. scikit-learn 1.9.0 runs until convergence at the lower
-  // exponent and stops after the first pass at the higher exponent.
+  REQUIRE(edges(wide, 4) == std::vector<double>{-0x1p600, -0x1p599, -0x1.cp0, 0x1p599, 0x1p600});
+  // Under 2^512 from the mean, the tolerance is infinite, and the run stops
+  // after its first pass, when the squared deviations at the column's own
+  // scale sum to 2^1024 - 2^970 or more, which rounds to infinity. The
+  // squared deviations of the cubes of 0 to 63 sum to 0.019 of that point
+  // times 2^490 and to 1.224 of it times 2^493, and times 115 * 2^486 and
+  // 29 * 2^488 to 0.988 and 1.005 of it (exact sums of the rounded squares).
+  // scikit-learn 1.9.0 gives all four columns' edges at their own scale:
+  // converged under the point and after one pass past it.
   std::vector<double> cubes;
   for (int i = 0; i < 64; ++i) cubes.push_back(i * i * i);
+  const auto times = [&](double factor, int exponent) {
+    std::vector<double> values = cubes;
+    for (double& value : values) value = std::ldexp(value * factor, exponent);
+    return values;
+  };
   REQUIRE(edges(scaled(cubes, 490), 3) == scaled({0.0, 56995.5, 150780.75, 250047.0}, 490));
   REQUIRE(edges(scaled(cubes, 493), 3) == scaled({0.0, 71698.0, 167319.5, 250047.0}, 493));
+  REQUIRE(edges(times(115.0, 486), 3) == std::vector<double>{0.0, 0x1.900dcap+508, 0x1.08958a4p+510, 0x1.b6c5cdp+510});
+  REQUIRE(edges(times(29.0, 488), 3) == std::vector<double>{0.0, 0x1.fba0ap+508, 0x1.2828a6p+510, 0x1.ba968cp+510});
   // Near f64's largest the initial midpoints overflow their sum, and a span
   // past f64 is refused rather than fit to a degenerate model.
   const std::vector<double> top{0.0, 1.63e308, 3e304, 1e304};
   REQUIRE(edges(top, 3) == scaled(edges(scaled(top, -2), 3), 2));
   REQUIRE_THROWS_WITH(edges({-1e308, -5e307, 0.0, 5e307, 1e308}, 3),
                       ContainsSubstring("column 'x' spans past the range of f64"));
+}
+
+TEST_CASE("k_bins_discretize's kmeans stops after one pass only within 2^512 of the mean") {
+  // Under 2^512 every squared deviation is finite (the largest double under
+  // 2^512 squares to 2^1024 - 2^972), and where they sum past f64,
+  // scikit-learn's tolerance is infinite and its run stops after the first
+  // pass. From 2^512 on, its squares overflow one by one and its edges
+  // depend on which of its distances overflow, so the fit runs to
+  // convergence as scikit-learn runs the column divided by a power of two.
+  const fft::Schema schema{{{"x", "f64"}}};
+  const auto edges = [&](std::vector<double> values, int exponent, int bins) {
+    for (double& value : values) value = std::ldexp(value, exponent);
+    const nlohmann::json params{{"columns", {"x"}}, {"n_bins", bins}, {"encode", "ordinal"}, {"strategy", "kmeans"}};
+    const nlohmann::json fitted =
+        fit_binning("k_bins_discretize", params, schema, {make_batch({"x"}, {f64_column(values)})})->state();
+    return fitted.at("bin_edges").at("x").get<std::vector<double>>();
+  };
+  // Both columns have a mean of exactly 0 and reach 16 on either side, the
+  // second only the largest double under 16. At 2 bins the first pass splits
+  // them at 0, and a second pass would move -1 up.
+  const double ulp = 0x1p-49;
+  const std::vector<double> reach{-16.0, -16.0, -1.0, 4.0, 4.0, 4.0, 5.0, 16.0};
+  const std::vector<double> under{-(16 - ulp), -(16 - ulp), -1.0, 4.0, 4.0, 4.0, 5 - ulp, 16 - ulp};
+  // The farthest value is the largest double under 2^512 from the mean.
+  // scikit-learn 1.9.0 gives these edges at this scale, after one pass.
+  REQUIRE(edges(under, 508, 2) ==
+          std::vector<double>{-0x1.fffffffffffffp+511, -0x1.1999999999999p+509, 0x1.fffffffffffffp+511});
+  // At 2^512 itself, and with the first column doubled, the edges are the
+  // 0.0.2 wheel's, and scikit-learn 1.9.0's on the columns divided by 2^12
+  // and 2^13 times those powers. scikit-learn at the columns' own scale
+  // still stops after one pass, at -0x1.1999999999999p+509 and +510.
+  REQUIRE(edges(reach, 508, 2) == std::vector<double>{-0x1p512, -0x1.5555555555556p+510, 0x1p512});
+  REQUIRE(edges(under, 509, 2) ==
+          std::vector<double>{-0x1.fffffffffffffp+512, -0x1.5555555555555p+511, 0x1.fffffffffffffp+512});
+  // The distance is from the mean, not from 0. Every value of the first
+  // column lies past 2^512, none lies more than 12 * 2^508 from the mean of
+  // 2^513, and their squared deviations sum past f64: scikit-learn 1.9.0
+  // gives these edges at this scale, after one pass. Every value of the
+  // second lies under 2^512 and its span under 2^513, and its highest value
+  // lies 24.25 * 2^508 from the mean of -10.25 * 2^508: the 0.0.2 wheel's
+  // edges, and scikit-learn 1.9.0's on the column divided by 2^13 times
+  // 2^13.
+  REQUIRE(edges({20.0, 20.0, 31.0, 33.0, 36.0, 36.0, 36.0, 44.0}, 508, 2) ==
+          std::vector<double>{0x1.4p+512, 0x1.e555555555556p+512, 0x1.6p+513});
+  REQUIRE(edges({-14.0, -14.0, -14.0, -14.0, -14.0, -14.0, -12.0, 14.0}, 508, 3) ==
+          std::vector<double>{-0x1.cp+511, -0x1.ap+511, 0x1p+508, 0x1.cp+511});
+  // Past 2^512 the run stops where the column divided by a power of two
+  // stops: for the cubes of 0 to 299 at 3 bins, at the ninth pass, whose
+  // center shifts fall to the tolerance before the labels repeat. The
+  // edges are scikit-learn 1.9.0's on the cubes at their own scale, times
+  // 2^520, and the 0.0.2 wheel's.
+  std::vector<double> cubes;
+  for (int i = 0; i < 300; ++i) cubes.push_back(i * i * i);
+  REQUIRE(edges(cubes, 520, 3) == std::vector<double>{0.0, 0x1.663667p+542, 0x1.dc96928p+543, 0x1.97e193p+544});
+  // -a, -a, a, a at 4 bins, a = 2^512: the 0.0.2 wheel's edges. One pass
+  // would end on a center at 2a, which an empty cluster takes from the
+  // unaveraged sum of the cluster at a, and on a top edge of 1.5a.
+  REQUIRE(edges({-1.0, -1.0, 1.0, 1.0}, 512, 4) == std::vector<double>{-0x1p512, -0x1p512, 0.0, 0x1p512});
 }
 
 TEST_CASE("k_bins_discretize's kmeans refuses a center midpoint that is not finite") {
