@@ -463,6 +463,36 @@ def test_a_group_agg_saves_a_timestamp_column_as_an_integer(tmp_path: Path) -> N
     assert pq.read_table(loaded_parts).to_pylist() == pq.read_table(fresh_parts).to_pylist()
 
 
+def test_an_aware_datetime_converts_up_to_each_bound_of_int64_microseconds(tmp_path: Path) -> None:
+    # The count is the wall clock less the offset, computed in Python ints
+    # here. Each count from -2**63 to 2**63 - 1 converts, and a count one past
+    # either bound is refused, also where the offset itself fits in int64.
+    class OffsetDateTime(datetime):
+        _offset: timedelta
+
+        def __new__(cls, wall: datetime, offset: timedelta) -> Self:
+            instance = super().__new__(
+                cls, wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second, wall.microsecond, tzinfo=UTC
+            )
+            instance._offset = offset
+            return instance
+
+        def utcoffset(self) -> timedelta:
+            return self._offset
+
+    pipeline: Pipeline = _scaler(tmp_path)
+    lowest, highest = -(2**63), 2**63 - 1
+    for wall in (datetime(1, 1, 1), EPOCH, datetime(9999, 12, 31, 23, 59, 59, 999_999)):
+        micros: int = (wall - EPOCH) // ONE_US
+        for count in (lowest, highest):
+            value = OffsetDateTime(wall, timedelta(microseconds=micros - count))
+            assert pipeline.transform_dict({"x": 1.0, "t": value})["t"] == count, (wall, count)
+        for count in (lowest - 1, highest + 1):
+            value = OffsetDateTime(wall, timedelta(microseconds=micros - count))
+            with pytest.raises(EngineError, match="^record value for 't' is outside the range of int64 microseconds$"):
+                pipeline.transform_dict({"x": 1.0, "t": value})
+
+
 def test_a_datetime_subclass_with_an_overflowing_utcoffset_is_refused(tmp_path: Path) -> None:
     # REGRESSION: epoch_microseconds computed the utcoffset shift and
     # subtraction in signed int64, overflowing on a datetime subclass whose

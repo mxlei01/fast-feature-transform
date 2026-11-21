@@ -885,6 +885,40 @@ TEST_CASE("a record lookup tells names of one size apart by any of their bytes")
   }
 }
 
+// Each name here sits in a heap buffer of exactly its size, so that under
+// AddressSanitizer a read of a byte past a name is an error. A std::string
+// holds a NUL past its last byte inside its own allocation, and a read of that
+// byte, the same in both names, passes unseen.
+TEST_CASE("name comparisons read no byte past either name") {
+  for (std::size_t size = 0; size <= 40; ++size) {
+    CAPTURE(size);
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::vector<std::string_view> names;
+    const auto add = [&](const std::string& text) {
+      buffers.push_back(std::make_unique<char[]>(text.size()));
+      std::ranges::copy(text, buffers.back().get());
+      names.emplace_back(buffers.back().get(), text.size());
+    };
+    // The name, for each of its bytes a name that differs in that byte
+    // alone, and names one byte shorter and one byte longer.
+    const std::string name(size, 'n');
+    add(name);
+    for (std::size_t byte = 0; byte < size; ++byte) {
+      std::string other = name;
+      other[byte] = 'm';
+      add(other);
+    }
+    if (size > 0) add(name.substr(1));
+    add(name + "n");
+    for (const std::string_view left : names) {
+      for (const std::string_view right : names) {
+        REQUIRE(fft::TransparentStringEqual{}(left, right) == (left == right));
+        REQUIRE(fft::TransparentStringEqual::scan_match(left, right) == (left == right));
+      }
+    }
+  }
+}
+
 TEST_CASE("a record lookup indexes a record of 128 fields that is read 16 times") {
   std::vector<std::string> names;
   for (std::size_t i = 0; i < 16; ++i) names.push_back("f" + std::to_string(127 - 5 * i));

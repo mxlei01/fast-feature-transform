@@ -101,6 +101,11 @@ TEST_CASE("make_kernel refuses a parameter name the kernel does not report") {
   REQUIRE_NOTHROW(fft::make_kernel("cast", nlohmann::json::parse(R"({"types": {"with_means": "f64"}})")));
   REQUIRE_NOTHROW(
       fft::make_kernel("group_agg", nlohmann::json::parse(R"({"key": "k", "aggs": {"with_means": ["sum"]}})")));
+  // Only cast skips the check of its names when its params hold types, its
+  // one required parameter, and nothing else. Any other kernel refuses a
+  // lone 'types'.
+  REQUIRE_THROWS_WITH(fft::make_kernel("standard_scale", nlohmann::json::parse(R"({"types": {"x": "f64"}})")),
+                      Equals("standard_scale: unknown parameter 'types'" + accepted));
 }
 
 TEST_CASE("make_kernel takes params as an object, or as null for no parameters") {

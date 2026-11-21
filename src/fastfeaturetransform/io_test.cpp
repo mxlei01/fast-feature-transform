@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +64,7 @@
 namespace fft = fastfeaturetransform;
 using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::EndsWith;
+using Catch::Matchers::Equals;
 using Catch::Matchers::StartsWith;
 using fft::testing::bool_column;
 using fft::testing::f64_column;
@@ -4274,6 +4276,27 @@ TEST_CASE("MemmapSink rolls back a constructor failure after opening its tempora
   REQUIRE(file_contents(index_temp) == "unowned index temporary");
   REQUIRE_FALSE(std::filesystem::exists(fft::MemmapSink::data_path(dir.path.string())));
   REQUIRE_FALSE(std::filesystem::exists(fft::MemmapSink::index_path(dir.path.string())));
+}
+
+// An I/O error names the path and ends with the system's text for the
+// error. Opening a directory for writing and renaming a file over a directory
+// both fail with EISDIR on Linux and on macOS. The text for it is each
+// platform's own, so it is taken from std::strerror here.
+TEST_CASE("MemmapSink errors end with the system's text for the error") {
+  const std::string is_a_directory = std::strerror(EISDIR);
+  {
+    TempDir dir;
+    const auto temp = fft::MemmapSink::temp_path(dir.path.string());
+    REQUIRE(std::filesystem::create_directory(temp));
+    REQUIRE_THROWS_WITH((fft::MemmapSink(dir.path.string(), fft::Schema{{{"a", "i32"}}}, {1})),
+                        Equals(temp + ": cannot create: " + is_a_directory));
+  }
+  TempDir dir;
+  const auto index = fft::MemmapSink::index_path(dir.path.string());
+  REQUIRE(std::filesystem::create_directory(index));
+  fft::MemmapSink sink(dir.path.string(), fft::Schema{{{"a", "i32"}}}, {1});
+  sink.write(0, make_batch({"a"}, {numeric_column<arrow::Int32Type>({7})}));
+  REQUIRE_THROWS_WITH(sink.finish(), Equals(index + ": " + is_a_directory));
 }
 
 TEST_CASE("MemmapSink cleans a metadata serialization failure before leaving scope") {

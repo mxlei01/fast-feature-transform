@@ -560,6 +560,20 @@ class _PathLike:
         return self.path
 
 
+class _Elsewhere(str):
+    """A str whose __str__ names a directory other than the one its text names."""
+
+    @override
+    def __str__(self) -> str:
+        """Name another directory.
+
+        Returns:
+            'elsewhere'.
+
+        """
+        return "elsewhere"
+
+
 # Every public call that takes a directory. None is refused only where the
 # call needs a directory; elsewhere it means a temporary directory, or the
 # system's temporary directory for temp_dir.
@@ -719,14 +733,22 @@ def test_a_path_is_read_through_os_fspath(call: str, tmp_path: Path, monkeypatch
         "temp_dir": [],
     }
     expected: list[str] = written[what]
-    for kind in ("str", "Path", "PathLike", "DirEntry"):
+    # A str subclass names the directory its text holds: its __str__, which
+    # names another one, is not called.
+    for kind in ("str", "str subclass", "Path", "PathLike", "DirEntry"):
         shutil.rmtree(work / "tgt", ignore_errors=True)
         (work / "tgt").mkdir()
         if call == "Pipeline.load":
             Pipeline([("select", Select(columns=["x"]))]).fit([source]).save("tgt")
         with os.scandir(".") as entries:
             entry: os.DirEntry[str] = next(entry for entry in entries if entry.name == "tgt")
-        value: Any = {"str": "tgt", "Path": Path("tgt"), "PathLike": _PathLike("tgt"), "DirEntry": entry}[kind]
+        value: Any = {
+            "str": "tgt",
+            "str subclass": _Elsewhere("tgt"),
+            "Path": Path("tgt"),
+            "PathLike": _PathLike("tgt"),
+            "DirEntry": entry,
+        }[kind]
         result: Any = run(value)
         assert sorted(path.name for path in work.iterdir()) == ["tgt"], kind
         assert sorted(path.name for path in (work / "tgt").iterdir()) == expected, kind

@@ -18,6 +18,8 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "fastfeaturetransform/io.hpp"
@@ -224,11 +226,18 @@ TEST_CASE("a polynomial artifact serves its stored basis and refuses one without
   REQUIRE(nlohmann::json::parse(loaded.manifest_json()) == manifest);
   REQUIRE(loaded.transform_row({{"c", std::string("a")}}) == fft::Row{{"c_0", -0.25}});
 
-  for (const char* key : {"handle_missing", "handle_unknown"}) {
-    nlohmann::json wrong = manifest;
-    wrong["ops"][0]["params"][key] = true;
-    REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(wrong.dump()),
-                        ContainsSubstring(std::string("'") + key + "' must be 'value', 'return_nan'"));
+  // A handling option that is not a string is refused by name, whatever its
+  // JSON type.
+  for (const auto& [key, allowed] : {std::pair{"handle_missing", "'value', 'return_nan' or 'error'"},
+                                     std::pair{"handle_unknown", "'value', 'return_nan', 'indicator' or 'error'"}}) {
+    for (const nlohmann::json& value : {nlohmann::json(true), nlohmann::json(0), nlohmann::json(2.5),
+                                        nlohmann::json::array(), nlohmann::json::object()}) {
+      CAPTURE(key, value.dump());
+      nlohmann::json wrong = manifest;
+      wrong["ops"][0]["params"][key] = value;
+      REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(wrong.dump()),
+                          Equals(std::string("polynomial_encode: '") + key + "' must be " + allowed));
+    }
   }
 
   // A stripped basis is refused rather than rebuilt.
@@ -255,12 +264,18 @@ TEST_CASE("load_json enforces the same invariants as compile_plan, with context"
     REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(bad.dump()), ContainsSubstring("invalid stage name"));
   }
 
-  for (const auto& names : {std::pair{"a", "a.inner"}, std::pair{"a.inner", "a"}}) {
+  // A step and a nested pipeline must not share a name at any depth, in
+  // either order. In 'x.a.b.c' the shared name 'x.a' ends at neither the
+  // first dot nor the last.
+  for (const auto& [first, second, shared] :
+       {std::tuple{"a", "a.inner", "a"}, std::tuple{"a.inner", "a", "a"}, std::tuple{"x.a", "x.a.b", "x.a"},
+        std::tuple{"x.a.b", "x.a", "x.a"}, std::tuple{"x.a", "x.a.b.c", "x.a"}, std::tuple{"x.a.b.c", "x.a", "x.a"}}) {
+    CAPTURE(first, second);
     nlohmann::json clash = duplicate;
-    clash["ops"][0]["stage"] = names.first;
-    clash["ops"][1]["stage"] = names.second;
+    clash["ops"][0]["stage"] = first;
+    clash["ops"][1]["stage"] = second;
     REQUIRE_THROWS_WITH(fft::FittedPipeline::load_json(clash.dump()),
-                        ContainsSubstring("stage 'a' is both a step and a nested pipeline"));
+                        ContainsSubstring(std::string("stage '") + shared + "' is both a step and a nested pipeline"));
   }
   nlohmann::json split = duplicate;
   split["ops"].push_back(op);
