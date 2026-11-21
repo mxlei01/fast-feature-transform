@@ -27,6 +27,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/column_page.h>
 #include <parquet/column_reader.h>
+#include <parquet/encoding.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 #include <parquet/page_index.h>
@@ -1253,12 +1254,13 @@ struct PageLayout {
 
 // Writes `table` to `path` with `compression`, without statistics and with a
 // page index, laid out as `layout` says. A dictionary limit also makes the
-// writer look at it every 50 values and end a data page near every 400 bytes.
-// With `int96`, timestamps are stored as INT96. With `format_1_0`, the file
-// is written in format 1.0, whose dictionary pages are PLAIN_DICTIONARY.
+// writer look at it every 50 values and end a data page near every
+// `page_size` bytes. With `int96`, timestamps are stored as INT96. With
+// `format_1_0`, the file is written in format 1.0, whose dictionary pages are
+// PLAIN_DICTIONARY.
 void write_pages(const std::string& path, const arrow::Table& table, const PageLayout& layout,
                  parquet::Compression::type compression = parquet::Compression::UNCOMPRESSED, bool int96 = false,
-                 bool format_1_0 = false) {
+                 bool format_1_0 = false, int64_t page_size = 400) {
   parquet::WriterProperties::Builder properties;
   if (format_1_0) properties.version(parquet::ParquetVersion::PARQUET_1_0);
   properties.compression(compression)
@@ -1268,7 +1270,7 @@ void write_pages(const std::string& path, const arrow::Table& table, const PageL
   properties.data_page_version(layout.data_page_v2 ? parquet::ParquetDataPageVersion::V2
                                                    : parquet::ParquetDataPageVersion::V1);
   if (layout.dictionary_limit > 0) {
-    properties.dictionary_pagesize_limit(layout.dictionary_limit)->write_batch_size(50)->data_pagesize(400);
+    properties.dictionary_pagesize_limit(layout.dictionary_limit)->write_batch_size(50)->data_pagesize(page_size);
   }
   parquet::ArrowWriterProperties::Builder arrow_properties;
   if (layout.store_schema) arrow_properties.store_schema();
@@ -1825,6 +1827,364 @@ TEST_CASE("an index past the dictionary page is refused in a page of indices tha
         REQUIRE(values.size() < written.size());
         REQUIRE(std::equal(values.begin(), values.end(), written.begin()));
       }
+    }
+  }
+}
+
+namespace {
+
+// The unsigned LEB128 varint of `value`, as Parquet stores the header of a
+// run of indices and Thrift's compact encoding an integer.
+std::string leb128(uint64_t value) {
+  std::string out;
+  do {
+    const auto low = static_cast<uint8_t>(value & 0x7fu);
+    value >>= 7;
+    out.push_back(static_cast<char>(value != 0 ? low | 0x80u : low));
+  } while (value != 0);
+  return out;
+}
+
+// Moves data pages `moved` (positions in column chunk (0, `leaf`) of the
+// file at `path`), pages of dictionary indices, behind the chunk's plain
+// pages, in that order.
+void move_behind_plain_pages(const std::string& path, int leaf, const std::vector<std::size_t>& moved) {
+  const std::vector<bool> plain = plain_data_pages(path, 0, leaf);
+  std::vector<std::size_t> order;
+  for (std::size_t i = 0; i < plain.size(); ++i) {
+    if (std::find(moved.begin(), moved.end(), i) == moved.end()) order.push_back(i);
+  }
+  for (const std::size_t page : moved) {
+    REQUIRE(page < plain.size());
+    REQUIRE_FALSE(plain[page]);
+    order.push_back(page);
+  }
+  reorder_data_pages(path, leaf, order);
+}
+
+// Rewrites data page `page` (counted among the chunk's data pages, in the
+// order the chunk holds them) of column chunk (0, 0) of the uncompressed
+// file at `path`, a page of dictionary indices with a value in every slot,
+// so that its indices end after the first `kept` of them, with the one at
+// `at` set to `outside`. The indices become one bit-packed run after the
+// byte that states their bit width: the run's header states ceil(kept / 8)
+// groups of 8 values, and its bytes hold the first `kept`, the first value
+// in the lowest bits. With `truncate`, the page is the chunk's last, it ends
+// with the byte that holds the last bit of them, and its header states its
+// new size; the chunk's bytes after it stay, and Arrow's page reader, which
+// stops at the values the chunk states, does not read them. Otherwise
+// `kept` is a multiple of 8, and the run is followed by a zero byte, the
+// header of a run of no values, which ends the decoding, and zeros up to
+// the page's size. Returns the count of indices the page held.
+int cut_indices(const std::string& path, std::size_t page, int kept, int at, int32_t outside, bool truncate) {
+  std::shared_ptr<parquet::Page> found;
+  bool last = false;
+  const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+  const parquet::ColumnDescriptor& column = *file->metadata()->schema()->Column(0);
+  {
+    const std::shared_ptr<parquet::RowGroupReader> row_group = file->RowGroup(0);
+    REQUIRE(row_group->metadata()->ColumnChunk(0)->compression() == parquet::Compression::UNCOMPRESSED);
+    const std::unique_ptr<parquet::PageReader> pages = row_group->GetColumnPageReader(0);
+    std::size_t seen = 0;
+    while (const std::shared_ptr<parquet::Page> next = pages->NextPage()) {
+      if (next->type() != parquet::PageType::DATA_PAGE && next->type() != parquet::PageType::DATA_PAGE_V2) continue;
+      if (seen++ == page) found = next;
+    }
+    last = seen == page + 1;
+  }
+  REQUIRE(found != nullptr);
+  const auto& data = static_cast<const parquet::DataPage&>(*found);
+  REQUIRE(data.encoding() == parquet::Encoding::RLE_DICTIONARY);
+  const std::string body(reinterpret_cast<const char*>(data.data()), static_cast<std::size_t>(data.size()));
+  // The levels in front of the indices: a version 2 page states their
+  // lengths in its header, and a version 1 page holds each length in 4
+  // little-endian bytes in front of them.
+  std::size_t levels = 0;
+  if (data.type() == parquet::PageType::DATA_PAGE_V2) {
+    const auto& v2 = static_cast<const parquet::DataPageV2&>(data);
+    levels = static_cast<std::size_t>(v2.repetition_levels_byte_length()) +
+             static_cast<std::size_t>(v2.definition_levels_byte_length());
+  } else {
+    for (const bool present : {column.max_repetition_level() > 0, column.max_definition_level() > 0}) {
+      if (!present) continue;
+      uint32_t length = 0;
+      std::memcpy(&length, body.data() + levels, 4);
+      levels += 4 + length;
+    }
+  }
+  const int count = data.num_values();
+  std::vector<int32_t> indices(static_cast<std::size_t>(count));
+  auto decoder = parquet::MakeDictDecoder<parquet::ByteArrayType>(&column);
+  decoder->SetData(count, data.data() + levels, static_cast<int>(body.size() - levels));
+  REQUIRE(decoder->DecodeIndices(count, indices.data()) == count);
+  REQUIRE(0 <= at);
+  REQUIRE(at < kept);
+  REQUIRE(kept < count);
+  indices.resize(static_cast<std::size_t>(kept));
+  indices[static_cast<std::size_t>(at)] = outside;
+  int width = static_cast<uint8_t>(body[levels]);
+  while ((outside >> width) != 0) ++width;
+  std::string bits(static_cast<std::size_t>((kept * width + 7) / 8), '\0');
+  for (int i = 0; i < kept; ++i) {
+    for (int bit = 0; bit < width; ++bit) {
+      if (((indices[static_cast<std::size_t>(i)] >> bit) & 1) == 0) continue;
+      const int position = i * width + bit;
+      char& byte = bits[static_cast<std::size_t>(position / 8)];
+      byte = static_cast<char>(static_cast<uint8_t>(byte) | (1u << (position % 8)));
+    }
+  }
+  std::string fresh = body.substr(0, levels) + static_cast<char>(width) +
+                      leb128(((static_cast<uint64_t>(kept) + 7) / 8 << 1) | 1u) + bits;
+  std::string bytes = file_contents(path);
+  const std::size_t start = bytes.find(body);
+  REQUIRE(start != std::string::npos);
+  REQUIRE(bytes.find(body, start + 1) == std::string::npos);
+  if (truncate) {
+    REQUIRE(last);
+    // The bytes hold no more values than `kept`, which Arrow's decoder
+    // decodes from a last run that ends inside its last group of 8.
+    REQUIRE(static_cast<int>(bits.size()) * 8 - kept * width < width);
+    REQUIRE(fresh.size() < body.size());
+    // Arrow's writer opens a page header with the page's type, its size
+    // uncompressed and its size compressed, each an i32 (0x15) that holds a
+    // zigzag varint; the new size takes as many bytes as the old one.
+    const auto opening = [&](std::size_t size) {
+      const std::string type = leb128(data.type() == parquet::PageType::DATA_PAGE_V2 ? 3u << 1 : 0u);
+      const std::string stated = leb128(static_cast<uint64_t>(size) << 1);
+      return "\x15" + type + "\x15" + stated + "\x15" + stated;
+    };
+    const std::string old = opening(body.size());
+    const std::size_t header = bytes.rfind(old, start);
+    REQUIRE(header != std::string::npos);
+    REQUIRE(start - header < 64);
+    REQUIRE(opening(fresh.size()).size() == old.size());
+    bytes.replace(header, old.size(), opening(fresh.size()));
+  } else {
+    REQUIRE(kept % 8 == 0);
+    fresh.push_back('\0');
+    REQUIRE(fresh.size() <= body.size());
+    fresh.resize(body.size(), '\0');
+  }
+  bytes.replace(start, fresh.size(), fresh);
+  write_contents(path, bytes);
+  return count;
+}
+
+}  // namespace
+
+TEST_CASE("an index past the dictionary page is refused before a batch holds it in a page of indices that ends early") {
+  // Arrow's reader decodes a page of indices a batch's rows at a time, and
+  // refuses it only at the end of its indices, so a batch whose indices end
+  // before that is handed on. A page that follows a plain page is checked as
+  // it passes, up to that end; a page before the first plain page is checked
+  // by the check of each batch, whose dictionary then holds only the
+  // dictionary page's values. REGRESSION: the check of a page that follows a
+  // plain page decodes, when its indices end, the step that met that end
+  // again, one index at a time. It used to leave that step unchecked, and a
+  // batch whose dictionary held a plain page's values passed an index at the
+  // dictionary page's count, read as the first plain value.
+  TempDir dir;
+  // 600 values drawn from 30 by a hash of their position, so that no two
+  // pages of indices hold the same bytes; 60 of a value of 300 bytes, which
+  // the writer, looking at the dictionary every 50 values or so, finds past
+  // its limit; then values each its own. The dictionary page holds 31
+  // values, so every page of indices takes 5 bits an index, as does the
+  // count 31; several pages of indices, of about 100 values each, hold the
+  // first 650 values or so, and plain pages the rest.
+  const auto values_of = [](int64_t count, int64_t repeated) {
+    return strings_column(count, [repeated](int64_t at) {
+      const std::string digits = std::to_string(at);
+      const uint64_t drawn = (static_cast<uint64_t>(at) * 0x9e3779b97f4a7c15u >> 58) % 30;
+      if (at < repeated) return "c" + std::to_string(drawn);
+      return at < repeated + 60 ? std::string(300, 'x') : "u" + std::string(5 - digits.size(), '0') + digits;
+    });
+  };
+  // Lists of `per_row` of `strings`.
+  const auto lists_of = [](const std::shared_ptr<arrow::Array>& strings, int per_row) {
+    std::vector<std::optional<int32_t>> offsets;
+    for (int64_t offset = 0; offset <= strings->length(); offset += per_row) {
+      offsets.emplace_back(static_cast<int32_t>(offset));
+    }
+    return arrow::ListArray::FromArrays(*numeric_column<arrow::Int32Type>(offsets), *strings).ValueOrDie();
+  };
+  const std::shared_ptr<arrow::Array> strings = values_of(720, 600);
+  // With data pages of 2,048 bytes, a first page of indices of 2,300 values
+  // and a second of 150, which hold the first 2,450 of these.
+  const std::shared_ptr<arrow::Array> long_page = values_of(3000, 2400);
+  const std::shared_ptr<arrow::Array> lists = lists_of(strings, 3);
+  // 70,000 values, all but the last 2,000 of them from the 30.
+  const std::shared_ptr<arrow::Array> long_strings = values_of(70000, 68000);
+  const std::shared_ptr<arrow::Array> long_lists = lists_of(long_strings, 1);
+
+  // Where the page whose indices end early lies. The pages of indices that
+  // are moved behind the plain pages keep the plain values in the batch's
+  // dictionary; with the plain pages first, Arrow's reader starts a new
+  // dictionary at the first page of indices.
+  enum class Place { last, first_last, moved_before_another, after_plain_pages_first, before_plain, across_65536 };
+  struct Case {
+    std::string name;
+    std::shared_ptr<arrow::Array> column;  // column 'c'
+    int per_row;                           // values a row
+    bool data_page_v2;
+    Place place;
+    int at;  // the index past the dictionary page, counted in the page; -1: the last before the end
+    // With `truncate`, the page ends with the bytes of the indices kept;
+    // otherwise a run of no values follows them. The page keeps the most
+    // indices below its count that are a multiple of 8, or with `partial` 4
+    // more than one; across row 65,536, those of the rows up to 65,535,
+    // rounded up to a multiple of 8.
+    bool truncate;
+    bool partial;
+  };
+  const std::vector<Case> cases{
+      {"string, the last page, moved behind the plain pages", strings, 1, false, Place::last, 2, true, false},
+      {"string, the last page, ending inside a group of 8", strings, 1, false, Place::last, -1, true, true},
+      {"string, a page of 2,300 indices, the last", long_page, 1, false, Place::first_last, -1, true, false},
+      {"string, a page of 2,300 indices, the first of the step that meets the end", long_page, 1, false,
+       Place::first_last, 2048, true, false},
+      {"string, data page v2, the last page", strings, 1, true, Place::last, -1, true, false},
+      {"string, data page v2, the last page, its first index", strings, 1, true, Place::last, 0, true, false},
+      {"string, a moved page before another", strings, 1, false, Place::moved_before_another, -1, false, false},
+      {"string, data page v2, a moved page before another", strings, 1, true, Place::moved_before_another, 2, false,
+       false},
+      {"string, the first page after plain pages first", strings, 1, false, Place::after_plain_pages_first, -1, false,
+       false},
+      {"string, a page before the plain pages", strings, 1, false, Place::before_plain, 2, false, false},
+      {"string, data page v2, a page before the plain pages", strings, 1, true, Place::before_plain, -1, false, false},
+      {"list, the last page", lists, 3, false, Place::last, -1, true, true},
+      {"list, data page v2, a moved page before another", lists, 3, true, Place::moved_before_another, 2, false, false},
+      {"list, a page before the plain pages", lists, 3, false, Place::before_plain, -1, false, false},
+      {"string, across row 65,536", long_strings, 1, false, Place::across_65536, 0, false, false},
+      {"list of one value, data page v2, across row 65,536", long_lists, 1, true, Place::across_65536, 0, false, false},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    const std::string clean = (dir.path / (c.name + ".parquet")).string();
+    write_pages(clean, *arrow::Table::Make(arrow::schema({arrow::field("c", c.column->type())}), {c.column}),
+                {1 << 20, 300, c.data_page_v2, false}, parquet::Compression::UNCOMPRESSED, false, false,
+                c.place == Place::first_last ? 2048 : 400);
+    const std::vector<bool> written_order = plain_data_pages(clean, 0, 0);
+    REQUIRE(written_order.front() == false);
+    REQUIRE(written_order.back() == true);
+    const auto indexed = static_cast<std::size_t>(std::count(written_order.begin(), written_order.end(), false));
+    REQUIRE(indexed > (c.place == Place::first_last ? std::size_t{1} : std::size_t{3}));
+    const int64_t rows = c.column->length();
+    // The writer ends the last page of indices where it gives the dictionary
+    // up, so that page can hold few rows: the second page, or the second and
+    // third, are moved, or the first of a long page's column.
+    switch (c.place) {
+      case Place::last:
+        move_behind_plain_pages(clean, 0, {1});
+        break;
+      case Place::first_last:
+        move_behind_plain_pages(clean, 0, {0});
+        break;
+      case Place::moved_before_another:
+        move_behind_plain_pages(clean, 0, {1, 2});
+        break;
+      case Place::after_plain_pages_first:
+        plain_pages_first(clean, 0);
+        break;
+      case Place::before_plain:
+        break;
+      case Place::across_65536: {
+        // The last pages of indices, from one that starts at row 65,000 or
+        // before, moved behind the plain pages: one of them then holds row
+        // 65,536.
+        const std::vector<std::pair<int32_t, std::string>> in_order = data_page_contents(clean, 0, 0);
+        int64_t moved_rows = 0;
+        std::vector<std::size_t> moved;
+        while (rows - moved_rows > 65000) {
+          REQUIRE(moved.size() < indexed);
+          moved.insert(moved.begin(), indexed - 1 - moved.size());
+          moved_rows += in_order[moved.front()].first / c.per_row;
+        }
+        move_behind_plain_pages(clean, 0, moved);
+        break;
+      }
+    }
+    const std::vector<bool> plain = plain_data_pages(clean, 0, 0);
+    const std::vector<std::pair<int32_t, std::string>> contents = data_page_contents(clean, 0, 0);
+    const auto first_plain = static_cast<std::size_t>(std::find(plain.begin(), plain.end(), true) - plain.begin());
+    // The page whose indices end early.
+    std::size_t page = 0;
+    switch (c.place) {
+      case Place::last:
+      case Place::first_last:
+        page = plain.size() - 1;
+        break;
+      case Place::moved_before_another:
+        page = plain.size() - 2;
+        break;
+      case Place::after_plain_pages_first:
+        page = static_cast<std::size_t>(std::find(plain.begin(), plain.end(), false) - plain.begin());
+        break;
+      case Place::before_plain:
+        page = first_plain - 2;
+        break;
+      case Place::across_65536:
+        for (int64_t held = 0; page < contents.size(); ++page) {
+          held += contents[page].first / c.per_row;
+          if (held > 65536) break;
+        }
+        break;
+    }
+    REQUIRE(page < plain.size());
+    REQUIRE_FALSE(plain[page]);
+    REQUIRE((c.place == Place::before_plain) == (page < first_plain));
+    int64_t before = 0;
+    for (std::size_t earlier = 0; earlier < page; ++earlier) before += contents[earlier].first;
+    REQUIRE(before % c.per_row == 0);
+    const int32_t count = contents[page].first;
+    int at = c.at;
+    int kept = c.partial ? (count - 5) / 8 * 8 + 4 : (count - 1) / 8 * 8;
+    if (c.place == Place::across_65536) {
+      // The index past the page in the batch of rows 0 to 65,535, and the
+      // end of the indices after that batch.
+      at = static_cast<int>(std::max<int64_t>(0, int64_t{65530} * c.per_row - before));
+      kept = static_cast<int>((int64_t{65536} * c.per_row - before + 7) / 8 * 8);
+    }
+    if (at < 0) at = kept - 1;
+    // Two steps of 1,024 indices pass before the one that meets the end.
+    if (c.place == Place::first_last) REQUIRE(kept > 2048);
+    const std::string damaged = (dir.path / (c.name + "-damaged.parquet")).string();
+    write_contents(damaged, file_contents(clean));
+    const int32_t entries = dictionary_page_count(clean, 0, 0);
+    REQUIRE(entries == 31);
+    REQUIRE(cut_indices(damaged, page, kept, at, entries, c.truncate) == count);
+    const std::string message = damaged +
+                                ": failed to read row group 0: column 'c' has a dictionary index outside its "
+                                "dictionary: Index " +
+                                std::to_string(entries) + " out of bounds";
+    const std::vector<std::string> written = page_values(clean, 0);
+    const std::vector<int64_t> batch_sizes =
+        c.place == Place::across_65536 ? std::vector<int64_t>{65536} : std::vector<int64_t>{1, 2, 7, 64, 65536};
+    for (const int64_t batch_size : batch_sizes) {
+      CAPTURE(batch_size);
+      std::vector<std::size_t> batches;
+      std::vector<std::string> values;
+      engine_values(clean, batch_size, nullptr, values, batches);
+      REQUIRE(values == written);
+      values.clear();
+      // A page that follows a plain page is checked when Arrow's reader
+      // reads its first row; one before the plain pages, when a batch holds
+      // its index past the page. Either is refused, naming that index, when
+      // the batch that reads that row ends before the page's indices do; and
+      // by Arrow's reader otherwise.
+      const int64_t checked = (c.place == Place::before_plain ? before + at : before) / c.per_row;
+      const int64_t end = std::min((checked / batch_size + 1) * batch_size, rows);
+      if (end * c.per_row <= before + kept) {
+        REQUIRE_THROWS_WITH(engine_values(damaged, batch_size, nullptr, values, batches), message);
+      } else {
+        REQUIRE_THROWS_WITH(engine_values(damaged, batch_size, nullptr, values, batches),
+                            damaged +
+                                ": failed to read row group 0: column 'c' cannot be decoded: IOError: Unexpected end "
+                                "of stream");
+      }
+      // What comes out before the error is what the file holds, and stops
+      // before the index past the page.
+      REQUIRE(std::cmp_less_equal(values.size(), before + at));
+      REQUIRE(std::equal(values.begin(), values.end(), written.begin()));
     }
   }
 }
@@ -2597,6 +2957,97 @@ bool same_arrays(const std::vector<std::shared_ptr<arrow::Array>>& left,
 }
 
 }  // namespace
+
+TEST_CASE("a file whose pages of indices change before they are read again is refused, naming the column") {
+  // The first batch after a chunk's first plain page reads the chunk's pages
+  // of indices before that page again, to bound them. A read that finds
+  // fewer of them than the first read passed means the file changed in
+  // between, and the file is refused; an error of Arrow's reader in that
+  // read names the column, as one in the first read does. Here a copy is
+  // written over the file in place after the first batch. The chunk is
+  // smaller than the 64 KiB a reader buffers, so the reading holds the
+  // original's bytes from its first batch on, and only the second read sees
+  // the copy.
+  TempDir dir;
+  const std::string path = (dir.path / "strings.parquet").string();
+  // 1,000 rows that go through 30 values, then 600 values each its own: the
+  // dictionary page holds the 30 and a few dozen of the others, several
+  // pages of indices hold their rows, and plain pages hold the rest.
+  const std::shared_ptr<arrow::Array> strings = strings_column(1600, [](int64_t row) {
+    const std::string digits = std::to_string(row);
+    return row < 1000 ? "c" + std::to_string(row * 7 % 30) : "u" + std::string(4 - digits.size(), '0') + digits;
+  });
+  write_pages(path, *arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings}),
+              {1 << 20, 300, false, false});
+  std::vector<parquet::PageLocation> locations;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+    REQUIRE(row_group->ColumnChunk(0)->total_compressed_size() < 64 * 1024);
+    locations = file->GetPageIndexReader()->RowGroup(0)->GetOffsetIndex(0)->page_locations();
+  }
+  const std::vector<bool> plain = plain_data_pages(path, 0, 0);
+  const auto plain_page = static_cast<std::size_t>(std::find(plain.begin(), plain.end(), true) - plain.begin());
+  REQUIRE(plain_page > 1);
+  REQUIRE(plain_page < plain.size());
+  int64_t first_plain = 0;
+  const std::vector<std::pair<int32_t, std::string>> contents = data_page_contents(path, 0, 0);
+  for (std::size_t page = 0; page < plain_page; ++page) first_plain += contents[page].first;
+  REQUIRE(first_plain > 7);
+  const std::vector<std::string> written = page_values(path, 0);
+  const std::string original = file_contents(path);
+
+  const std::string changed = path +
+                              ": failed to read row group 0: column 'c' has fewer pages of indices than when it "
+                              "was first read: the file changed while it was read";
+  // Copies with fewer pages of indices in front of the first plain page: an
+  // empty file; the file cut after its first page of indices; the file cut
+  // before its last page of indices, one page short; and a valid file, the
+  // same with its plain pages in front of its pages of indices.
+  const std::string plain_first = (dir.path / "plain-first.parquet").string();
+  write_contents(plain_first, original);
+  plain_pages_first(plain_first, 0);
+  REQUIRE(plain_data_pages(plain_first, 0, 0).front());
+  // A copy whose first page of indices states more bytes than the chunk
+  // has left after its header, which Arrow's page reader refuses.
+  const std::string restated = (dir.path / "restated.parquet").string();
+  write_contents(restated, original);
+  const ChunkPlace place = chunk_place(path, 0, 0);
+  const auto [old, stated] = restate_page(restated, place.first_data, 3);
+  const std::size_t left = place.end - (place.first_data + static_cast<std::size_t>(locations[0].compressed_page_size) -
+                                        static_cast<std::size_t>(old.value));
+  const std::vector<std::tuple<std::string, std::string, std::string>> copies{
+      {"an empty file", "", changed},
+      {"the file cut after its first page of indices",
+       original.substr(0, static_cast<std::size_t>(locations[1].offset)), changed},
+      {"the file cut before its last page of indices",
+       original.substr(0, static_cast<std::size_t>(locations[plain_page - 1].offset)), changed},
+      {"its plain pages first", file_contents(plain_first), changed},
+      {"its first page of indices states more bytes than the chunk holds", file_contents(restated),
+       path + ": failed to read row group 0: column 'c' cannot be decoded: Invalid: a page states " +
+           std::to_string(stated) + " bytes where its column chunk has " + std::to_string(left) + " left"},
+  };
+  for (const auto& [name, copy, message] : copies) {
+    CAPTURE(name);
+    write_contents(path, original);
+    auto source = fft::open_source({path});
+    auto readers = source->readers(1, nullptr);
+    std::vector<std::string> read;
+    std::size_t batches = 0;
+    REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], 7,
+                                                 [&](fft::Batch batch) {
+                                                   if (batches++ == 0) write_contents(path, copy);
+                                                   for (std::string& word : batch_words(batch)) {
+                                                     read.push_back(std::move(word));
+                                                   }
+                                                 }),
+                        message);
+    // The batch that holds the first plain row reads the pages again.
+    REQUIRE(std::cmp_less_equal(read.size(), first_plain));
+    REQUIRE(std::cmp_greater(read.size() + 7, first_plain));
+    REQUIRE(std::equal(read.begin(), read.end(), written.begin()));
+  }
+}
 
 TEST_CASE("a page that states more bytes than its column chunk has left is refused") {
   // REGRESSION: such a page is refused before its bytes are requested, and
