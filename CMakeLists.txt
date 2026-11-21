@@ -138,6 +138,23 @@ add_library(fftcore STATIC
   src/fastfeaturetransform/kernels/binning.cpp
   src/fastfeaturetransform/kernels/expand.cpp
   src/fastfeaturetransform/engine.cpp)
+# On macOS, binning.cpp compiles with its loops aligned to 32 bytes. A k-means
+# fit spends about half its time in the loop that finds each value's nearest
+# center, and on an Apple M4 that loop is slow when it starts 44 bytes into
+# a 64-byte line of code. One thread fitting 1,000,000 lognormal values at
+# 8 bins took 562 ms with the loop there and 435 to 444 ms at the 15 other
+# offsets that 4 to 60 bytes of padding in a function linked before this
+# file gave it; with this option it took 435 to 439 ms behind each of those
+# paddings, the loop starting 0 or 32 bytes into a line. The function that
+# holds the loop aligned to 64 bytes, in place of this option, left the
+# loop's copy for values spilled to disk 44 bytes into a line, where a fit
+# of 4,000,000 such values took 14% to 16% longer than with this option.
+# Loops aligned to 64 bytes made a RobustScaler fit of 4,000,000 values 2%
+# slower. Builds for other systems were not measured, and they compile the
+# file without the option.
+if(APPLE)
+  set_source_files_properties(src/fastfeaturetransform/kernels/binning.cpp PROPERTIES COMPILE_OPTIONS -falign-loops=32)
+endif()
 target_compile_definitions(fftcore PRIVATE FFT_LIBRARY_VERSION="${FFT_LIBRARY_VERSION}")
 target_include_directories(fftcore PUBLIC src)
 target_link_libraries(fftcore PUBLIC Arrow::arrow_static Parquet::parquet_static nlohmann_json::nlohmann_json
