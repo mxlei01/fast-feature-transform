@@ -212,7 +212,10 @@ else()
   # NOMINSIZE: nanobind otherwise compiles the module at -Os, which leaves its
   # reference-counting and casting helpers out of line. The record path is
   # nothing but those helpers around a kernel call, and it is the serving path.
-  nanobind_add_module(_core FREE_THREADED NOMINSIZE src/bindings/module.cpp)
+  # NB_SUPPRESS_WARNINGS passes nanobind's and Python's include directories
+  # as system directories, so the warning flags of fft_project_options apply
+  # to module.cpp's own code and not to those headers.
+  nanobind_add_module(_core FREE_THREADED NOMINSIZE NB_SUPPRESS_WARNINGS src/bindings/module.cpp)
   target_link_libraries(_core PRIVATE fftcore fft_project_options)
   # Export only the module initializer, so the static Arrow and the template
   # instantiations in this package's own objects stay private, whether or not
