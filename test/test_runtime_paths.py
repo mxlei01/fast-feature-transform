@@ -581,6 +581,111 @@ def _plain_pages_first(path: Path) -> None:
     path.write_bytes(data[:start] + pages[0][1] + b"".join(plain + indexed) + data[end:])
 
 
+# REGRESSION: an index at or past the count of a dictionary page is refused
+# before a batch holds it, in a page of indices that follows a plain page and
+# whose indices end before its values do. Arrow's reader hands on each batch
+# whose indices it decoded before that end, with the plain pages' values in
+# the batch's dictionary, and refuses the page only at the end. The check of
+# such a page used to leave unchecked the step of up to 1,024 indices that met
+# the end, so the batch of rows 0 to 65,535 went on to the steps with a plain
+# value in the place of such an index, and the call failed only later, with
+# Arrow's error. Here the last pages of indices, data pages v2, are moved
+# behind the plain pages, and the one that then holds row 65,536 gets indices
+# that end after it, with row 65,530 at the dictionary page's count, 31, or
+# without such an index, when Arrow's reader refuses the page.
+@pytest.mark.parametrize("damaged", [True, False], ids=["index past the page", "no index past the page"])
+def test_parquet_index_before_the_early_end_of_a_page_of_indices_is_refused(tmp_path: Path, damaged: bool) -> None:
+    # 68,000 values drawn from 30 by a hash of their position, 60 of 300
+    # bytes, which take the dictionary past its limit of 300 bytes, then
+    # values each its own: the dictionary page holds 31 values.
+    words = [f"c{(row * 0x9E3779B97F4A7C15 % 2**64 >> 58) % 30}" for row in range(68000)]
+    words += ["x" * 300] * 60 + [f"u{row:05d}" for row in range(68060, 70000)]
+    table = pa.table({"c": words, "x": np.arange(70000.0)})
+    clean, path = tmp_path / "clean.parquet", tmp_path / "short.parquet"
+    pq.write_table(
+        table,
+        clean,
+        data_page_version="2.0",
+        compression="NONE",
+        write_statistics=False,
+        dictionary_pagesize_limit=300,
+        write_batch_size=50,
+        data_page_size=400,
+    )
+    chunk = pq.ParquetFile(clean).metadata.row_group(0).column(0)
+    data = clean.read_bytes()
+    start, end = chunk.dictionary_page_offset, chunk.dictionary_page_offset + chunk.total_compressed_size
+    pages, at = [], start
+    while at < end:
+        header, body = _thrift_struct(data, at)
+        pages.append((header, at, body, body + header[3]))
+        at = body + header[3]
+    assert at == end
+    # A dictionary page (type 2), then data pages v2 (type 3), whose header
+    # states their rows in field 3 of its field 8, and their encoding in field
+    # 4: 0 is PLAIN. The pages of indices come first.
+    assert [page[0][1] for page in pages] == [2] + [3] * (len(pages) - 1)
+    data_pages = pages[1:]
+    rows = [header[8][3] for header, *_ in data_pages]
+    indexed = sum(header[8][4] != 0 for header, *_ in data_pages)
+    assert [header[8][4] != 0 for header, *_ in data_pages] == [True] * indexed + [False] * (len(data_pages) - indexed)
+    # The last pages of indices, from one that starts at row 65,000 or before,
+    # go behind the plain pages; the one that then holds row 65,536 is cut.
+    first_moved = indexed - 1
+    while sum(rows[first_moved:indexed]) < 70000 - 65000:
+        first_moved -= 1
+    order = [*range(first_moved), *range(indexed, len(data_pages)), *range(first_moved, indexed)]
+    row = 0
+    for target in order:
+        if row + rows[target] > 65536:
+            break
+        row += rows[target]
+    assert first_moved <= target < indexed
+    assert row < 65530
+    header, _, body, stop = data_pages[target]
+    # The page's indices follow its levels: their bit width, then runs. The
+    # first `kept` become one bit-packed run, whose header states their groups
+    # of 8, followed by the header of a run of no values, where decoding stops.
+    # An index is the place of its value in the dictionary page, which holds
+    # the values in the order they first come.
+    entries = [*dict.fromkeys(words[:68060])]
+    assert pq.read_table(clean, read_dictionary=["c"]).column("c").chunk(0).dictionary.to_pylist()[:31] == entries
+    levels = header[8][5] + header[8][6]
+    width = data[body + levels]
+    assert (len(entries), width) == (31, 5)
+    kept = (65536 - row + 7) // 8 * 8
+    assert kept < header[8][1]
+    assert kept // 8 < 64
+    first = sum(rows[:target])
+    indices = [entries.index(word) for word in words[first : first + kept]]
+    if damaged:
+        indices[65530 - row] = 31
+    packed = sum(index << (width * i) for i, index in enumerate(indices)).to_bytes(kept * width // 8, "little")
+    fresh = bytes([width, (kept // 8) << 1 | 1]) + packed + b"\x00"
+    assert len(fresh) <= stop - body - levels
+    fresh += bytes(stop - body - levels - len(fresh))
+    rewritten = {k: data[page[1] : page[3]] for k, page in enumerate(data_pages)}
+    rewritten[target] = data[data_pages[target][1] : body + levels] + fresh
+    path.write_bytes(data[: pages[1][1]] + b"".join(rewritten[k] for k in order) + data[end:])
+    with pytest.raises((OSError, pa.ArrowInvalid)):
+        pq.read_table(path)
+
+    problem = (
+        "has a dictionary index outside its dictionary: Index 31 out of bounds"
+        if damaged
+        else "cannot be decoded: IOError: Unexpected end of stream"
+    )
+    message = f"{path}: failed to read row group 0: column 'c' {problem}"
+    model = Pipeline([("s", StandardScaler(columns=["x"]))]).fit([clean], threads=1)
+    with pytest.raises(EngineError, match=re.escape(message)):
+        model.transform_parquet([path], output_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+    with pytest.raises(EngineError, match=re.escape(message)):
+        Pipeline([("keep", Select(["c", "x"])), ("s", StandardScaler(columns=["x"]))]).fit([path], threads=1)
+    with pytest.raises(EngineError, match=re.escape(message)):
+        CountEncoder(columns=["c"]).fit([path], threads=1)
+
+
 # The indices of a page come after its levels, whose lengths a page of version 2
 # states in its header. A length past the page is left to Arrow's reader, which
 # refuses it, and the indices are not looked for 100,000,000 bytes on. A page of
