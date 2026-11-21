@@ -2,74 +2,188 @@
 
 ## 0.0.3
 
-Pipelines and pickles saved by 0.0.1 or 0.0.2 load in this version. Version 0.0.2 can also load pipelines and pickles
-saved by 0.0.3. The version running a transform determines its behavior in the corrected cases below, including
-normalization near the limit of f64. Measurements compare 0.0.3 development builds with 0.0.2 on one thread of an
-Apple M4.
+Pipelines and pickles saved by 0.0.1 or 0.0.2 load in this version and answer as before; a `CountEncoder` among them
+that sets `min_group_name` or a nondefault `combine_min_nan_groups` without `min_group_size` cannot be fitted again
+(see Changed). Version 0.0.2 loads pipelines and pickles saved by 0.0.3. The version that runs a transform decides its
+answer in the cases below that changed: a `Normalizer` saved by 0.0.2 and loaded here normalizes a row that 0.0.2
+refuses, and one saved here and loaded by 0.0.2 refuses it. Measurements compare the published 0.0.2 and 0.0.3 wheels
+for free-threaded CPython 3.14 on one thread of an Apple M4: CPU time, the median of 11 pairs of fresh processes
+unless a line says otherwise.
 
 Fixed:
 
-- Reading a nested string or binary column with an out-of-range dictionary index raises an `EngineError` naming the
-  column. In 0.0.2, transforming such a file could crash the process or write wrong values, and fitting could succeed.
-- A repeated entry in a string or binary dictionary page can shift subsequent values when Arrow decodes the indices.
-  This version checks the page and raises an `EngineError` naming the column when the decoded dictionary loses a repeat.
-- `transform_dict` retains record fields before invoking a value's Python conversion, so a conversion that changes
-  the input dictionary no longer causes skipped fields or a read after the value was freed. Unrelated classes named
-  like NumPy scalars get the unsupported-type error, and passing something other than a dict names the public method.
-- Record keys with custom hashing or equality are checked for repeated text. A key whose hash changes after insertion,
-  or another thread changing the dict on a free-threaded build, can still leave a repeated key undetected.
-- Concurrent fitted-attribute reads, transforms, copies and pickles see a consistent fit. In particular,
-  `MinMaxScaler.data_range_` takes both endpoints from one fit, and an unpickled pipeline retains its fitted state
-  when another thread first uses it.
-- `StandardScaler` now fits columns such as `[9e153, 8e153]` and rejects a sum of squares that rounds to infinity
-  in every row order and worker split. `Normalizer` applies the same overflow rule to its l1 or l2 sum in every
-  column order.
-- `KBinsDiscretizer(strategy="kmeans")` checks the sum of squared deviations at the original scale. When that sum
-  overflows, it stops after the first center update, matching scikit-learn even when distances are scaled internally.
-- `WOEEncoder` distinguishes integer target values above 2^53. `JamesSteinEncoder`, `LeaveOneOutEncoder` and
-  `CatBoostEncoder` sum integer targets exactly, and the latter two accept larger finite float targets.
-- Files can be read together when the same string or binary column uses large offsets or view types in different
-  Parquet encodings, including delta pages and nested columns. Top-level `string_view` in delta pages is read as
-  `utf8` by string transformers and `Cast`.
-- Row-group minimum and maximum statistics for nullable string and binary dictionary columns use values present in
-  the rows. Numbered output parts sort in row order even when a transform writes more than 100,000 files.
-- Directory arguments accept text paths and path-like objects and reject embedded NULs. Batch calls validate input
-  paths before creating temporary output and remove their own temporary directory if an exception or interrupt
-  prevents them from returning it. An empty `temp_dir` still selects the system temporary directory.
+- Reading a nested string or binary column, such as a list, a struct or a fixed-size list of strings, whose
+  dictionary index lies outside its dictionary raises an `EngineError` naming the column; 0.0.2 ended the process
+  with a bus error. A column chunk whose dictionary is followed by plain pages is still read without the error, and
+  the rows with an out-of-range index get the values of later rows.
+- A string or binary column whose dictionary page holds one value twice raises an `EngineError` naming the column,
+  also when no row uses the repeated entry. Arrow drops the repeat when it decodes the page, which shifts the values
+  after it: 0.0.2 wrote the shifted values, refused the file with "has a dictionary index outside its dictionary", or
+  ended the process with a bus error on a list of such strings. When no row uses the repeat or an entry after it,
+  0.0.2 read the right values, and this version refuses the file too. Strings in a fixed-size list are read without
+  the dictionary and get the values the page holds, where 0.0.2 ended the process with a bus error.
+- Reading a column of Arrow's `arrow.opaque` extension type stored as a dictionary, at the top level or in a list,
+  raises an `EngineError` naming the column; 0.0.2 ended the process with an abort. Selecting only other columns
+  works. An extension type that this package's Arrow does not define, such as one defined in pyarrow, is read as its
+  storage, as before.
+- A record value of a class named `datetime64` that has `astype` but no `dtype`, or whose `dtype` raises, and a
+  datetime whose `asm8` is such a value, raise an `EngineError`; 0.0.2 ended the process with an abort. A datetime
+  whose `asm8` is not a numpy datetime64 raises an `EngineError` that says so; 0.0.2 raised `AttributeError` for an
+  `asm8` of `None`.
+- A record value of a class named like a numpy scalar that is not one, such as a class named `float64` with
+  `__float__` or one named `bool_`, gets the unsupported-type `EngineError`. 0.0.2 converted such a value, raised
+  `AttributeError` for a class named `datetime64` without `astype`, and `SystemError` for a `bool_` whose `__bool__`
+  raises.
+- `transform_dict` reads a record as it was when the call began: a value whose conversion code changes the record no
+  longer makes it skip a field, which 0.0.2 then reported as missing ("select key 'b' missing from record").
+- A record that holds one key twice, such as a `str` subclass with its own hash beside a `str` of the same text,
+  raises `EngineError` "record holds the key 'x' twice"; 0.0.2 answered with the later field. A key whose class's
+  `__hash__` changes while the record holds it is not checked.
+- Fitted-attribute reads, `transform_dict`, copies and pickles of a transformer or pipeline that another thread fits
+  again each answer for one fit, the old or the new. In 0.0.2 such calls sometimes mixed two fits:
+  `MinMaxScaler.data_range_` took its endpoints from both or raised `TypeError`, a standalone transformer's
+  `transform_dict` raised "was fitted as part of a Pipeline", and a copy, deep copy, pickle or save of a pipeline that
+  another thread fitted as a step of a larger one answered for the larger one. A copy, deep copy or pickle of an
+  unpickled pipeline that other threads use for the first time no longer raises
+  `RuntimeError: dictionary changed size during iteration`.
+- `StandardScaler` fits a column whose squares sum within f64, such as `[9e153, 8e153]`, in every row order,
+  row-group split and thread count, and refuses one whose squares sum to infinity in all of them. Of 118 columns of
+  2 to 4 values whose squares sum to within a step of the largest f64 and round to a finite value, 0.0.2 refused 31
+  in every order, split and thread count and 11 in some of them, and it refused `[9e153, 8e153]` with "the variance
+  leaves the range of f64". `Normalizer` decides from the exact l1 or l2 sum of a row, so a row gets one answer in
+  every column order: 0.0.2 refused the l1 row `[0x1.8p969, 0x1.fffffffffffffp1022, 0x1.fffffffffffffp1022]` in that
+  order and normalized it in another.
+- `KBinsDiscretizer(strategy="kmeans")` stops after its first center update when the squared deviations of a column,
+  at the column's own scale, sum past the range of f64. On 30 columns of 50 to 200 values whose squared deviations sum
+  past f64 while no value lies 2^512 or more from the mean, at 2 to 8 bins, its bins equal scikit-learn 1.9.0's in
+  209 of 210 fits, where 0.0.2's equal them in 44. Further than 2^512 (about 1.34e154) from the mean, scikit-learn's
+  own squares overflow, and this version also stops after one update: on 140 columns of 10 to 100 values at one
+  scale between 1e155 and 1e300, its bins differ from 0.0.2's in 428 of 980 fits, and none of those 428 equal
+  scikit-learn's bins for the column scaled down by a power of two, which 0.0.2's equal in 420. The column
+  `[-6e307, -6e307, 6e307, 6e307]` at 4 bins raises "fits a bin edge that is not finite", which 0.0.2 binned.
+- `KBinsDiscretizer(strategy="kmeans")` fits a column whose sum lies within f64 though a running sum passes it, such
+  as three values of -8e307 and three of 8e307, and one whose sum rounds to the largest f64; 0.0.2 refused both with
+  "sums past the range of f64".
+- `WOEEncoder` counts the distinct values of an integer target exactly above 2^53: a target of 0, 2^62 and 2^62 + 1
+  is refused for holding more than two values, which 0.0.2 fitted, and one of 2^62 and 2^62 + 1 for holding no 0,
+  where 0.0.2 said it holds one value. `JamesSteinEncoder`, `LeaveOneOutEncoder` and `CatBoostEncoder` sum an integer
+  target exactly: `LeaveOneOutEncoder` encodes a category of the targets 2^53 + 1 and 1 to 4503599627370497.0, where
+  0.0.2 gave 4503599627370496.0. `LeaveOneOutEncoder` and `CatBoostEncoder` take a float target below 2^900 in
+  magnitude, which 0.0.2 refused from 2^450.
+- Files are read together when one holds a string column in `string_view` delta pages, a binary column in
+  `large_binary` delta pages, or a list or struct of `large_string` or `string_view` in delta pages, and another holds
+  the same column in dictionary pages; 0.0.2 refused them as different types. A top-level `string_view` column in
+  delta pages is read as `utf8`, so `Cast` and the string transformers take it, where 0.0.2 refused it.
+- For a string or binary dictionary column, an output row group that holds a null keeps in its dictionary only the
+  values its rows hold, and its minimum and maximum statistics come from those values. 0.0.2 wrote the whole
+  dictionary into every row group, and gave a row group that held a null and all the dictionary's entries but one the
+  minimum and maximum of the whole dictionary. Above 100,000 parts, every part name has one more digit, the first
+  included, so the names sort in row order; 0.0.2 named the 100,001st part `part-100000.parquet`, which sorts before
+  `part-10001.parquet`.
+- `output_dir`, `temp_dir` and the path of `save` and `load` take a `str` or an `os.PathLike` that gives one. Bytes,
+  `None` where a path is needed, and other types raise `TypeError`, and an empty path or one that holds a NUL raises
+  `ValueError`, before anything is written. 0.0.2 wrote into or loaded from `./b'out'`, `./None` or `./5`, used the
+  `str()` of an `os.PathLike` as its path, created the directory named by the text before a NUL, and read
+  `/manifest.json` for `load("")`. An `output_dir` given as a `str` subclass whose `in` operator hides the NUL still
+  creates that directory before the error. An empty `temp_dir` still selects the system temporary directory.
+- A batch call without `output_dir` that a `KeyboardInterrupt` stops removes its temporary directory and the parts in
+  it; 0.0.2 left them.
 
 Changed:
 
-- Reading an Arrow extension column backed by a dictionary raises an `EngineError` before decoding. Selecting only
-  other columns still works.
-- Loading a saved manifest rejects missing required fitted state, invalid nested stage names and malformed handling
-  options. On a new `CountEncoder` fit, `min_group_name` and nondefault `combine_min_nan_groups` require
-  `min_group_size`. Older saved encoders with those options still load.
-- String subclasses used as names or string options are stored as plain strings. Numeric options accept compatible
-  NumPy scalars, and pipeline indexing accepts integer-like values.
-- `JamesSteinEncoder`, `LeaveOneOutEncoder` and `CatBoostEncoder` expose fitted `null_values_`. Python annotations
-  cover tuples of column names and distinguish file lists from a single path.
-- The writer flushes a row group after six buffered batches or when another batch of the previous size would take
-  its buffers past 36 MiB. On 8,192 rows with 1,000 f64 columns and distinct 20,000-character strings, peak memory
-  fell from 585 MiB to 436–453 MiB and the writer produced 12 row groups instead of two.
-- Wheels use pinned CMake and ninja versions. The Linux and macOS extensions export only the Python module initializer.
+- Loading a manifest that lacks required fitted state, such as an `OrdinalEncoder`'s `has_null`, or that holds state
+  for a `Select`, raises an `EngineError`; 0.0.2 loaded such manifests, and some answered differently, such as -2 for
+  a null `OrdinalEncoder` value. `Pipeline.load` raises `EngineError` instead of `ValueError` for stage names that
+  make one name both a step and a nested pipeline or that split a nested pipeline, and an unpickled pipeline with such
+  names raises it at first use, where 0.0.2 answered. A handling option that is not a string is reported by name
+  instead of with the JSON library's text.
+- A `CountEncoder` fit requires `min_group_size` when `min_group_name` or a nondefault `combine_min_nan_groups` is
+  set, also a new fit of one loaded or unpickled from 0.0.1 or 0.0.2, which still loads and answers as before. With
+  `handle_missing="error"` this check comes before the check for nulls.
+- String subclasses used as names or string options are stored as plain strings, also the type tags of `Cast`, the
+  aggregates of `GroupAgg`, `hash_method` of `HashingEncoder` and `combine_min_nan_groups` of `CountEncoder`, which
+  0.0.2 kept as given, so a pickle no longer refers to their class. Numeric options take compatible numpy scalars, a
+  `Fraction` and an integer array of no dimensions, and store each as a plain `int` or `float`. A number whose nearest
+  f64 is infinite or 0 though it is neither, such as `10**400`, raises `ValueError` naming the option; 0.0.2 raised
+  `OverflowError`, or `TypeError` for a `Fraction`. A string option given a list, and `hash_method` given an array,
+  raise `ValueError` where 0.0.2 raised `TypeError`. `pipeline[np.int64(0)]` returns the step, and a key that is
+  neither a `str` nor integer-like raises `KeyError` even when it compares equal to a step name, which 0.0.2 returned.
+- `transform_dict` raises the error of a record value whose `__index__` raises something other than `TypeError`, or
+  whose lookup of `__index__` or of a datetime's `asm8` raises something other than `AttributeError`, such as
+  `KeyError` or `KeyboardInterrupt`; 0.0.2 raised the unsupported-type `EngineError` instead, and read such a
+  datetime from its fields. A subclass of a numpy floating type gets the unsupported-type error whatever its class is
+  named; 0.0.2 converted one named like the numpy type. When a record holds more than one refused value, a value that
+  needs no Python code to read is refused first, and the conversion code of the others does not run.
+- A path that cannot be encoded as UTF-8, such as one with a lone surrogate from `os.fsdecode`, raises `ValueError`
+  naming the argument in `X`, `output_dir`, `temp_dir` and the path of `save` and `load`; 0.0.2 raised the binding's
+  `TypeError` "incompatible function arguments", and for `temp_dir` a `ValueError` that it must be an existing
+  directory. `fit_transform` checks `output_dir` before it fits, so a refused `output_dir` leaves the pipeline as it
+  was; 0.0.2 fitted first.
+- Messages: a row group that fails to decode names the first column that fails, as in "failed to read row group 0:
+  column 'n' cannot be decoded: IOError: Corrupt snappy compressed data."; `StandardScaler` says a column's "sum of
+  its squares rounds to infinity (scale the column down first)" where it said the column "sums past the range of
+  f64"; `LeaveOneOutEncoder` and `CatBoostEncoder` say a target value of 2^900 or more is "more than a sum can hold"
+  where they said a value of 2^450 or more is "more than the squared sums can hold"; `MinMaxScaler` says when its two
+  `feature_range` bounds round to one f64; a `large_binary` or `binary_view` column in delta pages is named `binary` in
+  type errors, as it is in other pages; `transform_dict` given something other than a dict, a `temp_dir` of another
+  type than `str` or `os.PathLike`, and an `os.PathLike` in `X` that gives bytes raise a `TypeError` that names the
+  argument and the type.
+- `fast_feature_transform._core.list_kernels` is gone, and `_core.pyi` no longer declares it. A transformer keeps its
+  fit in one private `_binding` where 0.0.2 kept `_handle`, `_stage` and `_standalone`, and a pipeline where 0.0.2
+  kept `_handle`, `_prefix` and `_manifest`, so code that called `pipeline._handle.transform_row` raises
+  `AttributeError`.
+- `JamesSteinEncoder`, `LeaveOneOutEncoder` and `CatBoostEncoder` expose the fitted `null_values_`. Annotations take a
+  tuple of column names and type `X` as a list or tuple of paths, which a single `str` does not match, where 0.0.2's
+  sequence of paths matched one; a path is typed `str` or `os.PathLike[str]`, where 0.0.2 named `pathlib.Path`.
+- The writer also closes a row group when one more batch as large as its last would take the waiting batches past
+  36 MiB, so a wide output with long values holds less memory and is written in more row groups. Passing 4,176 rows of
+  1,000 f64 columns and a distinct 20,000-character string, from one row group, through peaks at 1,253 -> 882 MiB of
+  resident memory (median of 11 runs), in 6 row groups where 0.0.2 wrote 1 and 2.6% more bytes, and takes
+  134 -> 142 ms (21 pairs).
+- A build from a source checkout uses CMake 4.4.2 and ninja 1.13.0, where 0.0.2 took CMake 4.1.2 or later and ninja
+  1.11 or later. The Linux extensions export only the Python module initializer, as the macOS ones did; 0.0.2's
+  Linux extensions also exported 46 weak symbols of C++ templates from Arrow and the standard library.
 
 Faster:
 
-- Looking up 30 long field names in reverse or shuffled order took 89% or 64% of the time of the 0.0.2 wheel,
-  respectively. Loading a saved `Cast` with 20,000 columns took 9.44 ms instead of 16.03 ms.
-- On a million rows in 16 row groups, fitting a `TargetEncoder` over a million distinct keys took 288 ms instead of
-  357 ms. Leave-one-out and CatBoost fits over 1,000 categories with integer targets took 7.2 ms instead of 12.3 ms.
+- `transform_dict` of a record of 30 fields whose 23-byte names are in reverse or shuffled order, through one
+  `StandardScaler`, takes 0.75 of the time: 3.13 -> 2.34 µs and 3.11 -> 2.36 µs. `Pipeline.load` of a `Cast`
+  over 20,000 columns, saved by 0.0.2, takes 15.9 -> 12.0 ms.
+- On a million rows in 16 row groups, with a target of 0 or 1: fitting a `TargetEncoder` over a million distinct keys
+  takes 363 -> 288 ms, and fitting `LeaveOneOutEncoder` and `CatBoostEncoder` over 1,000 categories takes
+  12.8 -> 7.6 ms each.
 
 Costs more:
 
-- Strings inside fixed-size lists are decoded without a dictionary. Passing through 500,000 rows of four 64-byte
-  strings took 79–95 ms instead of 42 ms with no null rows, and about 60% of the previous time with 30% null rows.
-- A top-level `string_view` column in delta pages is copied while reading. Passing through 1,048,576 eight-byte
-  strings took 30.5 ms instead of 24.5 ms with 90% nulls.
-- The wide output with 20,000-character strings above took 333 ms instead of 286 ms. With 32,768 rows of distinct
-  1,000-character dictionary strings beside 1,000 f64 columns, writing took about 18% longer and used 2% more bytes.
-- The million-key `TargetEncoder` fit above peaked at 346 MiB instead of 300 MiB. Fitting `JamesSteinEncoder` on a
-  million integer targets above 2^53 over 1,000 categories took 29.4 ms instead of 16.6 ms.
+- Strings inside fixed-size lists are read without a dictionary. Passing 500,000 rows of four 64-byte strings from
+  100 values, in 16 row groups, through takes 45 -> 85 ms and peaks at 73 -> 98 MiB of resident memory with no null
+  rows, and takes 247 -> 141 ms and peaks at 92 -> 141 MiB with 30% null rows (peaks: median of 11 runs).
+- A top-level `string_view` column in delta pages is copied as it is read: passing 1,048,576 rows of 8-byte strings,
+  90% of them null, in 16 row groups, through takes 26.5 -> 33.0 ms.
+- A string column whose dictionary page fills up, so that the rest of a row group is in plain pages, takes longer to
+  read when the page ends in a value over 256 bytes: passing 12 row groups of 8,000 distinct random 300-byte strings
+  through takes 27.5 -> 31.7 ms, and 8 row groups of 6,000 distinct 384-byte strings 16.9 -> 19.9 ms; 16 such row
+  groups whose dictionary is in sorted order take 1.08 times as long. Values of 200 bytes take the same time.
+- Passing a dictionary string column with nulls and many distinct values through takes 1.05 to 1.07 times as long:
+  4,000,000 rows of 20,000 values, 90% of them null, in 16 row groups, take 115 -> 120 ms (21 pairs), and 1,000,000
+  rows of 30,000 values with 30% null 74 -> 79 ms (21 pairs). Without nulls, or with 100 values, it takes the same
+  time.
+- `Normalizer` takes 1.42 times as long on rows whose sum of squares lies above 2^1023: 250,000 rows of four f64 near
+  6.2e153 through `Normalizer(norm="l2")` take 17.7 -> 24.9 ms. Rows of ordinary values take the same time.
+- With 16,384 rows of distinct 1,000-character strings, which the input holds in dictionary pages and then plain
+  pages, beside 1,000 f64 columns in one row group, passing them through takes 281 -> 321 ms, in 13 row groups where
+  0.0.2 wrote 4, and 1.4% more bytes.
+- On a million rows in 16 row groups, fitting `LeaveOneOutEncoder` and `JamesSteinEncoder` over a million distinct
+  keys takes 1.07 and 1.09 times as long with a target of 0 or 1 (270 -> 288 ms and 271 -> 296 ms), and 1.12 and 1.10
+  times with a float target. With a target of 0 or 1, one fit of either peaks at 333 -> 345 MiB of resident memory, and
+  one `TargetEncoder` fit above at 297 -> 346 MiB (median of 11 runs). Fitting `JamesSteinEncoder` over 1,000
+  categories with an integer target from 2^53 takes 17.0 -> 30.0 ms.
+- Reading a cached fitted attribute such as `StandardScaler.mean_` takes 48.6 -> 61.7 ns. Constructing a `GroupAgg`
+  of three aggregates takes 333 -> 507 ns, and a `CountEncoder` with `min_group_size=0.05` 599 -> 958 ns. A `Cast`
+  over 20,000 names given as a `str` subclass or as `numpy.str_` takes 0.59 -> 2.44 ms and 0.60 -> 2.42 ms to
+  construct, where plain `str` names take 0.60 -> 0.56 ms.
+- `transform_dict` of a record whose keys are a `str` subclass with its own `__hash__` takes 1.15 times as long with
+  3 fields (212 -> 243 ns) and 1.07 times with 30 fields (2.07 -> 2.24 µs).
 
 ## 0.0.2
 

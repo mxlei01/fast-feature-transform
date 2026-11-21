@@ -44,8 +44,10 @@ pipeline.save("artifacts/preprocessing")
 serving = Pipeline.load("artifacts/preprocessing")
 ```
 
-If you run a batch operation in a daemon thread, join that thread before Python shuts down. The engine needs the
-interpreter to stay alive until the call returns.
+If you run a batch call, such as `fit`, `transform_parquet` or `transform_memmap`, in a daemon thread, join that thread
+before the main module returns. A call still running when the interpreter exits is cut off: a transform leaves partial
+output, and the process can end with an abort from Arrow ("cannot create default memory pool"), as a pyarrow read or
+write in a daemon thread can.
 
 ## Transform latency
 
