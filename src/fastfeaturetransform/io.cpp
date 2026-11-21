@@ -12,6 +12,7 @@
 #include <arrow/io/interfaces.h>
 #include <arrow/table.h>
 #include <arrow/type_traits.h>
+#include <arrow/util/binary_view_util.h>
 #include <arrow/util/bit_run_reader.h>
 #include <arrow/util/bitmap_ops.h>
 #include <arrow/util/bitmap_reader.h>
@@ -1142,30 +1143,67 @@ std::shared_ptr<arrow::ChunkedArray> trim_for_statistics(const std::shared_ptr<a
 // (dictionary_readable). 64-bit offsets hold the bytes of any batch of views.
 // A column inside a list, struct or map keeps its views: no kernel reads one,
 // and the Parquet writer stores views and strings alike.
+//
+// The conversion works on the buffers. One pass over the views gives every
+// row its end offset, and a null row takes no bytes whatever its view holds.
+// Then each row that holds a value copies its bytes. The validity bitmap
+// gives those rows a run at a time, so a batch of mostly nulls skips its
+// nulls without reading their views again.
+//
+// Measured on an Apple M4 with one thread, CPU time, medians of 11
+// interleaved pairs in each of two runs: passing 1,048,576 rows of 8-byte
+// strings, 90% of them null, in 16 row groups through takes 0.85 to 0.87 of
+// the time it took when each value was appended to a builder, and 262,144
+// rows of 20 such columns in 4 row groups 0.82 of it.
 std::shared_ptr<arrow::Array> strings_from_views(const std::shared_ptr<arrow::Array>& column, const std::string& name) {
   if (column->type_id() != arrow::Type::STRING_VIEW) return column;
   const auto& views = static_cast<const arrow::StringViewArray&>(*column);
-  const bool nulls = views.null_count() != 0;
+  const arrow::BinaryViewType::c_type* view = views.raw_values();
+  // A view that is not inline names one of the buffers that follow the
+  // validity bitmap and the views.
+  const std::shared_ptr<arrow::Buffer>* buffers = views.data()->buffers.data() + 2;
+  const int64_t rows = views.length();
+  const uint8_t* validity = views.null_count() == 0 ? nullptr : views.null_bitmap_data();
+  const std::string where = "column '" + name + "'";
+  auto offsets = arrow::AllocateBuffer((rows + 1) * static_cast<int64_t>(sizeof(int64_t)));
+  if (!offsets.ok()) throw Error(where + ": " + offsets.status().ToString());
+  auto* ends = reinterpret_cast<int64_t*>((*offsets)->mutable_data());
   int64_t bytes = 0;
-  for (int64_t row = 0; row < views.length(); ++row) {
-    if (!(nulls && views.IsNull(row))) bytes += static_cast<int64_t>(views.GetView(row).size());
-  }
-  arrow::LargeStringBuilder builder;
-  arrow::Status status = builder.Reserve(views.length());
-  if (status.ok()) status = builder.ReserveData(bytes);
-  std::shared_ptr<arrow::Array> strings;
-  if (status.ok()) {
-    for (int64_t row = 0; row < views.length(); ++row) {
-      if (nulls && views.IsNull(row)) {
-        builder.UnsafeAppendNull();
-      } else {
-        builder.UnsafeAppend(views.GetView(row));
-      }
+  ends[0] = 0;
+  if (validity == nullptr) {
+    for (int64_t row = 0; row < rows; ++row) {
+      bytes += view[row].size();
+      ends[row + 1] = bytes;
     }
-    status = builder.Finish(&strings);
+  } else {
+    for (int64_t row = 0; row < rows; ++row) {
+      const bool valid = arrow::bit_util::GetBit(validity, static_cast<uint64_t>(views.offset() + row));
+      bytes += valid ? view[row].size() : 0;
+      ends[row + 1] = bytes;
+    }
   }
-  if (!status.ok()) throw Error("column '" + name + "': " + status.ToString());
-  return strings;
+  auto data = arrow::AllocateBuffer(bytes);
+  if (!data.ok()) throw Error(where + ": " + data.status().ToString());
+  uint8_t* out = (*data)->mutable_data();
+  arrow::internal::VisitSetBitRunsVoid(validity, views.offset(), rows, [&](int64_t first, int64_t count) {
+    for (int64_t row = first; row < first + count; ++row) {
+      const std::string_view value = arrow::util::FromBinaryView(view[row], buffers);
+      std::memcpy(out + ends[row], value.data(), value.size());
+    }
+  });
+  // The rows' validity, copied so that it starts at the first row whatever
+  // the column's offset is.
+  std::shared_ptr<arrow::Buffer> bitmap;
+  if (validity != nullptr) {
+    auto copied = arrow::internal::CopyBitmap(arrow::default_memory_pool(), validity, views.offset(), rows);
+    if (!copied.ok()) throw Error(where + ": " + copied.status().ToString());
+    bitmap = std::move(*copied);
+  }
+  return arrow::MakeArray(
+      arrow::ArrayData::Make(arrow::large_utf8(), rows,
+                             {std::move(bitmap), std::shared_ptr<arrow::Buffer>(std::move(*offsets)),
+                              std::shared_ptr<arrow::Buffer>(std::move(*data))},
+                             views.null_count()));
 }
 
 }  // namespace

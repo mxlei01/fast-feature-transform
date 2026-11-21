@@ -1,6 +1,7 @@
 """Tests for the Parquet source and sink: empty row groups, page encodings, projection, output contract."""
 
 import base64
+import itertools
 import json
 import os
 import resource
@@ -690,23 +691,66 @@ def test_files_that_store_large_or_view_strings_differently_are_read_together(
 def test_files_that_store_bytes_in_different_pages_are_read_together(
     tmp_path: Path, leaf: pa.DataType, encoding: str
 ) -> None:
+    # Bytes at the top level and in every kind of nested column: a list, a
+    # large list, a fixed-size list, a struct, and a map's keys and values.
     values: list[bytes | None] = [b"\xff", None, b"", b"longer than twelve bytes"]
+    keys: list[bytes] = [b"\xff", b"k", b"", b"a key longer than twelve bytes"]
     table: pa.Table = pa.table(
-        {"raw": pa.array(values, leaf), "nested": pa.array([[v] for v in values], pa.list_(leaf))}
+        {
+            "raw": pa.array(values, leaf),
+            "nested": pa.array([[v] for v in values], pa.list_(leaf)),
+            "big": pa.array([[v] for v in values], pa.large_list(leaf)),
+            "fixed": pa.array([[v] for v in values], pa.list_(leaf, 1)),
+            "pair": pa.array(
+                [{"blob": v, "n": row} for row, v in enumerate(values)], pa.struct([("blob", leaf), ("n", pa.int64())])
+            ),
+            "map": pa.array([[(k, v)] for k, v in zip(keys, values, strict=True)], pa.map_(leaf, leaf)),
+            "x": np.arange(4, dtype=np.float64),
+        }
     )
+    leaves: list[str] = [
+        "raw",
+        "nested.list.element",
+        "big.list.element",
+        "fixed.list.element",
+        "pair.blob",
+        "map.key_value.key",
+        "map.key_value.value",
+    ]
     files: list[str] = [
         write_parquet(tmp_path / "dictionary.parquet", table),
         write_parquet(tmp_path / "plain.parquet", table, use_dictionary=False),
         write_parquet(
-            tmp_path / "delta.parquet",
-            table,
-            use_dictionary=False,
-            column_encoding=dict.fromkeys(["raw", "nested.list.element"], encoding),
+            tmp_path / "delta.parquet", table, use_dictionary=False, column_encoding=dict.fromkeys(leaves, encoding)
         ),
     ]
-    for order in (files, files[::-1]):
-        parts = Select(columns=["raw", "nested"]).fit(order).transform_parquet(order, output_dir=tmp_path / "out")
-        assert [pq.read_table(part).to_pydict() for part in parts] == [table.to_pydict()] * len(files)
+    # Each file stores every leaf of bytes in the pages it is named for, and
+    # the reader gives delta pages back in the stored layout.
+    for leaf_name in leaves:
+        assert _first_chunk(Path(files[0]), leaf_name).has_dictionary_page
+        assert not _first_chunk(Path(files[1]), leaf_name).has_dictionary_page
+        assert encoding in _first_chunk(Path(files[2]), leaf_name).encodings
+    # One thread over the three files, and 4 threads over 18, which the
+    # engine inspects on several threads before it compares them.
+    for run, (threads, order) in enumerate(itertools.product((1, 4), (files, files[::-1]))):
+        sources: list[str] = order * (6 if threads == 4 else 1)
+        selected: Select = Select(columns=table.column_names).fit(sources, threads=threads)
+        parts: list[Path] = selected.transform_parquet(sources, output_dir=tmp_path / f"out-{run}")
+        assert [pq.read_table(part).to_pydict() for part in parts] == [table.to_pydict()] * len(sources)
+        # A memmap holds no bytes, but the files are still checked against one
+        # another, the columns it leaves out included.
+        mapped: Select = Select(columns=["x"]).fit(sources, threads=threads)
+        index: Path = mapped.transform_memmap(sources, output_dir=tmp_path / f"memmap-{run}")
+        records: np.ndarray = np.memmap(index.parent / json.loads(index.read_text())["file"], dtype="<f8", mode="r")
+        np.testing.assert_array_equal(records, np.tile(np.arange(4, dtype=np.float64), len(sources)))
+    # A message names a column of bytes in delta pages binary, its type in
+    # dictionary and plain pages.
+    numbers: str = write_parquet(tmp_path / "numbers.parquet", pa.table({"raw": [1, 2]}))
+    raw: str = write_parquet(
+        tmp_path / "raw.parquet", table.select(["raw"]), use_dictionary=False, column_encoding={"raw": encoding}
+    )
+    with pytest.raises(EngineError, match=r"numbers\.parquet: column 'raw' is i64 but .*raw\.parquet has binary$"):
+        Select(columns=["raw"]).fit([raw, numbers])
 
 
 @pytest.mark.parametrize("encoding", ["DELTA_BYTE_ARRAY", "DELTA_LENGTH_BYTE_ARRAY"])
@@ -753,6 +797,46 @@ def test_a_string_view_column_in_delta_pages_is_utf8_to_string_steps_and_cast(tm
     assert run(str(delta), str(delta)) == expected
     assert run(dictionary, str(delta)) == expected
     assert run(str(delta), dictionary) == expected
+
+
+def test_string_view_columns_in_delta_pages_pass_through_with_the_values_pyarrow_reads(tmp_path: Path) -> None:
+    # 100,000 rows in two row groups, read in several batches, of strings of
+    # 0 to 40 letters. Arrow's reader keeps the bytes of each string longer
+    # than 12 bytes in buffers of 32 KiB, so the views of one batch name many
+    # buffers. The columns hold no null, about half nulls, about nine nulls in
+    # ten, and nulls only.
+    rng = np.random.default_rng(12)
+    rows: int = 100_000
+    letters: np.ndarray = rng.integers(ord("a"), ord("z") + 1, size=(rows, 40), dtype=np.uint8)
+    words: list[str] = [bytes(letters[row, :length]).decode() for row, length in enumerate(rng.integers(0, 41, rows))]
+    shares: dict[str, float] = {"none": 0.0, "half": 0.5, "most": 0.9, "all": 1.0}
+    table: pa.Table = pa.table(
+        {
+            **{
+                name: pa.array(
+                    [None if null else word for word, null in zip(words, rng.random(rows) < share, strict=True)],
+                    pa.string_view(),
+                )
+                for name, share in shares.items()
+            },
+            "x": np.arange(rows, dtype=np.float64),
+        }
+    )
+    source: str = write_parquet(
+        tmp_path / "views.parquet",
+        table,
+        row_group_size=rows // 2,
+        use_dictionary=False,
+        column_encoding=dict.fromkeys(shares, "DELTA_BYTE_ARRAY"),
+    )
+    assert pq.read_schema(source).equals(table.schema, check_metadata=False)
+    assert all("DELTA_BYTE_ARRAY" in _first_chunk(Path(source), name).encodings for name in shares)
+    pipeline: Pipeline = Pipeline([("scale", StandardScaler(columns=["x"], with_mean=False, with_std=False))])
+    parts: list[Path] = pipeline.fit([source]).transform_parquet([source], output_dir=tmp_path / "out")
+    assert len(parts) == 2
+    # A part stores no Arrow schema, so pyarrow reads the strings back as string.
+    written: pa.Schema = pa.schema([*((name, pa.string()) for name in shares), ("x", pa.float64())])
+    assert pq.read_table(tmp_path / "out").equals(table.cast(written))
 
 
 def test_files_whose_nested_columns_differ_in_type_are_still_refused(tmp_path: Path) -> None:
