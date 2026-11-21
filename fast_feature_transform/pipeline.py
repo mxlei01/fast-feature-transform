@@ -389,6 +389,9 @@ class Pipeline:
                 digits, and the same names ending in ``.tmp``, are deleted,
                 and a run that fails midway leaves none. Each part number has
                 the width of the last part number, with at least five digits.
+                Names are compared with their case: on a volume that ignores
+                case, a file whose name differs from a part's only in case is
+                not deleted, and a run that writes that part writes over it.
 
         Returns:
             The paths of the part files written, one per input row group, in

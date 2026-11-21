@@ -552,6 +552,9 @@ class Transformer:
                 digits, and the same names ending in ``.tmp``, are deleted,
                 and a run that fails midway leaves none. Each part number has
                 the width of the last part number, with at least five digits.
+                Names are compared with their case: on a volume that ignores
+                case, a file whose name differs from a part's only in case is
+                not deleted, and a run that writes that part writes over it.
 
         Returns:
             The paths of the part files written, one per input row group, in
@@ -3304,20 +3307,21 @@ class KBinsDiscretizer(Transformer):
     an edge midway between each pair of sorted cluster centers. Transform
     answers how many interior edges a value is at or past, so a value below
     the first edge is bin 0 and one past the last is the top bin. The
-    ``"quantile"`` and ``"kmeans"`` strategies then drop every edge within
-    ``1e-8`` of the one before it, as scikit-learn does, so a column can end
-    up with fewer bins than ``n_bins`` asked for. Values near f64's largest
-    can make a computed edge overflow: that rule drops such an edge where
-    scikit-learn drops it, and a kept edge that is not finite is an error,
-    because a saved pipeline cannot hold it. So is a ``"kmeans"`` edge
-    midway between two centers whose sum overflows. A constant column is
-    one bin holding everything. ``encode="ordinal"`` replaces the column with
-    an i64 bin index in place. ``"onehot"`` and ``"onehot-dense"`` mean the
-    same thing here, because the output is always dense columns: both drop the
-    column and append one i64 column per bin, named ``<column>_<bin>``, after
-    the columns that stay, so how many columns there are is known only after
-    the fit and a later step in the same pipeline cannot name them, and one
-    given no columns does not take them. A null is an error, at fit and at
+    ``"quantile"`` and ``"kmeans"`` strategies then drop every edge after
+    the first that is not more than ``1e-8`` above the edge computed before
+    it, as scikit-learn does, so a column can end up with fewer bins than
+    ``n_bins`` asked for, and one left with no bin is an error. Values near
+    f64's largest can make a computed edge overflow: that rule drops such an
+    edge where scikit-learn drops it, and a kept edge that is not finite is
+    an error, because a saved pipeline cannot hold it. So is a ``"kmeans"``
+    edge that is not finite, even one that rule would drop. A constant column
+    is one bin holding everything. ``encode="ordinal"`` replaces the column
+    with an i64 bin index in place. ``"onehot"`` and ``"onehot-dense"`` mean
+    the same thing here, because the output is always dense columns: both drop
+    the column and append one i64 column per bin, named ``<column>_<bin>``,
+    after the columns that stay, so how many columns there are is known only
+    after the fit and a later step in the same pipeline cannot name them, and
+    one given no columns does not take them. A null is an error, at fit and at
     transform, because scikit-learn refuses one outright; so is a value that is
     NaN or infinity. An integer column is widened to f64, so a magnitude past
     2^53 rounds. ``"quantile"`` and ``"kmeans"`` keep every value and move them
@@ -3335,7 +3339,8 @@ class KBinsDiscretizer(Transformer):
     scikit-learn's arbitrary choice among points that tie on distance from
     their center, which scikit-learn makes over the rows in file order and
     this package over the sorted values. On ``[-1, -1, 1, 1]`` at 4 bins the
-    edges here are ``[-1, -1, 0, 1]`` and the values fall in bins 1 and 2,
+    edges here are ``[-1, -1, 0, 1]`` (the edge computed between the two -1
+    edges lies below -1 and is dropped) and the values fall in bins 1 and 2,
     where scikit-learn 1.9.0 gives the edges ``[-1, 0, 1]`` and the bins 0
     and 1; for the rows in the order ``[1, 1, -1, -1]`` it gives the edges
     and bins of this package. The fit of a column whose squared deviations

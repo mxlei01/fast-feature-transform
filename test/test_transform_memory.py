@@ -213,8 +213,10 @@ print(peak() - before)
 # peak memory by 134 MB at one thread and by 537 MB at four, where each thread
 # read a damaged page (Apple M4).
 CLAIMED_BYTES: int = 134_000_000
-# Refused before the request, the damaged reads raise it by less than 0.4 MB
-# at one thread and at four. The bound sits between.
+# Refused before the request, the damaged reads raised it by 0.18 to 0.59 MB
+# in 120 runs at one thread and 120 at four, 30 of each beside four busy
+# threads (Apple M4). The bound sits between: one page's stated bytes,
+# requested, pass it, and the refused reads stay far below it.
 MAX_CLAIM_PEAK_GROWTH_BYTES: int = 32_000_000
 
 
@@ -280,7 +282,7 @@ def test_a_page_that_states_more_bytes_than_its_chunk_holds_is_refused_before_th
         str(threads),
         str(tmp_path),
     ]
-    child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path)  # nosec B603
+    child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path, timeout=60)  # nosec B603
     *errors, growth = child.stdout.splitlines()
     assert int(growth) < MAX_CLAIM_PEAK_GROWTH_BYTES, f"the damaged reads raised the peak by {int(growth) / 1e6:.1f} MB"
     assert len(errors) == 2

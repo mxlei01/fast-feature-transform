@@ -438,7 +438,11 @@ void reject_sources_inside(const std::vector<std::string>& sources, const std::s
 }
 
 // The output directory is ours to overwrite: drop every part file (and any
-// half-written .tmp part) so a directory read as a dataset never mixes runs.
+// half-written .tmp part), so a directory read as a dataset holds one run's
+// parts. is_part_file compares names with their case: on a volume that
+// ignores case, a file whose name differs from a part's only in case is not
+// dropped, a run that writes that part writes over it, and a later run that
+// does not write that part leaves it beside its own parts.
 void clear_parts(const std::string& dir) {
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
