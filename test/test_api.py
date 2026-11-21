@@ -416,6 +416,130 @@ def test_interrupts_that_land_in_the_removal_start_it_over_and_the_call_raises_a
     assert _interrupted_batch_calls(tmp_path, first, 10) == _removed_after_the_output(raised)
 
 
+# Pipeline.transform_parquet raises the exception the test names where Path
+# in the pipeline module turns the first part's path into a Path, after the
+# engine wrote its three parts, and the second os.unlink of the removal
+# raises KeyboardInterrupt, so the removal starts over. An INSTRUCTION
+# callback of sys.monitoring marks a SIGINT pending right before the
+# helper's backward jump to the next attempt, without a check for it:
+# interrupt_main runs inside a for loop's own iteration, where the
+# interpreter does not check for a signal. The jump checks, so a second
+# interrupt lands there. With the garbage collector off, the child prints
+# the traceback lines of the exception that reached the caller that name an
+# exception or link two, whether the interrupt was set at the jump, and
+# whether an object in the caller's frame was freed once that exception was
+# dropped.
+_INTERRUPT_BETWEEN_ATTEMPTS_CHILD: str = """
+import _thread
+import dis
+import gc
+import json
+import os
+import signal
+import sys
+import tempfile
+import traceback
+import weakref
+from pathlib import Path
+
+import fast_feature_transform.pipeline
+from fast_feature_transform import EngineError, Pipeline, Select
+from fast_feature_transform.transformers import _output_directory
+
+source, parent, first = sys.argv[1:]
+tempfile.tempdir = parent
+signal.signal(signal.SIGINT, signal.default_int_handler)
+first_error = {"KeyboardInterrupt": KeyboardInterrupt, "EngineError": EngineError}[first]
+code = _output_directory.__wrapped__.__code__
+(jump,) = [instruction.offset for instruction in dis.get_instructions(code) if instruction.opname == "JUMP_BACKWARD"]
+monitoring = sys.monitoring
+tool = monitoring.DEBUGGER_ID
+monitoring.use_tool_id(tool, "interrupts")
+real_path, real_unlink = Path, os.unlink
+unlinks = [0]
+reached = []
+
+
+def output_path(*args):
+    path = real_path(*args)
+    if path.parent.name.startswith("fast_feature_transform_"):
+        raise first_error("after the output")
+    return path
+
+
+def unlink(path, *, dir_fd=None):
+    unlinks[0] += 1
+    if unlinks[0] == 2:
+        raise KeyboardInterrupt("interrupt 1 in the removal")
+    real_unlink(path, dir_fd=dir_fd)
+
+
+def before(executing, offset):
+    if offset == jump:
+        reached.append(offset)
+        monitoring.set_local_events(tool, code, 0)
+        for _ in iter(_thread.interrupt_main, None):
+            pass
+
+
+class Local:
+    pass
+
+
+def caller(local):
+    in_the_frame = Local()
+    local.append(weakref.ref(in_the_frame))
+    pipeline.transform_parquet([source])
+
+
+gc.disable()
+pipeline = Pipeline([("select", Select(columns=["x"]))]).fit([source])
+local = []
+raised = None
+fast_feature_transform.pipeline.Path = output_path
+os.unlink = unlink
+monitoring.register_callback(tool, monitoring.events.INSTRUCTION, before)
+monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+try:
+    caller(local)
+except (KeyboardInterrupt, EngineError) as error:
+    text = "".join(traceback.format_exception(error))
+    raised = [line for line in text.splitlines() if line[:1].strip() and not line.startswith("Traceback")]
+finally:
+    monitoring.set_local_events(tool, code, 0)
+    os.unlink = real_unlink
+    fast_feature_transform.pipeline.Path = real_path
+print(json.dumps([raised, reached == [jump], local[0]() is None]))
+"""
+
+
+@pytest.mark.parametrize("first", ["KeyboardInterrupt", "EngineError"])
+def test_an_interrupt_at_the_jump_between_two_attempts_of_the_removal_leaves_the_callers_frames_free(
+    tmp_path: Path, first: str
+) -> None:
+    # REGRESSION: the removal deletes the first interrupt that landed in it
+    # on every way out, so the exception that reaches the caller holds no
+    # reference cycle, and the caller's frames are freed as soon as the
+    # caller drops it. An interrupt at the jump between two attempts stops
+    # the removal and reaches the caller, and the first interrupt, whose
+    # traceback holds the helper's frame, used to stay in that frame until
+    # the garbage collector ran.
+    source: Path = tmp_path / "numbers.parquet"
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), source, row_group_size=1)
+    parent: Path = tmp_path / "temporary"
+    parent.mkdir()
+    command: list[str] = [sys.executable, "-c", _INTERRUPT_BETWEEN_ATTEMPTS_CHILD, str(source), str(parent), first]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=60, check=False)  # nosec B603
+    assert child.returncode == 0, child.stderr
+    call: str = "KeyboardInterrupt" if first == "KeyboardInterrupt" else "fast_feature_transform._core.EngineError"
+    raised: list[str] = [
+        f"{call}: after the output",
+        "During handling of the above exception, another exception occurred:",
+        "KeyboardInterrupt",
+    ]
+    assert json.loads(child.stdout) == [raised, True, True]
+
+
 # The pipeline writes one part per row group of a file of 512 rows in 512 row
 # groups, and the call raises KeyboardInterrupt where Path in its module
 # turns the first part's path into a Path. A watcher thread then sends a real
@@ -2414,35 +2538,33 @@ class _HeldFit:
 
     The engine call comes after the fit has read the steps. ``moved`` is set
     when the fit reaches the engine call, or when it has to wait for a
-    _WatchedLock built on ``moved``. Leaving the block lets the engine call
-    run and waits for the fit; when the block raised nothing, it checks that
-    the fit raised nothing either.
+    _WatchedLock built on ``moved``. Leaving the block, or ``finish``, lets
+    the engine call run and waits for the fit; when the block raised
+    nothing, leaving it checks that the fit raised what it was expected to
+    raise, or nothing.
     """
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, pipeline: Pipeline, path: Path) -> None:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pipeline: Pipeline,
+        path: Path,
+        raises: type[BaseException] | None = None,
+    ) -> None:
         """Prepare the fit, which ``start`` starts.
 
         Args:
             monkeypatch: Replaces the engine the pipeline module builds, for the test.
             pipeline: The pipeline to fit.
             path: The file to fit it on.
+            raises: The exception the fit raises, or None when it returns.
 
         """
         self.moved: threading.Event = threading.Event()
         self._release: threading.Event = threading.Event()
         self._errors: list[BaseException] = []
-
-        def held_engine(threads: int, temp_dir: Any) -> SimpleNamespace:
-            engine: _core.Engine = _fit_engine(threads, temp_dir)
-
-            def fit(plan: str, paths: list[str]) -> _core.FittedPipeline:
-                self.moved.set()
-                assert self._release.wait(_WAIT)
-                return engine.fit(plan, paths)
-
-            return SimpleNamespace(fit=fit)
-
-        monkeypatch.setattr("fast_feature_transform.pipeline._fit_engine", held_engine)
+        self._raises: type[BaseException] | None = raises
+        self._monkeypatch: pytest.MonkeyPatch = monkeypatch
         self._thread: threading.Thread = threading.Thread(target=self._fit, args=(pipeline, path), daemon=True)
 
     def __enter__(self) -> Self:
@@ -2465,12 +2587,16 @@ class _HeldFit:
             traceback: Its traceback.
 
         """
+        self.finish()
+        if exc_type is None:
+            assert not self._thread.is_alive()
+            assert [type(error) for error in self._errors] == ([] if self._raises is None else [self._raises])
+
+    def finish(self) -> None:
+        """Let the engine call run and wait for the fit to return or raise."""
         self._release.set()
         if self._thread.ident is not None:
             self._thread.join(_WAIT)
-        if exc_type is None:
-            assert not self._thread.is_alive()
-            assert self._errors == []
 
     def _fit(self, pipeline: Pipeline, path: Path) -> None:
         """Fit, keeping what it raises for the end of the block.
@@ -2486,7 +2612,24 @@ class _HeldFit:
             self._errors.append(error)
 
     def start(self) -> None:
-        """Start the fit and wait until it is in the engine call or waits for a watched lock."""
+        """Start the fit and wait until it is in the engine call or waits for a watched lock.
+
+        The engine is replaced as the fit starts, so that fits started one
+        after another each wait for their own release.
+        """
+        release: threading.Event = self._release
+
+        def held_engine(threads: int, temp_dir: Any) -> SimpleNamespace:
+            engine: _core.Engine = _fit_engine(threads, temp_dir)
+
+            def fit(plan: str, paths: list[str]) -> _core.FittedPipeline:
+                self.moved.set()
+                assert release.wait(_WAIT)
+                return engine.fit(plan, paths)
+
+            return SimpleNamespace(fit=fit)
+
+        self._monkeypatch.setattr("fast_feature_transform.pipeline._fit_engine", held_engine)
         self._thread.start()
         assert self.moved.wait(_WAIT)
 
@@ -2581,6 +2724,82 @@ def test_steps_assigned_while_a_fit_runs_raise_and_the_fit_binds_the_steps_it_co
         target.steps = _new_steps()
 
 
+def test_steps_assigned_while_a_fit_binds_the_tree_raise_and_the_fit_binds_the_steps_it_compiled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fit ends only once it has bound every pipeline it read, so the
+    # nested pipeline, assigned to after the fit binds its step and before
+    # the fit publishes its binding, refuses as being fitted. A fit that ends
+    # before its bind lets the nested pipeline take the steps there, and then
+    # binds it to the plan compiled from the old ones.
+    first, _ = _two_files(tmp_path)
+    nested: Pipeline = Pipeline([("u", _ReadsAtItsBind(columns=["u"]))])
+    root: Pipeline = Pipeline([("nested", nested), ("v", LabelEncoder(columns=["v"]))])
+    answers: list[object] = []
+
+    def assign() -> None:
+        nested.steps = _new_steps()
+
+    monkeypatch.setattr(_ReadsAtItsBind, "hook", lambda: answers.append(_outcome(assign)))
+    root.fit([first], threads=1)
+    refused: str = (
+        "RuntimeError: Pipeline is being fitted, so its steps cannot be reassigned; "
+        "build a new Pipeline with the steps you want and fit that"
+    )
+    assert answers == [refused]
+    assert json.loads(root.stages_json()) == _listed_stages(root)
+
+
+@pytest.mark.parametrize("failing", ["first", "second"])
+def test_a_pipeline_refuses_new_steps_until_every_fit_that_read_it_has_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    # Two fits of one pipeline read its steps, one after the other, and wait
+    # in their engine calls. The first or the second to read raises, on a
+    # file without the column, while the other still runs, and the pipeline
+    # refuses new steps until that one ends too. A pipeline that keeps a
+    # flag in place of the fits that read its steps, or only the last of
+    # them, takes the assignment, and then lists a range of (0, 10) and
+    # scales to (0, 1).
+    pipeline: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    without_x: Path = tmp_path / "without_x.parquet"
+    pq.write_table(pa.table({"y": [0.0]}), without_x)
+    with _HeldFit(monkeypatch, pipeline, _scaled_file(tmp_path)) as running:
+        with _HeldFit(monkeypatch, pipeline, without_x, raises=EngineError) as failed:
+            for fit in (failed, running) if failing == "first" else (running, failed):
+                fit.start()
+        # The failed fit has raised, and the other waits in its engine call.
+        with pytest.raises(
+            RuntimeError,
+            match="^Pipeline is being fitted, so its steps cannot be reassigned; "
+            "build a new Pipeline with the steps you want and fit that$",
+        ):
+            pipeline.steps = _new_steps()
+    _assert_runs_the_steps_it_lists(pipeline, 1.0)
+
+
+@pytest.mark.parametrize("assigned", ["root", "nested"])
+def test_a_fitted_pipeline_that_is_being_fitted_again_refuses_new_steps_as_already_fitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, assigned: str
+) -> None:
+    # A fitted pipeline answers that it is fitted whether or not another fit
+    # of it runs: its steps cannot be reassigned once that fit ends either.
+    nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    root: Pipeline = Pipeline([("nested", nested)])
+    path: Path = _scaled_file(tmp_path)
+    root.fit([path], threads=1)
+    target: Pipeline = root if assigned == "root" else nested
+    with _HeldFit(monkeypatch, root, path) as fit:
+        fit.start()
+        with pytest.raises(
+            RuntimeError,
+            match="^Pipeline is already fitted, so its steps cannot be reassigned; "
+            "build a new Pipeline with the steps you want and fit that$",
+        ):
+            target.steps = _new_steps()
+    _assert_runs_the_steps_it_lists(root, 1.0)
+
+
 def test_an_assignment_raises_when_a_fit_reads_the_steps_while_it_reads_the_new_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2628,6 +2847,56 @@ def test_a_fit_that_starts_while_the_setter_assigns_waits_and_runs_the_new_steps
     _assert_runs_the_steps_it_lists(pipeline, 10.0)
 
 
+class _EndsAHeldFitWhenReadAgain:
+    """Stands in for the fits a pipeline holds: none runs, and the second read lets a held fit end first.
+
+    The steps setter reads the fits twice, before it reads the new steps
+    and again under the bind lock.
+    """
+
+    def __init__(self, fit: _HeldFit) -> None:
+        """Hold the fit, unread.
+
+        Args:
+            fit: The fit to end at the second read.
+
+        """
+        self._fit: _HeldFit = fit
+        self._reads: int = 0
+
+    @property
+    def running(self) -> bool:
+        """Read as ended; at the second read, after the held fit has bound its tree and ended.
+
+        Returns:
+            False.
+
+        """
+        self._reads += 1
+        if self._reads == 2:
+            self._fit.finish()
+        return False
+
+
+def test_an_assignment_raises_when_a_fit_binds_the_pipeline_and_ends_while_the_setter_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The setter reads the fits of a pipeline before its binding. A fit
+    # binds a nested pipeline without the lock of that pipeline, which the
+    # setter holds for its second check, and then ends. A setter that reads
+    # the binding before the fits sees no binding and no fit that runs, and
+    # takes the steps, which the pipeline then lists while it runs the plan
+    # compiled from the old ones.
+    nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["x"]))])
+    root: Pipeline = Pipeline([("nested", nested)])
+    with _HeldFit(monkeypatch, root, _scaled_file(tmp_path)) as fit:
+        fit.start()
+        vars(nested)["_fits"] = (_EndsAHeldFitWhenReadAgain(fit),)
+        with pytest.raises(RuntimeError, match="^Pipeline is already fitted"):
+            nested.steps = _new_steps()
+    _assert_runs_the_steps_it_lists(root, 1.0)
+
+
 class _UnreadableScaler(MinMaxScaler):
     """A MinMaxScaler whose parameters raise ValueError when a fit reads them."""
 
@@ -2639,8 +2908,7 @@ class _UnreadableScaler(MinMaxScaler):
 @pytest.mark.parametrize("failure", ["read", "engine", "threads"])
 def test_a_fit_that_raises_leaves_every_pipeline_in_its_tree_taking_new_steps(tmp_path: Path, failure: str) -> None:
     nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["missing"]))])
-    # The tree lists the nested pipeline twice: the fit counts it once and
-    # takes its count back once.
+    # The tree lists the nested pipeline twice, and the fit reads it once.
     steps: list[tuple[str, Transformer | Pipeline]] = [("nested", nested), ("again", nested)]
     if failure == "read":
         steps.append(("last", _UnreadableScaler(columns=["x"])))
@@ -2659,6 +2927,132 @@ def test_a_fit_that_raises_leaves_every_pipeline_in_its_tree_taking_new_steps(tm
     root.steps = [("nested", nested)]
     root.fit([path], threads=1)
     _assert_runs_the_steps_it_lists(root, 10.0)
+
+
+def test_a_pipeline_keeps_the_fits_that_ended_only_until_a_fit_reads_it_again(tmp_path: Path) -> None:
+    # A fit ends without taking a lock, and each fit that reads the steps
+    # drops the fits that have ended: a pipeline fitted and failed again and
+    # again keeps one ended fit, not one for every fit.
+    nested: Pipeline = Pipeline([("scale", MinMaxScaler(columns=["missing"]))])
+    root: Pipeline = Pipeline([("nested", nested)])
+    path: Path = _scaled_file(tmp_path)
+    for _ in range(3):
+        with pytest.raises(EngineError, match="missing"):
+            root.fit([path], threads=1)
+    assert [fit.running for fit in root._fits] == [False]
+    assert [fit.running for fit in nested._fits] == [False]
+
+
+# Each instruction of Pipeline.fit itself, not of the functions it calls,
+# gets a KeyboardInterrupt in turn, on a fit that raises EngineError (a
+# missing column) and on one that returns, each of a new tree of two
+# pipelines. An INSTRUCTION callback of sys.monitoring marks a SIGINT
+# pending right before the instruction: interrupt_main runs inside a for
+# loop's own iteration, where the interpreter does not check for a signal,
+# and the loop ends without a backward jump, which would. The interrupt then
+# lands where the interpreter next checks, as a SIGINT that arrives at that
+# instruction does, and never in the callback. A pending interrupt lands, at
+# the latest, in a call the child makes once fit has returned or raised. The
+# child prints, for each instruction the fit runs, whether the interrupt
+# landed in the fit or after it, and what an assignment of new steps to the
+# root and to the nested pipeline does then.
+_FIT_INTERRUPTED_CHILD: str = """
+import _thread
+import json
+import signal
+import sys
+
+from fast_feature_transform import MinMaxScaler, Pipeline
+
+path = sys.argv[1]
+signal.signal(signal.SIGINT, signal.default_int_handler)
+monitoring = sys.monitoring
+tool = monitoring.DEBUGGER_ID
+code = Pipeline.fit.__code__
+monitoring.use_tool_id(tool, "interrupts")
+
+
+def set_an_interrupt_pending():
+    for _ in iter(_thread.interrupt_main, None):
+        pass
+
+
+def interrupt_lands_here():
+    pass
+
+
+def answer(pipeline):
+    if pipeline._bind_lock.locked():
+        return "its lock is held"
+    try:
+        pipeline.steps = [("scale", MinMaxScaler(columns=["x"]))]
+    except RuntimeError as error:
+        return str(error).partition(",")[0]
+    return "takes new steps"
+
+
+def fit(column, offset):
+    nested = Pipeline([("scale", MinMaxScaler(columns=[column]))])
+    root = Pipeline([("nested", nested), ("last", MinMaxScaler(columns=["x"]))])
+    ran = []
+
+    def before(executing, at):
+        if offset is None:
+            ran.append(at)
+        elif at == offset and not ran:
+            ran.append(at)
+            monitoring.set_local_events(tool, code, 0)
+            set_an_interrupt_pending()
+
+    monitoring.register_callback(tool, monitoring.events.INSTRUCTION, before)
+    monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+    landed = None
+    try:
+        try:
+            root.fit([path], threads=1)
+        except KeyboardInterrupt:
+            landed = "in the fit"
+        except Exception:
+            pass
+        interrupt_lands_here()
+    except KeyboardInterrupt:
+        landed = "after the fit"
+    monitoring.set_local_events(tool, code, 0)
+    return ran, landed, [answer(root), answer(nested)]
+
+
+results = {}
+for column in ("missing", "x"):
+    ran, _, _ = fit(column, None)
+    results[column] = [[offset, *fit(column, offset)[1:]] for offset in sorted(set(ran))]
+print(json.dumps(results))
+"""
+
+
+def test_an_interrupt_at_each_instruction_of_pipeline_fit_leaves_every_pipeline_fitted_or_taking_new_steps(
+    tmp_path: Path,
+) -> None:
+    # REGRESSION: a KeyboardInterrupt that arrives at any instruction of
+    # Pipeline.fit itself, its end included, leaves each pipeline of the tree
+    # fitted, or taking new steps. A fit used to give a count back to each
+    # pipeline it had read, under that pipeline's lock, as it returned or
+    # raised, and an interrupt there left a pipeline refusing new steps as
+    # being fitted, or its lock held, for good.
+    command: list[str] = [sys.executable, "-c", _FIT_INTERRUPTED_CHILD, str(_scaled_file(tmp_path))]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=60, check=False)  # nosec B603
+    assert child.returncode == 0, child.stderr
+    results: dict[str, list[list[Any]]] = json.loads(child.stdout)
+    unfitted: list[str] = ["takes new steps", "takes new steps"]
+    fitted: list[str] = ["Pipeline is already fitted", "Pipeline is already fitted"]
+    # The fit that raises leaves both pipelines unfitted, and the one that
+    # returns leaves both fitted when the interrupt lands after the bind.
+    assert [row for row in results["missing"] if row[1] is None or row[2] != unfitted] == []
+    assert [row for row in results["x"] if row[1] is None or row[2] not in (unfitted, fitted)] == []
+    # The interrupts landed both in the fit and after it, and the fit that
+    # returns was interrupted both before and after it bound the tree.
+    assert {row[1] for row in results["missing"]} == {"in the fit", "after the fit"}
+    assert {row[1] for row in results["x"]} == {"in the fit", "after the fit"}
+    assert {tuple(row[2]) for row in results["x"]} == {tuple(unfitted), tuple(fitted)}
 
 
 _DUPLICATES: dict[str, Callable[[Pipeline], Pipeline]] = {

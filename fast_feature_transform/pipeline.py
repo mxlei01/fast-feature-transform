@@ -85,6 +85,17 @@ _PipelineBinding = tuple[_core.FittedPipeline | None, str, str | None]
 # binds these lists.
 _Reading = dict[int, tuple["Pipeline", list[Step]]]
 
+
+class _Fit:
+    """One fit of a step tree, as the pipelines it read see it: running until the fit returns or raises."""
+
+    __slots__ = ("running",)
+
+    def __init__(self) -> None:
+        """Start the fit."""
+        self.running: bool = True
+
+
 _SHELLS: dict[str, type[Transformer]] = {
     "select": Select,
     "cast": Cast,
@@ -228,10 +239,10 @@ class Pipeline:
         self._steps: list[Step] = _validated_steps(steps)
         self._binding: _PipelineBinding = (None, "", None)
         self._bind_lock: threading.Lock = threading.Lock()
-        # The fits that have read the steps and not yet returned or raised;
-        # the steps setter refuses while there is one. Changed under
-        # _bind_lock, as _steps is.
-        self._fitting: int = 0
+        # The fits that have read the steps, running or ended; the steps
+        # setter refuses while one of them runs. Replaced under _bind_lock, as
+        # _steps is, and never changed in place.
+        self._fits: tuple[_Fit, ...] = ()
 
     @property
     def steps(self) -> list[Step]:
@@ -336,15 +347,26 @@ class Pipeline:
         # fitted pipeline: steps assigned in between were bound to the plan
         # compiled from the old ones, and the pipeline listed one plan and ran
         # another.
+        this_fit: _Fit = _Fit()
         reading: _Reading = {}
         try:
-            plan: str = json.dumps(self._to_tree(reading))
+            plan: str = json.dumps(self._to_tree(reading, this_fit))
             engine: _core.Engine = _fit_engine(threads, temp_dir)
             self._adopt(engine.fit(plan, _source_paths(X)), reading)
         finally:
-            for pipeline, _ in reading.values():
-                with pipeline._bind_lock:
-                    pipeline._fitting -= 1
+            # REGRESSION: the fit ends in one store, the first thing it does
+            # when it returns or raises. The interpreter checks for a signal
+            # at a call or a backward jump, and there is none from the end of
+            # the try to this store, so no KeyboardInterrupt lands in between.
+            # A trace function, such as a debugger's, runs Python code before
+            # the store, and an interrupt that lands in it leaves the fit
+            # running. The fit used to give a count back to each pipeline it
+            # had read, one pipeline at a time and under that pipeline's lock.
+            # An interrupt in that loop left a count above zero, and one right
+            # after a lock was taken left that lock held: the pipeline refused
+            # new steps for good, and a later fit of it waited for the lock
+            # for good.
+            this_fit.running = False
         return self
 
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
@@ -661,9 +683,9 @@ class Pipeline:
         clone: Pipeline = type(self).__new__(type(self))
         clone.__dict__.update(self.__dict__)
         clone._bind_lock = threading.Lock()
-        # The copy is not being fitted: a fit of the original takes its count
-        # back from the original only.
-        clone._fitting = 0
+        # The copy is not being fitted: a fit of the original read the steps
+        # of the original only.
+        clone._fits = ()
         return clone
 
     def __getstate__(self) -> dict[str, Any]:
@@ -703,7 +725,7 @@ class Pipeline:
         self._steps = state["steps"]
         self._binding = (None, state.get("prefix", ""), state["manifest"])
         self._bind_lock = threading.Lock()
-        self._fitting = 0
+        self._fits = ()
 
     def _ensure_bound(self) -> _PipelineBinding:
         """Load a deferred (unpickled) saved pipeline and bind every step to it, once.
@@ -728,6 +750,11 @@ class Pipeline:
             RuntimeError: If it is.
 
         """
+        # The fits are read before the binding. A fit binds a nested pipeline
+        # without the lock of that pipeline, and ends after it binds, so when
+        # every fit read here has ended, the binding read next shows what they
+        # bound.
+        fitting: bool = any(fit.running for fit in self._fits)
         # Checked without _ensure_bound: an unpickled pipeline is fitted even
         # before its manifest is loaded, and refusing must not load it just to
         # refuse.
@@ -737,21 +764,22 @@ class Pipeline:
                 "Pipeline is already fitted, so its steps cannot be reassigned; "
                 "build a new Pipeline with the steps you want and fit that"
             )
-        if self._fitting:
+        if fitting:
             raise RuntimeError(
                 "Pipeline is being fitted, so its steps cannot be reassigned; "
                 "build a new Pipeline with the steps you want and fit that"
             )
 
-    def _to_tree(self, reading: _Reading) -> dict[str, Any]:
+    def _to_tree(self, reading: _Reading, fit: _Fit) -> dict[str, Any]:
         """Read the step tree for a fit and serialize it for the C++ plan compiler.
 
         Each pipeline in the tree is read once, under its bind lock, and
-        counts the fit in ``_fitting`` from then on, which refuses new steps;
-        the fit takes the count back when it returns or raises.
+        holds the fit in ``_fits`` from then on: the steps setter refuses
+        while the fit runs.
 
         Args:
             reading: Collects each pipeline read, with its steps.
+            fit: The fit that reads the tree.
 
         Returns:
             The nested plan tree as JSON-compatible data.
@@ -760,11 +788,15 @@ class Pipeline:
         with self._bind_lock:
             if id(self) not in reading:
                 reading[id(self)] = (self, self._steps)
-                self._fitting += 1
+                # The fits that have ended are dropped here, when a fit reads
+                # the steps, and not as each fit ends: a lock taken there
+                # would be left held by an interrupt that lands right after
+                # it is taken.
+                self._fits = (*[other for other in self._fits if other.running], fit)
         serialized_steps: list[list[Any]] = []
         for name, step in reading[id(self)][1]:
             if isinstance(step, Pipeline):
-                serialized_steps.append([name, step._to_tree(reading)])
+                serialized_steps.append([name, step._to_tree(reading, fit)])
             else:
                 serialized_steps.append([name, {"kernel": step.kernel_id, "params": step.params()}])
         return {"type": "pipeline", "steps": serialized_steps}
