@@ -4,7 +4,7 @@ import importlib.metadata
 import json
 import pickle
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -168,6 +168,26 @@ def test_unfitted_pipeline_raises() -> None:
 def test_fit_rejects_a_bare_path(train_files: list[str]) -> None:
     with pytest.raises(TypeError, match="wrap it in a list"):
         _build_pipeline().fit(train_files[0])  # ty: ignore[invalid-argument-type]
+
+
+def test_the_annotations_take_a_tuple_of_columns_and_an_os_pathlike_path(
+    train_files: list[str], tmp_path: Path
+) -> None:
+    # ty checks this test with the rest of the tree. A tuple of column names
+    # and an os.PathLike path that is not a pathlib.Path, a PurePath here,
+    # pass its check. A bare str of columns does not, and ty reports the
+    # ignore comment below as unused once an annotation takes one. The calls
+    # run as well.
+    with pytest.raises(TypeError, match="not a single string"):
+        Select(columns="device")  # ty: ignore[invalid-argument-type]
+    source: PurePath = PurePath(train_files[0])
+    pipeline: Pipeline = Pipeline([("select", Select(columns=("device", "price")))])
+    pipeline.fit((source,), temp_dir=PurePath(tmp_path))
+    parts: list[Path] = pipeline.transform_parquet([source], output_dir=PurePath(tmp_path / "out"))
+    assert {part.parent.name for part in parts} == {"out"}
+    pipeline.save(PurePath(tmp_path / "saved"))
+    loaded: Pipeline = Pipeline.load(PurePath(tmp_path / "saved"))
+    assert loaded.transform_dict({"device": "mob", "price": 1.0}) == {"device": "mob", "price": 1.0}
 
 
 def test_duplicate_step_names_rejected() -> None:

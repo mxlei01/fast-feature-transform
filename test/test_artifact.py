@@ -1020,6 +1020,24 @@ def test_transform_dict_raises_the_error_a_value_raises_while_it_converts(source
         pipeline.transform_dict({"device": "ios", "n": _NoIndex(), "big": INT64_MAX + 1})
 
 
+def test_transform_dict_refuses_the_first_value_it_reads_of_two_it_refuses(source: str) -> None:
+    # The walk over a record reads, in record order, every value that runs no
+    # Python code to read, numpy values among them. It then reads the other
+    # values in record order. Of two values that are refused, the one read
+    # first is the one refused.
+    pipeline: Pipeline = Pipeline([("s", Select(columns=["device"]))]).fit([source])
+    with pytest.raises(EngineError, match="^record value for 'a' does not fit in a 64-bit integer$"):
+        pipeline.transform_dict({"device": "ios", "a": np.uint64(2**64 - 1), "b": INT64_MAX + 1})
+    with pytest.raises(EngineError, match="^record value for 'b' does not fit in a 64-bit integer$"):
+        pipeline.transform_dict({"device": "ios", "b": INT64_MAX + 1, "a": np.uint64(2**64 - 1)})
+    # Neither _NoIndex nor Decimal is read in the walk.
+    with pytest.raises(ValueError, match="^no integer value$"):
+        pipeline.transform_dict({"device": "ios", "a": _NoIndex(), "b": Decimal(2)})
+    unsupported: str = r"must be str, int, float, bool, datetime, or None \(got Decimal\)"
+    with pytest.raises(EngineError, match=f"^record value for 'b' {unsupported}$"):
+        pipeline.transform_dict({"device": "ios", "b": Decimal(2), "a": _NoIndex()})
+
+
 class _LookupRaises:
     """A value whose lookup of an attribute it lacks raises KeyError, as a __getattr__ that reads a dict does."""
 

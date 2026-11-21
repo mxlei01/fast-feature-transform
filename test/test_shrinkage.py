@@ -155,6 +155,22 @@ def test_shrinkage_null_and_unknown_options(events: list[str], tmp_path: Path) -
     assert sparse.prior_ == pytest.approx(2.0)
 
 
+def test_shrinkage_null_values_are_none_where_the_null_category_has_no_value(events: list[str], tmp_path: Path) -> None:
+    # The null category has no value under handle_missing='return_nan', which
+    # encodes a null as null, and after a fit that saw no null, which encodes
+    # a null as the prior. Here the prior is (1 + 2 + 4) / 3.
+    no_nulls: str = write_parquet(
+        tmp_path / "no_nulls.parquet", pa.table({"device": ["ios", "web", "ios"], "clicks": [1.0, 2.0, 4.0]})
+    )
+    for encoder in (JamesSteinEncoder, LeaveOneOutEncoder, CatBoostEncoder):
+        keep_null = encoder(columns=["device"], target="clicks", handle_missing="return_nan").fit(events)
+        assert keep_null.null_values_ == {"device": None}, encoder.__name__
+        assert keep_null.transform_dict({"device": None}) == {"device": None}, encoder.__name__
+        unseen = encoder(columns=["device"], target="clicks").fit([no_nulls])
+        assert unseen.null_values_ == {"device": None}, encoder.__name__
+        assert unseen.transform_dict({"device": None}) == {"device": 7 / 3}, encoder.__name__
+
+
 # REGRESSION: a mis-joined label column — every row null after a left join
 # that missed — used to fit, save, load and serve a constant 0.0 for every
 # category, with nothing anywhere saying so. Under handle_unknown="error" it
