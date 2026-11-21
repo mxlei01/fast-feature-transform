@@ -362,6 +362,7 @@ struct DictionaryChunk {
   bool settled = false;
   std::optional<int32_t> outside;  // a data page's index at or past `entries`
   int unchecked = 0;               // pages of indices passed before any plain page
+  int64_t after_dictionary = 0;    // bytes from the chunk's start to the page after its dictionary page
 };
 
 // Parquet stores the length of a string or byte value in a PLAIN page as 4
@@ -493,12 +494,19 @@ class PageIndices {
 // passes, with the decoder Arrow uses. One that comes before any plain page
 // is only counted, and its bytes do not outlive the next page: the check of
 // the first batch after a plain page reads those pages again
-// (index_outside_before_plain).
+// (index_outside_before_plain), from where `stream`, the chunk's bytes, stood
+// after the dictionary page. `stream` is null for a chunk that Arrow's own
+// page reader reads, which is then read again from its start.
 class WatchedPages final : public parquet::PageReader {
  public:
-  WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::vector<DictionaryChunk>& chunks, std::size_t leaf,
-               const parquet::ColumnDescriptor& column)
-      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf), column_(column), watched_(chunks[leaf].watched) {
+  WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::shared_ptr<arrow::io::InputStream> stream,
+               std::vector<DictionaryChunk>& chunks, std::size_t leaf, const parquet::ColumnDescriptor& column)
+      : pages_(std::move(pages)),
+        stream_(std::move(stream)),
+        chunks_(chunks),
+        leaf_(leaf),
+        column_(column),
+        watched_(chunks[leaf].watched) {
     if (watched_) {
       chunks_[leaf_] = DictionaryChunk{};
       chunks_[leaf_].watched = true;
@@ -516,15 +524,25 @@ class WatchedPages final : public parquet::PageReader {
     if (page->type() == parquet::PageType::DICTIONARY_PAGE) {
       const auto& dictionary = static_cast<const parquet::DictionaryPage&>(*page);
       chunk.entries = dictionary.num_values();
+      if (stream_) {
+        const arrow::Result<int64_t> after = stream_->Tell();
+        if (after.ok()) chunk.after_dictionary = *after;
+      }
       const uint8_t* at = dictionary.data();
       if (dictionary.size() > 0 && chunk.entries > 0) {
         const uint8_t* end = at + dictionary.size();
         for (int32_t i = 0; i < chunk.entries; ++i) {
           const auto value = next_plain_value(at, end);
           if (!value) break;
-          // A single long string must not keep a copy of its bytes alive
-          // through every batch. Mixed pages then take the exact fallback.
-          if (i == chunk.entries - 1 && value->size() <= 256) chunk.last.emplace(*value);
+          // REGRESSION: the last value is kept whatever its length, so that
+          // a batch that shows the page is checked without reading the page
+          // again. Arrow's reader holds every value of the page for the
+          // whole chunk, so the copy adds one value to that. A last value
+          // over 256 bytes used to be left out, and a chunk of such values
+          // whose first checked batch came after a plain page had its
+          // dictionary page read and sorted a second time
+          // (dictionary_page_repeats).
+          if (i == chunk.entries - 1) chunk.last.emplace(*value);
         }
       }
     } else if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
@@ -587,6 +605,7 @@ class WatchedPages final : public parquet::PageReader {
   }
 
   std::unique_ptr<parquet::PageReader> pages_;
+  std::shared_ptr<arrow::io::InputStream> stream_;
   std::vector<DictionaryChunk>& chunks_;
   std::size_t leaf_;
   const parquet::ColumnDescriptor& column_;
@@ -654,14 +673,22 @@ class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
         always_compressed_(always_compressed) {}
 
   std::unique_ptr<parquet::PageReader> GetColumnPageReader(int i) override {
-    return std::make_unique<WatchedPages>(open_pages(i), chunks_, static_cast<std::size_t>(i),
+    std::shared_ptr<arrow::io::InputStream> stream;
+    std::unique_ptr<parquet::PageReader> pages = open_pages(i, stream);
+    return std::make_unique<WatchedPages>(std::move(pages), std::move(stream), chunks_, static_cast<std::size_t>(i),
                                           *group_->metadata()->schema()->Column(i));
   }
   const parquet::RowGroupMetaData* metadata() const override { return group_->metadata(); }
   const parquet::ReaderProperties* properties() const override { return &properties_; }
 
  private:
-  std::unique_ptr<parquet::PageReader> open_pages(int i) {
+  // The pages of leaf `i`, read through `stream` unless Arrow's own page
+  // reader reads them. A second read of a chunk's pages of indices
+  // (index_outside_before_plain) gives the leaf an unwatched DictionaryChunk
+  // that notes where the first read found the page after the dictionary
+  // page, and starts there. A watched one belongs to a first read, and still
+  // holds what the leaf's previous chunk noted.
+  std::unique_ptr<parquet::PageReader> open_pages(int i, std::shared_ptr<arrow::io::InputStream>& stream) {
     const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = group_->metadata()->ColumnChunk(i);
     int64_t start = chunk->data_page_offset();
     if (chunk->has_dictionary_page() && chunk->dictionary_page_offset() > 0 &&
@@ -673,9 +700,14 @@ class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
       return group_->GetColumnPageReader(i);
     }
     if (short_chunks_) length += std::min<int64_t>(100, size_ - start - length);
-    return parquet::PageReader::Open(
-        std::make_shared<ChunkStream>(properties_.GetStream(input_, start, length), length), chunk->num_values(),
-        chunk->compression(), properties_, *group_->metadata()->schema()->Column(i), always_compressed_);
+    const DictionaryChunk& noted = chunks_[static_cast<std::size_t>(i)];
+    if (!noted.watched && noted.after_dictionary > 0) {
+      start += noted.after_dictionary;
+      length -= noted.after_dictionary;
+    }
+    stream = std::make_shared<ChunkStream>(properties_.GetStream(input_, start, length), length);
+    return parquet::PageReader::Open(stream, chunk->num_values(), chunk->compression(), properties_,
+                                     *group_->metadata()->schema()->Column(i), always_compressed_);
   }
 
   std::shared_ptr<parquet::RowGroupReader> group_;
@@ -839,13 +871,17 @@ bool dictionary_page_repeats(const std::shared_ptr<arrow::io::RandomAccessFile>&
 // indices of column chunk (`row_group`, `leaf`) of the file at `path`, which
 // come before its first plain page, or nullopt. The chunk's pages up to the
 // last of them are read from `input` again, through the bounds of
-// WatchedRowGroup; the plain page after them is not.
+// WatchedRowGroup; the plain page after them is not, nor is the dictionary
+// page before them when the first read noted `after_dictionary`, the bytes
+// from the chunk's start to the page that follows it.
 std::optional<int32_t> index_outside_before_plain(const std::string& path,
                                                   const std::shared_ptr<arrow::io::RandomAccessFile>& input,
                                                   const std::shared_ptr<parquet::FileMetaData>& metadata, int row_group,
-                                                  int leaf, int count, int32_t entries, const std::string& where) {
+                                                  int leaf, int count, int32_t entries, int64_t after_dictionary,
+                                                  const std::string& where) {
   try {
     std::vector<DictionaryChunk> unwatched(static_cast<std::size_t>(metadata->num_columns()));
+    unwatched[static_cast<std::size_t>(leaf)].after_dictionary = after_dictionary;
     const std::unique_ptr<parquet::ParquetFileReader> file = open_watched(path, input, metadata, unwatched);
     const std::shared_ptr<parquet::RowGroupReader> group = file->RowGroup(row_group);
     const std::unique_ptr<parquet::PageReader> pages = group->GetColumnPageReader(leaf);
@@ -1465,8 +1501,9 @@ class ParquetSource::Reader final : public TaskReader {
     if (chunk.unchecked > 0 && chunk.plain) {
       const int count = chunk.unchecked;
       chunk.unchecked = 0;
-      const std::optional<int32_t> earlier = index_outside_before_plain(file.path, input_, file.metadata, row_group,
-                                                                        column_index, count, chunk.entries, where);
+      const std::optional<int32_t> earlier =
+          index_outside_before_plain(file.path, input_, file.metadata, row_group, column_index, count, chunk.entries,
+                                     chunk.after_dictionary, where);
       if (earlier) chunk.outside = earlier;
     }
     // Worded as Arrow's check words it, so both checks refuse an index alike.
