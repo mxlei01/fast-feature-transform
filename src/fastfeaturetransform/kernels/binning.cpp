@@ -1443,6 +1443,9 @@ class KBinsDiscretize final : public Kernel {
     return edges;
   }
 
+  // On macOS, CMakeLists.txt compiles this file with its loops aligned to 32
+  // bytes, because on an Apple M4 the nearest-center loop below is slow when
+  // it starts 44 bytes into a 64-byte line of code.
   static bool assign(SpillVector<KMeansPoint>& points, const std::vector<double>& centers, std::vector<double>& norms,
                      std::vector<ExactSum>& sums, std::vector<int64_t>& sizes) {
     for (std::size_t k = 0; k < centers.size(); ++k) norms[k] = centers[k] * centers[k];
