@@ -3410,7 +3410,9 @@ class PolynomialFeatures(Transformer):
     order ``columns`` gives). ``degree=(min, max)`` keeps only the degrees in
     that range (the bias survives either way), and ``interaction_only=True``
     drops every monomial with an exponent above 1, leaving the products of
-    distinct columns.
+    distinct columns. With ``interaction_only=True``, no bias and a minimum
+    degree above the number of columns, no monomial is left: the step drops
+    its columns and adds none, as scikit-learn's transform returns no column.
 
     The width is a function of the parameters alone, so this transformer
     never fits: it declares its outputs before any data is read, and a later
@@ -3457,7 +3459,7 @@ class PolynomialFeatures(Transformer):
                 or a pair of them, or a flag is not a bool.
             ValueError: If columns is empty, a column name would make a
                 generated name ambiguous, degree is negative or inverted,
-                the combination generates no columns, or the expansion would
+                degree 0 is asked for without a bias, or the expansion would
                 be wider than ``MAX_OUTPUTS`` (4096) columns.
 
         """
@@ -3475,11 +3477,6 @@ class PolynomialFeatures(Transformer):
         if maximum == 0 and not include_bias:
             raise ValueError("PolynomialFeatures: degree 0 with include_bias False would generate no columns")
         names: list[str] = _monomial_names(self.columns, self.degree, self.interaction_only, self.include_bias)
-        if not names:
-            raise ValueError(
-                f"PolynomialFeatures: {len(self.columns)} columns with degree {self.degree!r}, "
-                "interaction_only True and include_bias False would generate no columns"
-            )
         if include_bias and "1" in names[1:]:
             raise ValueError(
                 "PolynomialFeatures: column '1' has the bias column's name; rename it or set include_bias=False"

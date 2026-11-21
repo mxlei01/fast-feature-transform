@@ -132,6 +132,86 @@ def test_polynomial_features_honours_degree_interaction_and_bias(numbers: list[s
     }
 
 
+# REGRESSION: interaction_only without the bias and with a minimum degree
+# above the number of columns leaves no monomial, and the step drops its
+# columns and adds none. scikit-learn 1.9.0 fits the same options with
+# n_output_features_ 0. Construction and the fit used to refuse them.
+def test_polynomial_features_that_generates_no_column_drops_its_columns(tmp_path: Path) -> None:
+    empty: PolynomialFeatures = PolynomialFeatures(
+        columns=["x", "z"], degree=(3, 4), interaction_only=True, include_bias=False
+    )
+    assert empty.output_columns == []
+    train: str = write_parquet(
+        tmp_path / "train.parquet",
+        pa.table({"x": [1.0, 2.0], "z": [None, 5.0], "y": [0.0, 4.0], "keep": ["a", "b"]}),
+    )
+    probe: str = write_parquet(
+        tmp_path / "probe.parquet",
+        pa.table({"x": [3.0, None], "z": [4.0, 2.0], "y": [7.0, -1.0], "keep": ["c", "d"]}),
+    )
+    passed: list[dict[str, Any]] = [{"y": 7.0, "keep": "c"}, {"y": -1.0, "keep": "d"}]
+    # The scaler fits y = [0, 4]: mean 2 and standard deviation 2, so 7 and -1
+    # become (7 - 2) / 2 = 2.5 and (-1 - 2) / 2 = -1.5.
+    scaled: list[dict[str, Any]] = [{"y": 2.5, "keep": "c"}, {"y": -1.5, "keep": "d"}]
+    alone: PolynomialFeatures = PolynomialFeatures(**empty.params()).fit([train])
+    pipeline: Pipeline = Pipeline([("poly", empty), ("scale", StandardScaler(columns=["y"]))]).fit([train])
+    cases: dict[str, tuple[PolynomialFeatures | Pipeline, list[dict[str, Any]]]] = {
+        "alone": (alone, passed),
+        "alone unpickled": (pickle.loads(pickle.dumps(alone)), passed),
+        "pipeline": (pipeline, scaled),
+        "pipeline unpickled": (pickle.loads(pickle.dumps(pipeline)), scaled),
+    }
+    for name, (fitted, expected) in cases.items():
+        assert read_rows(fitted.transform_parquet([probe], output_dir=tmp_path / name)) == expected, name
+        assert fitted.transform_dict({"x": 3.0, "z": 4.0, "y": 7.0, "keep": "c"}) == expected[0], name
+        assert fitted.transform_dict({"x": None, "z": 2.0, "y": -1.0, "keep": "d"}) == expected[1], name
+
+    # The dropped columns are still read under the step's rules, and a file
+    # with no column left gets the error of any pipeline that emits nothing.
+    with pytest.raises(EngineError, match="key 'x' must be a number or null"):
+        alone.transform_dict({"x": "three", "z": 4.0, "y": 7.0, "keep": "c"})
+    only: str = write_parquet(tmp_path / "only.parquet", pa.table({"x": [3.0], "z": [4.0]}))
+    with pytest.raises(EngineError, match="the pipeline emits no columns"):
+        alone.transform_parquet([only], output_dir=tmp_path / "only")
+
+
+# The manifest version 0.0.3 wrote for a PolynomialFeatures step that
+# generates no column followed by a StandardScaler fitted on y = [0, 4]. It
+# is that version's text byte for byte, except the time in created_at.
+_EMPTY_EXPANSION_SAVED_BY_0_0_3: str = (
+    '{"created_at":"1999-01-01T00:00:00Z","library_version":"0.0.3","ops":[{"kernel":"polynomial_features",'
+    '"params":{"columns":["x"],"degree":[2,2],"include_bias":false,"interaction_only":true},"stage":"poly",'
+    '"state":{}},{"kernel":"standard_scale","params":{"columns":["y"],"with_mean":true,"with_std":true},'
+    '"stage":"scale","state":{"columns":["y"],"counts":{"y":2},"means":{"y":2.0},"scales":{"y":2.0},'
+    '"variances":{"y":4.0}}}],"schema_version":"0.3.0"}'
+)
+
+
+# REGRESSION: a saved pipeline with a PolynomialFeatures step that generates
+# no column loads and answers as the version that saved it did. Loading it,
+# from the directory or from a pickle, used to raise.
+def test_polynomial_features_that_generates_no_column_loads_as_version_0_0_3_saved_it(tmp_path: Path) -> None:
+    (tmp_path / "saved").mkdir()
+    (tmp_path / "saved" / "manifest.json").write_text(_EMPTY_EXPANSION_SAVED_BY_0_0_3)
+    loaded: Pipeline = Pipeline.load(tmp_path / "saved")
+    step: Any = loaded["poly"]
+    assert isinstance(step, PolynomialFeatures)
+    assert step.output_columns == []
+    probe: str = write_parquet(
+        tmp_path / "probe.parquet", pa.table({"x": [3.0, None], "y": [7.0, -1.0], "keep": ["c", "d"]})
+    )
+    # Version 0.0.3 answered these. By hand from the manifest's mean 2 and
+    # scale 2 of y: (7 - 2) / 2 = 2.5 and (-1 - 2) / 2 = -1.5.
+    expected: list[dict[str, Any]] = [{"y": 2.5, "keep": "c"}, {"y": -1.5, "keep": "d"}]
+    for name, candidate in {"loaded": loaded, "unpickled": pickle.loads(pickle.dumps(loaded))}.items():
+        assert read_rows(candidate.transform_parquet([probe], output_dir=tmp_path / name)) == expected, name
+        assert candidate.transform_dict({"x": 3.0, "y": 7.0, "keep": "c"}) == expected[0], name
+        assert candidate.transform_dict({"x": None, "y": -1.0, "keep": "d"}) == expected[1], name
+    loaded.save(tmp_path / "again")
+    again: dict[str, Any] = json.loads((tmp_path / "again" / "manifest.json").read_text())
+    assert again["ops"] == json.loads(_EMPTY_EXPANSION_SAVED_BY_0_0_3)["ops"]
+
+
 def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_path: Path) -> None:
     text: Any = "2"
     not_a_flag: Any = 1
@@ -159,8 +239,6 @@ def test_polynomial_features_validates_its_arguments(numbers: list[str], tmp_pat
         PolynomialFeatures(columns=["a"], degree=(3, 2))
     with pytest.raises(ValueError, match="degree 0 with include_bias False"):
         PolynomialFeatures(columns=["a"], degree=0, include_bias=False)
-    with pytest.raises(ValueError, match="would generate no columns"):
-        PolynomialFeatures(columns=["a", "b"], degree=(3, 4), interaction_only=True, include_bias=False)
     assert PolynomialFeatures(columns=["a", "b"], degree=(3, 4), interaction_only=True).output_columns == ["1"]
     with pytest.raises(TypeError, match="interaction_only must be True or False"):
         PolynomialFeatures(columns=["a"], interaction_only=not_a_flag)
