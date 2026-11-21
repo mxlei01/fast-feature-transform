@@ -3270,7 +3270,12 @@ class KBinsDiscretizer(Transformer):
     stopping iteration computed. What this package cannot follow is
     scikit-learn's arbitrary choice among points that tie on distance from
     their center, which scikit-learn makes over the rows in file order and
-    this package over the sorted values.
+    this package over the sorted values. The fit of a column whose squared
+    deviations from its mean sum past the range of f64 stops after its first
+    pass, as scikit-learn's does, while every value is less than 2^512 from
+    the mean; from 2^512 on, where scikit-learn's own squares overflow, the
+    column is fit as scikit-learn fits it divided by a power of two that
+    brings it into range.
 
     ``strategy="uniform"`` over a column spanning a few ulps returns bin edges
     that repeat, as ``np.linspace`` and scikit-learn do; the saved pipeline

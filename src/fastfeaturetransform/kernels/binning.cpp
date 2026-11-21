@@ -1357,18 +1357,23 @@ class KBinsDiscretize final : public Kernel {
     const double largest = std::max(high - mean, mean - low);
     const int exponent = largest >= 0x1p500 ? std::ilogb(largest) - 499 : 0;
     const auto centered = [&](double value) { return std::ldexp(value - mean, -exponent); };
-    // sklearn stops after the first pass when the original squared
-    // deviations sum to infinity. Restore their scale only for that check:
-    // the finite tolerance and the center shifts use the scaled units.
+    // sklearn's tolerance is infinite when the original squared deviations
+    // sum past f64, and its run then stops after the first pass. The fit
+    // stops there too while the farthest value is under 2^512 from the mean
+    // (an exponent of at most 12), where each of sklearn's squares is still
+    // finite: the largest double under 2^512 squares to 2^1024 - 2^972. The
+    // original scale is restored only for that check; the finite tolerance
+    // and the center shifts use the scaled units. From 2^512 on, sklearn's
+    // squares overflow one by one and its edges depend on which of its
+    // distances overflow, so the column runs as sklearn runs it divided by
+    // 2^exponent, whose tolerance is infinite only when the scaled squares
+    // sum past f64.
     ExactSum squares;
-    bool squares_fit = true;
-    sorted.for_each([&](std::size_t, double value) {
-      squares_fit = squares_fit && squares.add(centered(value) * centered(value));
-    });
-    const double square_sum = squares_fit ? squares.value() : std::numeric_limits<double>::infinity();
-    const double tolerance = std::isfinite(std::ldexp(square_sum, 2 * exponent))
-                                 ? square_sum / static_cast<double>(count) * kTolerance
-                                 : std::numeric_limits<double>::infinity();
+    sorted.for_each([&](std::size_t, double value) { (void)squares.add(centered(value) * centered(value)); });
+    const double square_sum = squares.value();
+    const bool first_pass_only = largest < 0x1p512 && std::isinf(std::ldexp(square_sum, 2 * exponent));
+    const double tolerance = first_pass_only ? std::numeric_limits<double>::infinity()
+                                             : square_sum / static_cast<double>(count) * kTolerance;
 
     // Point and previous label travel together through sequential spill-file
     // passes. The sentinel is outside the validated [0, bins_) label range,
