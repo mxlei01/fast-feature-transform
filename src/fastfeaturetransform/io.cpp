@@ -22,6 +22,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/column_page.h>
 #include <parquet/column_reader.h>
+#include <parquet/encoding.h>
 #include <parquet/exception.h>
 #include <parquet/file_reader.h>
 #include <parquet/schema.h>
@@ -30,6 +31,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cctype>
 #include <cerrno>
@@ -314,6 +316,9 @@ void require_parquet(const std::string& path) {
 // are read as a dictionary at the top of a column and inside a list, large
 // list, struct or map, where a child array holds them, so the check visits
 // every child: one pass per batch here covers every kernel and the writer.
+// It bounds indices by the batch's dictionary, which also holds the values of
+// plain pages that follow the dictionary page; WatchedPages bounds each page
+// of indices by the dictionary page's own count.
 // Strings inside a fixed-size list are read plain instead (see
 // read_plain_inside_fixed_size_lists). The reader's indices are int32, and
 // their largest value read as unsigned (a negative one is then too large)
@@ -353,6 +358,7 @@ struct DictionaryChunk {
   bool indexed = false;
   bool plain = false;
   bool settled = false;
+  std::optional<int32_t> outside;  // a data page's index at or past `entries`
 };
 
 // Parquet stores the length of a string or byte value in a PLAIN page as 4
@@ -372,11 +378,23 @@ std::optional<std::string_view> next_plain_value(const uint8_t*& at, const uint8
   return value;
 }
 
-// Tracks the dictionary count and data page encodings as Arrow reads them.
+// Tracks the dictionary count and data page encodings as Arrow reads them,
+// and bounds the indices of each data page by the dictionary page's count.
+//
+// Arrow's reader of strings as a dictionary decodes each page of indices
+// without a bounds check, and appends the values of the plain pages that a
+// writer falls back to after them to the same dictionary. In a chunk that
+// holds both, an index at or past the dictionary page's count can name the
+// value of a plain page inside the batch's dictionary, where
+// check_dictionary_indices cannot see it. Whether plain pages follow is known
+// only after a page of indices has gone to Arrow, and the page's bytes do
+// not outlive the next page, so every page of indices is checked as it
+// passes, with the decoder Arrow uses.
 class WatchedPages final : public parquet::PageReader {
  public:
-  WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::vector<DictionaryChunk>& chunks, std::size_t leaf)
-      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf) {
+  WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::vector<DictionaryChunk>& chunks, std::size_t leaf,
+               const parquet::ColumnDescriptor& column)
+      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf), column_(column) {
     chunks_[leaf_] = DictionaryChunk{};
     chunks_[leaf_].watched = true;
   }
@@ -400,9 +418,11 @@ class WatchedPages final : public parquet::PageReader {
         }
       }
     } else if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
-      const parquet::Encoding::type encoding = static_cast<const parquet::DataPage&>(*page).encoding();
+      const auto& data = static_cast<const parquet::DataPage&>(*page);
+      const parquet::Encoding::type encoding = data.encoding();
       if (encoding == parquet::Encoding::RLE_DICTIONARY || encoding == parquet::Encoding::PLAIN_DICTIONARY) {
         chunk.indexed = true;
+        if (chunk.entries >= 0 && !chunk.outside) chunk.outside = index_outside(data, chunk.entries);
       } else {
         chunk.plain = true;
       }
@@ -413,9 +433,87 @@ class WatchedPages final : public parquet::PageReader {
   void set_max_page_header_size(uint32_t size) override { pages_->set_max_page_header_size(size); }
 
  private:
+  // The first index of data page `page` at or past `entries`, or nullopt.
+  // Arrow decodes an index for each definition level that reaches the
+  // leaf's maximum, so exactly those are checked. A page whose levels or
+  // indices cannot be decoded is left to Arrow, which fails on the same
+  // bytes.
+  std::optional<int32_t> index_outside(const parquet::DataPage& page, int32_t entries) {
+    try {
+      const uint8_t* data = page.data();
+      const int64_t size = page.size();
+      const int16_t max_definition = column_.max_definition_level();
+      int64_t levels = 0;  // the bytes of levels in front of the indices
+      if (page.type() == parquet::PageType::DATA_PAGE_V2) {
+        // The header states the lengths of the levels, which Arrow's page
+        // reader has found to be at least 0, but not at most the page's size.
+        // A version 1 page holds each length in its bytes, and LevelDecoder
+        // refuses one past the page.
+        const auto& v2 = static_cast<const parquet::DataPageV2&>(page);
+        levels = int64_t{v2.repetition_levels_byte_length()} + v2.definition_levels_byte_length();
+        if (levels > size) return std::nullopt;
+        if (max_definition > 0) {
+          definitions_.SetDataV2(v2.definition_levels_byte_length(), max_definition, page.num_values(),
+                                 data + v2.repetition_levels_byte_length());
+        }
+      } else {
+        const auto& v1 = static_cast<const parquet::DataPageV1&>(page);
+        if (column_.max_repetition_level() > 0) {
+          levels = repetitions_.SetData(v1.repetition_level_encoding(), column_.max_repetition_level(),
+                                        page.num_values(), data, static_cast<int32_t>(size));
+        }
+        if (max_definition > 0) {
+          levels += definitions_.SetData(v1.definition_level_encoding(), max_definition, page.num_values(),
+                                         data + levels, static_cast<int32_t>(size - levels));
+        }
+      }
+      // CountUpTo stops where the page's levels end, and Arrow's reader then
+      // refuses a page short of levels. A debug build of Arrow asserts in
+      // CountUpTo that the levels fill the page instead, which ends the
+      // process.
+      int count = page.num_values();
+      if (max_definition > 0) {
+        count = 0;
+        for (int left = page.num_values(); left > 0;) {
+          const parquet::LevelDecoder::CountUpToResult counted = definitions_.CountUpTo(max_definition, left);
+          if (counted.processed_count <= 0) break;
+          count += counted.matching_count;
+          left -= counted.processed_count;
+        }
+      }
+      if (count <= 0) return std::nullopt;
+      if (!indices_) indices_ = parquet::MakeDictDecoder<parquet::ByteArrayType>(&column_);
+      indices_->SetData(count, data + levels, static_cast<int>(size - levels));
+      const auto bound = static_cast<uint32_t>(entries);
+      for (int done = 0; done < count;) {
+        const int step = std::min(count - done, static_cast<int>(decoded_.size()));
+        indices_->DecodeIndices(step, decoded_.data());
+        const int32_t* first = decoded_.data();
+        const int32_t* last = first + step;
+        // A negative index read as unsigned is past any count.
+        uint32_t largest = 0;
+        for (const int32_t* index = first; index != last; ++index) {
+          largest = std::max(largest, static_cast<uint32_t>(*index));
+        }
+        if (largest >= bound) {
+          return *std::find_if(first, last, [&](int32_t index) { return static_cast<uint32_t>(index) >= bound; });
+        }
+        done += step;
+      }
+    } catch (const parquet::ParquetException&) {
+      // Arrow refuses the page when it decodes it.
+    }
+    return std::nullopt;
+  }
+
   std::unique_ptr<parquet::PageReader> pages_;
   std::vector<DictionaryChunk>& chunks_;
   std::size_t leaf_;
+  const parquet::ColumnDescriptor& column_;
+  parquet::LevelDecoder repetitions_;
+  parquet::LevelDecoder definitions_;
+  std::unique_ptr<parquet::DictDecoder<parquet::ByteArrayType>> indices_;
+  std::array<int32_t, 1024> decoded_{};
 };
 
 // A row group of a WatchedFile: the pages of each watched leaf pass through
@@ -430,7 +528,7 @@ class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
     std::unique_ptr<parquet::PageReader> pages = group_->GetColumnPageReader(i);
     const auto leaf = static_cast<std::size_t>(i);
     if (!chunks_[leaf].watched) return pages;
-    return std::make_unique<WatchedPages>(std::move(pages), chunks_, leaf);
+    return std::make_unique<WatchedPages>(std::move(pages), chunks_, leaf, *group_->metadata()->schema()->Column(i));
   }
   const parquet::RowGroupMetaData* metadata() const override { return group_->metadata(); }
   const parquet::ReaderProperties* properties() const override { return &properties_; }
@@ -1105,6 +1203,11 @@ class ParquetSource::Reader final : public TaskReader {
     const int column_index = leaves_[leaf++];
     DictionaryChunk& chunk = chunks_[static_cast<std::size_t>(column_index)];
     if (!column.dictionary) return;
+    // Worded as Arrow's check words it, so both checks refuse an index alike.
+    if (chunk.outside) {
+      throw Error(where + ": column '" + name + "' has a dictionary index outside its dictionary: Index " +
+                  std::to_string(*chunk.outside) + " out of bounds");
+    }
     if (chunk.entries > 0 && chunk.indexed && !chunk.settled) {
       if (!chunk.plain && column.dictionary->length == chunk.entries) {
         chunk.settled = true;

@@ -386,6 +386,180 @@ def test_parquet_dictionary_indices_outside_a_nested_dictionary_are_refused(tmp_
         parquet_to_memmap([corrupt], output_dir=tmp_path / "converted")
 
 
+def _declare_dictionary_entries(path: Path, leaf: int, count: Callable[[int], int]) -> int:
+    """Rewrites the count of entries that the dictionary page of a leaf in row group 0 declares.
+
+    The page's values stay as they are. In Thrift's compact encoding the dictionary page header (field 7 of the page
+    header, a struct: 0x4C) opens with num_values (field 1, an i32: 0x15) as a zigzag varint; the new count must take
+    as many bytes as the old one.
+
+    Args:
+        path: The file, rewritten in place.
+        leaf: The number of the Parquet leaf.
+        count: Gives the new count from the declared one.
+
+    Returns:
+        The count the page declared.
+    """
+    chunk = pq.ParquetFile(path).metadata.row_group(0).column(leaf)
+    data = bytearray(path.read_bytes())
+    header = bytes(data[chunk.dictionary_page_offset : chunk.data_page_offset])
+    assert header.count(b"\x4c\x15") == 1
+    at = chunk.dictionary_page_offset + header.index(b"\x4c\x15") + 2
+    zigzag, length = 0, 0
+    while True:
+        byte = data[at + length]
+        zigzag |= (byte & 0x7F) << (7 * length)
+        length += 1
+        if byte < 0x80:
+            break
+    declared = zigzag >> 1
+    rest, fresh = count(declared) << 1, bytearray()
+    while True:
+        fresh.append((rest & 0x7F) | (0x80 if rest > 0x7F else 0))
+        rest >>= 7
+        if not rest:
+            break
+    assert len(fresh) == length
+    data[at : at + length] = fresh
+    path.write_bytes(bytes(data))
+    return declared
+
+
+def _falling_back_column(kind: str) -> tuple[pa.Array, int, dict[str, Any]]:
+    """A column whose strings fill a dictionary page and then go on in plain pages.
+
+    Args:
+        kind: "string", "binary", "list", "struct", "map values", "long page" or "later page".
+
+    Returns:
+        The column; the number of the Parquet leaf that holds the strings; and the options for pq.write_table.
+    """
+    if kind == "long page":
+        # 5,000 rows of 40 values, and 1,000 values each its own: the writer
+        # gives the dictionary up after the first batch of 1,024 rows that
+        # passes 600 bytes, so one page of indices holds more than 5,000 rows
+        # and the page's last entry is used past its first 1,024.
+        words = [f"c{row % 40:02d}" for row in range(5000)] + [f"u{row:04d}" for row in range(1000)]
+        return pa.array(words), 0, {"dictionary_pagesize_limit": 600}
+    if kind == "later page":
+        # 2,049 rows of 39 short values, a long value that takes the dictionary
+        # past 300 bytes, and values each its own: the page's last entry, the
+        # long value, is used only in the last row of the last of several pages
+        # of indices.
+        words = [f"c{row % 39}" for row in range(2049)] + ["x" * 60] + [f"u{row:04d}" for row in range(950)]
+        return pa.array(words), 0, {"dictionary_pagesize_limit": 300, "write_batch_size": 50, "data_page_size": 400}
+    # 3,000 values, each its own, every seventh one null. Looked at every 50
+    # values, the 300-byte limit is passed by the first 50, so each row group's
+    # page holds those, pages of indices their rows, and plain pages the rest.
+    options = {"dictionary_pagesize_limit": 300, "write_batch_size": 50, "data_page_size": 400, "row_group_size": 1000}
+    words = [None if row % 7 == 3 else f"u{row:04d}" for row in range(3000)]
+    strings = pa.array(words)
+    offsets = pa.array(range(0, 3001, 3), pa.int32())
+    if kind == "string":
+        return strings, 0, options
+    if kind == "binary":
+        return strings.cast(pa.binary()), 0, options
+    if kind == "list":
+        return pa.ListArray.from_arrays(offsets, strings), 0, options
+    if kind == "struct":
+        return pa.StructArray.from_arrays([strings, pa.array(range(3000))], ["name", "n"]), 0, options
+    return pa.MapArray.from_arrays(offsets, pa.array([f"k{row:04d}" for row in range(3000)]), strings), 1, options
+
+
+# REGRESSION: an index at or past the count of a dictionary page is refused in
+# a chunk that falls back to plain pages after it. Arrow's reader of strings as
+# a dictionary appends the plain pages' values to the batch's dictionary, so
+# such an index used to name one of them, and the row was read as that value
+# without an error, at the top level and nested alike. Here the dictionary page
+# declares one entry fewer than it holds, so the rows that use its last entry
+# point one past the page.
+@pytest.mark.parametrize("pages", [("1.0", "NONE"), ("2.0", "SNAPPY"), ("1.0", "ZSTD")], ids=str)
+@pytest.mark.parametrize("kind", ["string", "binary", "list", "struct", "map values", "long page", "later page"])
+def test_parquet_index_past_a_dictionary_page_that_plain_pages_follow_is_refused(
+    tmp_path: Path, kind: str, pages: tuple[str, str]
+) -> None:
+    column, leaf, options = _falling_back_column(kind)
+    table = pa.table({"c": column, "x": np.arange(float(len(column)))})
+    clean, corrupt = tmp_path / "clean.parquet", tmp_path / "corrupt.parquet"
+    version, compression = pages
+    pq.write_table(table, clean, data_page_version=version, compression=compression, **options)
+    corrupt.write_bytes(clean.read_bytes())
+    entries = _declare_dictionary_entries(corrupt, leaf, lambda declared: declared - 1)
+    # The page holds fewer than a fifth of the chunk's values: plain pages hold the rest.
+    assert 1 < entries < 200
+    with pytest.raises(pa.ArrowInvalid, match="Index not in dictionary bounds"):
+        pq.read_table(corrupt)
+
+    message = (
+        f"{corrupt}: failed to read row group 0: column 'c' has a dictionary index outside its dictionary: "
+        f"Index {entries - 1} out of bounds"
+    )
+    for threads in (1, 4):
+        model = Pipeline([("s", StandardScaler(columns=["x"]))]).fit([clean], threads=threads)
+        parts = model.transform_parquet([clean], output_dir=tmp_path / f"clean-{threads}")
+        assert pq.read_table(parts).column("c").to_pylist() == table.column("c").to_pylist()
+        with pytest.raises(EngineError, match=re.escape(message)):
+            model.transform_parquet([corrupt], output_dir=tmp_path / f"out-{threads}")
+        assert list((tmp_path / f"out-{threads}").iterdir()) == []
+        keep = Pipeline([("keep", Select(["c", "x"])), ("s", StandardScaler(columns=["x"]))])
+        with pytest.raises(EngineError, match=re.escape(message)):
+            keep.fit([corrupt], threads=threads)
+        if kind not in ("string", "long page"):
+            continue
+        with pytest.raises(EngineError, match=re.escape(message)):
+            OrdinalEncoder(columns=["c"]).fit([corrupt], threads=threads)
+        encoder = CountEncoder(columns=["c"]).fit([clean], threads=threads)
+        with pytest.raises(EngineError, match=re.escape(message)):
+            encoder.transform_memmap([corrupt], output_dir=tmp_path / f"memmap-{threads}")
+
+
+# The indices of a page come after its levels, whose lengths a page of version 2
+# states in its header. A length past the page is left to Arrow's reader, which
+# refuses it, and the indices are not looked for 100,000,000 bytes on.
+def test_parquet_data_page_v2_whose_levels_state_more_bytes_than_the_page_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "levels.parquet"
+    table = pa.table({"c": [f"u{row}" for row in range(600)]})
+    pq.write_table(
+        table,
+        path,
+        data_page_version="2.0",
+        compression="NONE",
+        write_statistics=False,
+        dictionary_pagesize_limit=300,
+        write_batch_size=50,
+        data_page_size=400,
+    )
+    data = path.read_bytes()
+    # The header of the first data page, a page of indices, ends with the
+    # fields of its DataPageHeaderV2 in Thrift's compact encoding: encoding
+    # RLE_DICTIONARY (0x15 0x10), the length of the definition levels (0x15, a
+    # varint), the length of the repetition levels (0x15 0x00), is_compressed
+    # false (0x12) and empty statistics (0x1C 0x00), then the ends of both
+    # structs. The repetition length becomes 100,000,000, a zigzag varint of 4
+    # bytes, in the place of its old byte and of the two optional fields after it.
+    at = data.index(
+        b"\x15\x00\x12\x1c\x00\x00\x00", pq.ParquetFile(path).metadata.row_group(0).column(0).data_page_offset
+    )
+    assert data[at - 4 : at - 1] == b"\x15\x10\x15"
+    rest, length = 100_000_000 << 1, bytearray(b"\x15")
+    while rest:
+        length.append((rest & 0x7F) | (0x80 if rest > 0x7F else 0))
+        rest >>= 7
+    assert len(length) == 5
+    path.write_bytes(data[:at] + bytes(length) + data[at + 5 :])
+    with pytest.raises(OSError, match=re.escape("Data page too small for levels (corrupt header?)")):
+        pq.read_table(path)
+    message = (
+        f"{path}: failed to read row group 0: column 'c' cannot be decoded: IOError: Data page too small for levels "
+        "(corrupt header?)"
+    )
+    with pytest.raises(EngineError, match=re.escape(message)):
+        OrdinalEncoder(columns=["c"]).fit([path])
+    with pytest.raises(EngineError, match=re.escape(message)):
+        Pipeline([("keep", Select(["c"]))]).fit([path]).transform_parquet([path], output_dir=tmp_path / "out")
+
+
 def _repeating_page_table(layout: str) -> tuple[pa.Table, bytes, bytes, dict[str, Any]]:
     """A table whose string column 'c' is written in a dictionary page, and how to make that page repeat a value.
 
