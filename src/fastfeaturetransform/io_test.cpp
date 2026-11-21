@@ -11,12 +11,16 @@
 #include <arrow/array/builder_decimal.h>
 #include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
+#include <arrow/array/data.h>
+#include <arrow/array/util.h>
 #include <arrow/buffer.h>
 #include <arrow/io/file.h>
 #include <arrow/memory_pool.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <arrow/type_traits.h>
+#include <arrow/util/binary_view_util.h>
+#include <arrow/util/bit_util.h>
 #include <arrow/util/decimal.h>
 #include <parquet/arrow/writer.h>
 #include <parquet/column_page.h>
@@ -717,6 +721,58 @@ std::string string_pages_file(const TempDir& dir, const std::string& name,
   return path;
 }
 
+// The column a one-column batch of `column` enters the engine as.
+std::shared_ptr<arrow::Array> entered(const std::shared_ptr<arrow::Array>& column) {
+  return fft::batch_from_arrow(
+             *arrow::RecordBatch::Make(arrow::schema({arrow::field("v", column->type())}), column->length(), {column}))
+      .cols[0];
+}
+
+// `got` holds the buffers of `want`, a large_string column a builder made:
+// the same validity bitmap (none without a null), offsets and bytes, byte for
+// byte and of the same sizes, and the same null count.
+void require_same_bits(const arrow::Array& got, const arrow::Array& want) {
+  REQUIRE(want.type_id() == arrow::Type::LARGE_STRING);
+  REQUIRE(got.type_id() == arrow::Type::LARGE_STRING);
+  REQUIRE(got.ValidateFull().ok());
+  REQUIRE(got.length() == want.length());
+  REQUIRE(got.offset() == 0);
+  REQUIRE(want.offset() == 0);
+  REQUIRE(got.null_count() == want.null_count());
+  const auto bytes_of = [](const std::shared_ptr<arrow::Buffer>& buffer) {
+    return buffer ? std::optional<std::string>(buffer->ToString()) : std::nullopt;
+  };
+  REQUIRE(got.data()->buffers.size() == 3);
+  for (std::size_t buffer = 0; buffer < 3; ++buffer) {
+    CAPTURE(buffer);
+    REQUIRE(bytes_of(got.data()->buffers[buffer]) == bytes_of(want.data()->buffers[buffer]));
+  }
+}
+
+// A string_view column made by hand from its views, the data buffers they
+// name, and whether each row holds a value.
+std::shared_ptr<arrow::Array> views_column(const std::vector<arrow::BinaryViewType::c_type>& views,
+                                           const std::vector<std::string>& data, const std::vector<bool>& valid) {
+  REQUIRE(valid.size() == views.size());
+  const auto rows = static_cast<int64_t>(views.size());
+  auto bitmap = arrow::AllocateEmptyBitmap(rows);
+  REQUIRE(bitmap.ok());
+  int64_t nulls = 0;
+  for (int64_t row = 0; row < rows; ++row) {
+    if (valid[static_cast<std::size_t>(row)]) {
+      arrow::bit_util::SetBit((*bitmap)->mutable_data(), row);
+    } else {
+      ++nulls;
+    }
+  }
+  auto stored = arrow::AllocateBuffer(rows * static_cast<int64_t>(sizeof(arrow::BinaryViewType::c_type)));
+  REQUIRE(stored.ok());
+  std::copy(views.begin(), views.end(), reinterpret_cast<arrow::BinaryViewType::c_type*>((*stored)->mutable_data()));
+  arrow::BufferVector buffers{*bitmap, std::move(*stored)};
+  for (const std::string& bytes : data) buffers.push_back(arrow::Buffer::FromString(bytes));
+  return arrow::MakeArray(arrow::ArrayData::Make(arrow::utf8_view(), rows, std::move(buffers), nulls));
+}
+
 }  // namespace
 
 TEST_CASE("a string_view column enters the engine as large_string, and any other column as it came") {
@@ -735,6 +791,129 @@ TEST_CASE("a string_view column enters the engine as large_string, and any other
   REQUIRE(batch.cols[2] == input->column(2));
   REQUIRE(large_string_values(*fft::batch_from_arrow(*input->Slice(1, 3)).cols[0]) ==
           std::vector<std::optional<std::string>>(words.begin() + 1, words.begin() + 4));
+}
+
+TEST_CASE("a string_view column enters as the bits of the large_string a builder makes of its values") {
+  using arrow::util::ToInlineBinaryView;
+  // Three data buffers. A view of up to 12 bytes holds them itself; a longer
+  // one names a buffer and an offset, in any order, and two name the same
+  // bytes. A null row's view is never read: one names a buffer that does not
+  // exist, one holds 2 bytes, one is zeros.
+  const std::vector<std::string> data{"0123456789abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                                      "a string in the third buffer"};
+  const auto at = [&](int32_t buffer, int32_t offset, int32_t size) {
+    return arrow::util::ToNonInlineBinaryView(data[static_cast<std::size_t>(buffer)].data() + offset, size, buffer,
+                                              offset);
+  };
+  arrow::BinaryViewType::c_type nowhere{};
+  nowhere.ref = {1000, {}, 9, 1 << 30};
+  const std::vector<arrow::BinaryViewType::c_type> views{ToInlineBinaryView(""),
+                                                         ToInlineBinaryView("a"),
+                                                         ToInlineBinaryView("twelve bytes"),
+                                                         at(2, 2, 13),
+                                                         nowhere,
+                                                         at(0, 10, 16),
+                                                         ToInlineBinaryView("zz"),
+                                                         at(1, 0, 26),
+                                                         at(0, 10, 16),
+                                                         ToInlineBinaryView("b"),
+                                                         arrow::BinaryViewType::c_type{},
+                                                         at(2, 0, 28)};
+  const std::vector<bool> valid{true, true, true, true, false, true, false, true, true, true, false, true};
+  const std::vector<std::optional<std::string>> values{"",
+                                                       "a",
+                                                       "twelve bytes",
+                                                       "string in the",
+                                                       std::nullopt,
+                                                       "abcdefghijklmnop",
+                                                       std::nullopt,
+                                                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                                                       "abcdefghijklmnop",
+                                                       "b",
+                                                       std::nullopt,
+                                                       "a string in the third buffer"};
+  const auto column = views_column(views, data, valid);
+  REQUIRE(column->null_count() == 3);
+  require_same_bits(*entered(column), *strings_of<arrow::LargeStringBuilder>(values));
+  // Every slice: ones that start inside a byte of the bitmap, ones of nulls
+  // only, ones without a null (whose result has no bitmap), and empty ones.
+  for (int64_t offset = 0; offset <= 12; ++offset) {
+    for (int64_t length = 0; offset + length <= 12; ++length) {
+      CAPTURE(offset, length);
+      const std::vector<std::optional<std::string>> rows(values.begin() + offset, values.begin() + offset + length);
+      require_same_bits(*entered(column->Slice(offset, length)), *strings_of<arrow::LargeStringBuilder>(rows));
+    }
+  }
+  // A column of nulls only takes no bytes, whatever its views say.
+  const auto nulls =
+      views_column(std::vector<arrow::BinaryViewType::c_type>(20, nowhere), data, std::vector<bool>(20, false));
+  require_same_bits(*entered(nulls),
+                    *strings_of<arrow::LargeStringBuilder>(std::vector<std::optional<std::string>>(20)));
+}
+
+TEST_CASE("random string_view columns enter as the bits of the large_string a builder makes of their values") {
+  // 300 columns from a fixed generator: up to 69 rows of up to 40 letters,
+  // nulls in no row, about one in four, about nine in ten, or every row, and
+  // up to 9 rows sliced off the front. The builder keeps the bytes that do not
+  // fit a view in data buffers of 64 bytes, so a column of more than 64 such
+  // bytes names several. Then every null row's view is overwritten with one
+  // of up to 1,000 bytes that names, past 12 bytes, a buffer that does not
+  // exist.
+  uint64_t state = 31;
+  const auto draw = [&](uint64_t below) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (state >> 33) % below;
+  };
+  int several_buffers = 0;
+  int null_only = 0;
+  int without_nulls = 0;
+  for (int round = 0; round < 300; ++round) {
+    CAPTURE(round);
+    const auto rows = static_cast<int64_t>(draw(70));
+    const uint64_t share = draw(4);
+    std::vector<std::optional<std::string>> values;
+    arrow::StringViewBuilder builder;
+    builder.SetBlockSize(64);
+    for (int64_t row = 0; row < rows; ++row) {
+      const bool null = share == 3 || (share == 1 && draw(4) == 0) || (share == 2 && draw(10) != 0);
+      if (null) {
+        values.emplace_back();
+        REQUIRE(builder.AppendNull().ok());
+      } else {
+        std::string value;
+        for (uint64_t byte = draw(41); byte > 0; --byte) value.push_back(static_cast<char>('a' + draw(26)));
+        REQUIRE(builder.Append(value).ok());
+        values.emplace_back(std::move(value));
+      }
+    }
+    std::shared_ptr<arrow::Array> built;
+    REQUIRE(builder.Finish(&built).ok());
+    std::shared_ptr<arrow::ArrayData> scribbled = built->data()->Copy();
+    auto views = arrow::AllocateBuffer(rows * static_cast<int64_t>(sizeof(arrow::BinaryViewType::c_type)));
+    REQUIRE(views.ok());
+    auto* view = reinterpret_cast<arrow::BinaryViewType::c_type*>((*views)->mutable_data());
+    std::copy_n(built->data()->GetValues<arrow::BinaryViewType::c_type>(1), rows, view);
+    for (int64_t row = 0; row < rows; ++row) {
+      if (built->IsValid(row)) continue;
+      view[row].ref = {static_cast<int32_t>(draw(1001)),
+                       {},
+                       1000 + static_cast<int32_t>(draw(9)),
+                       static_cast<int32_t>(draw(uint64_t{1} << 20))};
+    }
+    scribbled->buffers[1] = std::move(*views);
+    const auto offset = static_cast<int64_t>(draw(static_cast<uint64_t>(std::min<int64_t>(rows, 9)) + 1));
+    const auto column = arrow::MakeArray(scribbled)->Slice(offset);
+    const std::vector<std::optional<std::string>> kept(values.begin() + offset, values.end());
+    require_same_bits(*entered(column), *strings_of<arrow::LargeStringBuilder>(kept));
+    if (scribbled->buffers.size() > 3) ++several_buffers;
+    if (column->length() > 0 && column->null_count() == column->length()) ++null_only;
+    if (column->length() > 0 && column->null_count() == 0) ++without_nulls;
+  }
+  INFO(several_buffers << " columns name several data buffers, " << null_only << " hold only nulls, " << without_nulls
+                       << " hold no null");
+  REQUIRE(several_buffers > 100);
+  REQUIRE(null_only > 30);
+  REQUIRE(without_nulls > 30);
 }
 
 TEST_CASE("files that store strings of any layout in dictionary, plain or delta pages are read together") {
