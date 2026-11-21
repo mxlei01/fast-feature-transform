@@ -1076,9 +1076,13 @@ struct PageLayout {
 // Writes `table` to `path` with `compression`, without statistics and with a
 // page index, laid out as `layout` says. A dictionary limit also makes the
 // writer look at it every 50 values and end a data page near every 400 bytes.
+// With `int96`, timestamps are stored as INT96. With `format_1_0`, the file
+// is written in format 1.0, whose dictionary pages are PLAIN_DICTIONARY.
 void write_pages(const std::string& path, const arrow::Table& table, const PageLayout& layout,
-                 parquet::Compression::type compression = parquet::Compression::UNCOMPRESSED) {
+                 parquet::Compression::type compression = parquet::Compression::UNCOMPRESSED, bool int96 = false,
+                 bool format_1_0 = false) {
   parquet::WriterProperties::Builder properties;
+  if (format_1_0) properties.version(parquet::ParquetVersion::PARQUET_1_0);
   properties.compression(compression)
       ->disable_statistics()
       ->set_size_statistics_level(parquet::SizeStatisticsLevel::None)
@@ -1090,6 +1094,7 @@ void write_pages(const std::string& path, const arrow::Table& table, const PageL
   }
   parquet::ArrowWriterProperties::Builder arrow_properties;
   if (layout.store_schema) arrow_properties.store_schema();
+  if (int96) arrow_properties.enable_deprecated_int96_timestamps();
   auto output = arrow::io::FileOutputStream::Open(path);
   REQUIRE(output.ok());
   const arrow::Status written =
@@ -1628,6 +1633,617 @@ TEST_CASE("a dictionary page whose values a batch shows is read once") {
   // The copy now in its place is refused.
   REQUIRE_THROWS_WITH(fft::testing::read_task(*fft::open_source({path}), 1),
                       path + ": failed to read row group 1: column 'c' has a dictionary page that repeats a value");
+}
+
+namespace {
+
+// The zigzag varint of `value`, as Thrift's compact encoding stores an i32
+// or an i64.
+std::string zigzag_varint(int64_t value) {
+  REQUIRE(value >= 0);
+  std::string out;
+  for (auto rest = static_cast<uint64_t>(value) << 1; out.empty() || rest != 0; rest >>= 7) {
+    out.push_back(static_cast<char>((rest & 0x7fu) | (rest > 0x7fu ? 0x80u : 0u)));
+  }
+  return out;
+}
+
+// A field of a page header: where its varint starts in the file, how many
+// bytes it takes, and the value it holds.
+struct HeaderField {
+  std::size_t at;
+  std::size_t length;
+  int64_t value;
+};
+
+// Field `field` of the page header at `header` in `bytes`: 2 for the page's
+// uncompressed size, 3 for its compressed size. Arrow's writer opens a page
+// header with fields 1 (the type), 2 and 3, each an i32 (0x15) that holds a
+// zigzag varint.
+HeaderField page_header_field(const std::string& bytes, std::size_t header, int field) {
+  std::size_t at = header;
+  for (int id = 1;; ++id) {
+    REQUIRE(id <= 3);
+    REQUIRE(bytes.at(at) == '\x15');
+    uint64_t zigzag = 0;
+    std::size_t length = 0;
+    for (int shift = 0;; shift += 7) {
+      const auto byte = static_cast<uint8_t>(bytes.at(at + 1 + length++));
+      zigzag |= static_cast<uint64_t>(byte & 0x7fu) << shift;
+      if ((byte & 0x80u) == 0) break;
+    }
+    if (id == field) return {at + 1, length, static_cast<int64_t>(zigzag >> 1)};
+    at += 1 + length;
+  }
+}
+
+// Rewrites field `field` (see page_header_field) of the page header at
+// `header` in the file at `path` to the largest value that takes as many
+// bytes, and returns the field as it was and the value it now states. A
+// varint of n bytes holds a zigzag value below 2^(7n), so a value below
+// 2^(7n - 1).
+std::pair<HeaderField, int64_t> restate_page(const std::string& path, std::size_t header, int field) {
+  std::string bytes = file_contents(path);
+  const HeaderField old = page_header_field(bytes, header, field);
+  const int64_t stated = (int64_t{1} << (7 * old.length - 1)) - 1;
+  const std::string fresh = zigzag_varint(stated);
+  REQUIRE(fresh.size() == old.length);
+  bytes.replace(old.at, old.length, fresh);
+  write_contents(path, bytes);
+  return {old, stated};
+}
+
+// Where the pages of column chunk (`group`, `leaf`) of the file at `path`
+// lie: the header of its dictionary page, of its first and of its last data
+// page, and the end of the chunk, which is where the last data page ends.
+struct ChunkPlace {
+  std::size_t dictionary;
+  std::size_t first_data;
+  std::size_t last_data;
+  std::size_t end;
+  int64_t uncompressed;  // the footer's total_uncompressed_size
+};
+
+ChunkPlace chunk_place(const std::string& path, int group, int leaf) {
+  const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+  const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(group);
+  const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(leaf);
+  REQUIRE(chunk->has_dictionary_page());
+  const std::shared_ptr<parquet::PageIndexReader> index = file->GetPageIndexReader();
+  const std::shared_ptr<parquet::RowGroupPageIndexReader> group_index = index->RowGroup(group);
+  const std::vector<parquet::PageLocation> locations = group_index->GetOffsetIndex(leaf)->page_locations();
+  ChunkPlace place{};
+  place.dictionary = static_cast<std::size_t>(chunk->dictionary_page_offset());
+  place.first_data = static_cast<std::size_t>(chunk->data_page_offset());
+  place.last_data = static_cast<std::size_t>(locations.back().offset);
+  place.end = place.dictionary + static_cast<std::size_t>(chunk->total_compressed_size());
+  place.uncompressed = chunk->total_uncompressed_size();
+  REQUIRE(static_cast<std::size_t>(locations.front().offset) == place.first_data);
+  // A location's compressed size counts the page's header.
+  REQUIRE(place.last_data + static_cast<std::size_t>(locations.back().compressed_page_size) == place.end);
+  return place;
+}
+
+// `rows` strings, each one of 13 words of 12 letters, drawn at random so that
+// no codec shrinks the pages much, or with `cycling` the words in turn, which
+// gives pages of indices that a codec shrinks and that are no runs.
+std::shared_ptr<arrow::Array> random_words(int64_t rows, uint64_t seed, bool cycling = false) {
+  uint64_t state = seed;
+  const auto next = [&state](uint64_t below) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (state >> 33) % below;
+  };
+  std::vector<std::string> words(13);
+  for (std::string& word : words) {
+    for (int letter = 0; letter < 12; ++letter) word.push_back(static_cast<char>('a' + next(26)));
+  }
+  std::vector<std::optional<std::string>> values;
+  for (int64_t row = 0; row < rows; ++row) {
+    values.emplace_back(words[cycling ? static_cast<std::size_t>(row % 13) : next(13)]);
+  }
+  return utf8_column(values);
+}
+
+// `rows` integers drawn at random from 0 to 6.
+std::shared_ptr<arrow::Array> random_sevens(int64_t rows, uint64_t seed) {
+  std::vector<std::optional<int64_t>> values;
+  uint64_t state = seed;
+  for (int64_t row = 0; row < rows; ++row) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    values.emplace_back(static_cast<int64_t>((state >> 33) % 7));
+  }
+  return numeric_column<arrow::Int64Type>(values);
+}
+
+// The columns a page size test damages: 400 rows of strings, of integers, of
+// lists and of fixed-size lists of two strings, or of the seven values of
+// random_sevens as an i32, float, double, fixed_size_binary(5) or timestamp
+// column. A "cycling" kind takes its strings in turn.
+std::shared_ptr<arrow::Array> sized_column(const std::string& kind) {
+  const bool cycling = kind.starts_with("cycling ");
+  if (kind == "i64") return random_sevens(400, 3);
+  if (kind == "i32" || kind == "f32" || kind == "f64" || kind == "fixed_size_binary" || kind == "timestamp") {
+    const auto sevens = std::static_pointer_cast<arrow::Int64Array>(random_sevens(400, 3));
+    std::vector<std::optional<int32_t>> i32;
+    std::vector<std::optional<float>> f32;
+    std::vector<std::optional<double>> f64;
+    arrow::FixedSizeBinaryBuilder bytes(arrow::fixed_size_binary(5));
+    arrow::TimestampBuilder stamps(arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
+    for (int64_t row = 0; row < sevens->length(); ++row) {
+      const int64_t value = sevens->Value(row);
+      i32.emplace_back(static_cast<int32_t>(value));
+      f32.emplace_back(static_cast<float>(value));
+      f64.emplace_back(static_cast<double>(value));
+      REQUIRE(bytes.Append(std::string(5, static_cast<char>('a' + value))).ok());
+      REQUIRE(stamps.Append(value).ok());
+    }
+    if (kind == "i32") return numeric_column<arrow::Int32Type>(i32);
+    if (kind == "f32") return numeric_column<arrow::FloatType>(f32);
+    if (kind == "f64") return numeric_column<arrow::DoubleType>(f64);
+    return (kind == "timestamp" ? stamps.Finish() : bytes.Finish()).ValueOrDie();
+  }
+  if (kind == "string" || kind == "cycling string") return random_words(400, 5, cycling);
+  const std::shared_ptr<arrow::Array> words = random_words(800, 7, cycling);
+  if (kind == "fixed_size_list") return arrow::FixedSizeListArray::FromArrays(words, 2).ValueOrDie();
+  REQUIRE((kind == "list" || kind == "cycling list"));
+  std::vector<std::optional<int32_t>> offsets;
+  for (int32_t offset = 0; offset <= 800; offset += 2) offsets.emplace_back(offset);
+  return arrow::ListArray::FromArrays(*numeric_column<arrow::Int32Type>(offsets), *words).ValueOrDie();
+}
+
+// Writes `column` as 'c' after a clean column 'before', so that 'c' is leaf
+// 1, as write_pages writes, in one row group; `int96` and `format_1_0` are
+// as write_pages takes them.
+std::string write_sized(const TempDir& dir, const std::string& name, const std::shared_ptr<arrow::Array>& column,
+                        bool data_page_v2, parquet::Compression::type compression, bool int96 = false,
+                        bool format_1_0 = false) {
+  std::vector<std::optional<int64_t>> numbers;
+  for (int64_t row = 0; row < column->length(); ++row) numbers.emplace_back(row);
+  const auto table =
+      arrow::Table::Make(arrow::schema({arrow::field("before", arrow::int64()), arrow::field("c", column->type())}),
+                         {numeric_column<arrow::Int64Type>(numbers), column});
+  const std::string path = (dir.path / (name + ".parquet")).string();
+  write_pages(path, *table, {1 << 20, 0, data_page_v2, true}, compression, int96, format_1_0);
+  return path;
+}
+
+// Reads every row group of the file at `path` 7 rows a batch, every column
+// or 'c' alone, and returns the batches' columns 'c'.
+std::vector<std::shared_ptr<arrow::Array>> read_c(const std::string& path, bool alone) {
+  const std::vector<std::string> only_c{"c"};
+  auto source = fft::open_source({path});
+  auto readers = source->readers(1, alone ? &only_c : nullptr);
+  std::vector<std::shared_ptr<arrow::Array>> out;
+  for (const fft::Task& task : source->plan_tasks()) {
+    readers[0]->read_batches(task, 7, [&](fft::Batch batch) {
+      const auto name = std::find(batch.names.begin(), batch.names.end(), "c");
+      REQUIRE(name != batch.names.end());
+      out.push_back(batch.cols[static_cast<std::size_t>(name - batch.names.begin())]);
+    });
+  }
+  return out;
+}
+
+// Whether two reads of 'c' hold the same arrays.
+bool same_arrays(const std::vector<std::shared_ptr<arrow::Array>>& left,
+                 const std::vector<std::shared_ptr<arrow::Array>>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), [](auto& a, auto& b) { return a->Equals(*b); });
+}
+
+}  // namespace
+
+TEST_CASE("a page that states more bytes than its column chunk has left is refused") {
+  // REGRESSION: such a page is refused before its bytes are requested, and
+  // the error gives the bytes the page states and the bytes its chunk has
+  // left; test_transform_memory.py checks the peak memory. Arrow's page
+  // reader asks for the bytes a page's header states before it reads them,
+  // and a header that stated more than its chunk held used to make the
+  // reader request them all, up to 2 GiB, before Arrow refused the page.
+  TempDir dir;
+  struct Case {
+    std::string name;
+    std::string kind;  // of sized_column
+    bool dictionary;   // the dictionary page, else the last data page
+    bool data_page_v2;
+    parquet::Compression::type compression;
+  };
+  const auto none = parquet::Compression::UNCOMPRESSED;
+  const std::vector<Case> cases{
+      {"string, dictionary page", "string", true, false, none},
+      {"string, data page", "string", false, false, none},
+      {"string, dictionary page, Snappy", "string", true, false, parquet::Compression::SNAPPY},
+      {"string, data page v2, Zstd", "string", false, true, parquet::Compression::ZSTD},
+      {"i64, data page", "i64", false, false, none},
+      {"list, dictionary page", "list", true, false, none},
+      {"list, data page v2, Snappy", "list", false, true, parquet::Compression::SNAPPY},
+      {"fixed_size_list, data page", "fixed_size_list", false, false, none},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    const std::string clean = write_sized(dir, c.name, sized_column(c.kind), c.data_page_v2, c.compression);
+    const std::string damaged = (dir.path / (c.name + "-damaged.parquet")).string();
+    write_contents(damaged, file_contents(clean));
+    const ChunkPlace place = chunk_place(clean, 0, 1);
+    const auto [old, stated] = restate_page(damaged, c.dictionary ? place.dictionary : place.last_data, 3);
+    // The bytes after the page's header: the page and the data pages after
+    // a dictionary page, whose body ends where the first data page starts.
+    const auto size = static_cast<std::size_t>(old.value);
+    const std::size_t left = c.dictionary ? place.end - (place.first_data - size) : size;
+    REQUIRE(stated > static_cast<int64_t>(left));
+    for (const bool alone : {false, true}) {
+      CAPTURE(alone);
+      REQUIRE(read_c(clean, alone).size() == 58);
+      REQUIRE_THROWS_WITH(read_c(damaged, alone), damaged +
+                                                      ": failed to read row group 0: column 'c' cannot be decoded: "
+                                                      "Invalid: a page states " +
+                                                      std::to_string(stated) + " bytes where its column chunk has " +
+                                                      std::to_string(left) + " left");
+    }
+  }
+}
+
+TEST_CASE("a dictionary page that states more values than its bytes hold is refused before it is decoded") {
+  // REGRESSION: such a page is refused before Arrow decodes it. Arrow sizes
+  // the array it decodes a dictionary page into by the count of values the
+  // page's header states, and used to request that array before it ran out
+  // of bytes. A PLAIN string takes at least the 4 bytes of its length, and
+  // a value of a fixed width its width: 4 bytes for an i32 or a float, 8 for
+  // an i64 or a double, 12 for a timestamp stored as INT96 and 5 for a
+  // fixed_size_binary(5). A file in format 1.0 marks its dictionary pages
+  // PLAIN_DICTIONARY, which Arrow decodes as PLAIN.
+  TempDir dir;
+  struct Case {
+    std::string kind;  // of sized_column
+    int64_t bits;      // the fewest bits a value takes
+    bool format_1_0;
+  };
+  const std::vector<Case> cases{
+      {"string", 32, false}, {"list", 32, false},      {"fixed_size_list", 32, false},
+      {"i64", 64, false},    {"i32", 32, false},       {"f32", 32, false},
+      {"f64", 64, false},    {"timestamp", 96, false}, {"fixed_size_binary", 40, false},
+      {"string", 32, true},  {"i64", 64, true},
+  };
+  for (const Case& c : cases) {
+    const std::string name = c.kind + (c.format_1_0 ? ", format 1.0" : "");
+    CAPTURE(name);
+    const std::string clean = write_sized(dir, name, sized_column(c.kind), false, parquet::Compression::UNCOMPRESSED,
+                                          c.kind == "timestamp", c.format_1_0);
+    {
+      const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(clean);
+      const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+      const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(1);
+      const std::vector<parquet::PageEncodingStats>& pages = chunk->encoding_stats();
+      const auto dictionary = std::ranges::find_if(pages, [](const parquet::PageEncodingStats& page) {
+        return page.page_type == parquet::PageType::DICTIONARY_PAGE;
+      });
+      REQUIRE(dictionary != pages.end());
+      REQUIRE(dictionary->encoding == (c.format_1_0 ? parquet::Encoding::PLAIN_DICTIONARY : parquet::Encoding::PLAIN));
+    }
+    const std::string damaged = (dir.path / (name + "-damaged.parquet")).string();
+    write_contents(damaged, file_contents(clean));
+    const int32_t declared = declare_dictionary_entries(damaged, 0, 1, [](int32_t) { return 63; });
+    // The page's bytes, which hold its values one after the other.
+    const int64_t bytes = page_header_field(file_contents(clean), chunk_place(clean, 0, 1).dictionary, 2).value;
+    const int64_t most = bytes * 8 / c.bits;
+    REQUIRE(declared <= most);
+    REQUIRE(most < 63);
+    // The 7 values of a fixed width fill their page.
+    if (c.kind != "string" && c.kind != "list" && c.kind != "fixed_size_list") REQUIRE(declared == most);
+    for (const bool alone : {false, true}) {
+      CAPTURE(alone);
+      REQUIRE(read_c(clean, alone).size() == 58);
+      REQUIRE_THROWS_WITH(read_c(damaged, alone),
+                          damaged +
+                              ": failed to read row group 0: column 'c' cannot be decoded: Invalid: a dictionary page "
+                              "states 63 values where its " +
+                              std::to_string(bytes) + " bytes hold at most " + std::to_string(most));
+    }
+  }
+}
+
+namespace {
+
+// Writes `table` to `path` in one row group, without statistics, with a page
+// index and with `compression`, as the writer `created_by` names writes it.
+void write_as(const std::string& path, const arrow::Table& table, const std::string& created_by,
+              parquet::Compression::type compression, bool data_page_v2) {
+  parquet::WriterProperties::Builder properties;
+  properties.created_by(created_by)
+      ->compression(compression)
+      ->disable_statistics()
+      ->set_size_statistics_level(parquet::SizeStatisticsLevel::None)
+      ->enable_write_page_index()
+      ->data_page_version(data_page_v2 ? parquet::ParquetDataPageVersion::V2 : parquet::ParquetDataPageVersion::V1);
+  auto output = arrow::io::FileOutputStream::Open(path);
+  REQUIRE(output.ok());
+  REQUIRE(parquet::arrow::WriteTable(table, arrow::default_memory_pool(), *output, 1 << 20, properties.build()).ok());
+  REQUIRE((*output)->Close().ok());
+}
+
+// A table of a clean column 'before' and a column 'c' of `rows` strings.
+std::shared_ptr<arrow::Table> words_table(int64_t rows, bool cycling) {
+  std::vector<std::optional<int64_t>> numbers;
+  for (int64_t row = 0; row < rows; ++row) numbers.emplace_back(row);
+  return arrow::Table::Make(arrow::schema({arrow::field("before", arrow::int64()), arrow::field("c", arrow::utf8())}),
+                            {numeric_column<arrow::Int64Type>(numbers), random_words(rows, 11, cycling)});
+}
+
+// Replaces, in the footer of the file at `path`, the varint of the i64 field
+// that follows one holding `before` and holds `value`, with that of `fresh`,
+// and corrects the footer's length. In Thrift's compact encoding a field
+// that follows the one before it is a byte 0x16 for an i64, then a zigzag
+// varint: so are a row group's total_byte_size and num_rows, and a column
+// chunk's num_values, total_uncompressed_size and total_compressed_size.
+void restate_footer(const std::string& path, int64_t before, int64_t value, int64_t fresh) {
+  std::string bytes = file_contents(path);
+  const std::string field = '\x16' + zigzag_varint(before) + '\x16' + zigzag_varint(value);
+  const std::size_t at = bytes.find(field);
+  REQUIRE(at != std::string::npos);
+  REQUIRE(bytes.find(field, at + 1) == std::string::npos);
+  // The footer's length, 4 little-endian bytes before the closing PAR1.
+  uint32_t footer = 0;
+  std::memcpy(&footer, bytes.data() + bytes.size() - 8, 4);
+  REQUIRE(at >= bytes.size() - 8 - footer);
+  const std::size_t length = zigzag_varint(value).size();
+  const std::string varint = zigzag_varint(fresh);
+  bytes.replace(at + field.size() - length, length, varint);
+  footer = static_cast<uint32_t>(footer + varint.size() - length);
+  std::memcpy(bytes.data() + bytes.size() - 8, &footer, 4);
+  write_contents(path, bytes);
+}
+
+}  // namespace
+
+TEST_CASE("a row group whose pages hold fewer rows than its footer states is refused with both counts") {
+  // REGRESSION: the error names the file, the row group, the rows read and
+  // the rows the footer states. It used to say that the input changed while
+  // it was read, and name neither.
+  TempDir dir;
+  // Row groups of 300 and 250 rows.
+  const std::string clean = (dir.path / "clean.parquet").string();
+  write_pages(clean, *words_table(550, false), {300, 0, false, false});
+  const std::vector<int64_t> held{300, 250};
+  const std::vector<std::string> only_c{"c"};
+  for (const int group : {0, 1}) {
+    const auto at = static_cast<std::size_t>(group);
+    for (const int64_t rows : {held[at] + 1, held[at] - 1}) {
+      CAPTURE(group, rows);
+      const std::string damaged = (dir.path / ("damaged-" + std::to_string(group) + ".parquet")).string();
+      write_contents(damaged, file_contents(clean));
+      {
+        const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(damaged);
+        const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(group);
+        REQUIRE(row_group->num_rows() == held[at]);
+        restate_footer(damaged, row_group->total_byte_size(), held[at], rows);
+      }
+      for (const bool alone : {false, true}) {
+        CAPTURE(alone);
+        auto source = fft::open_source({damaged});
+        REQUIRE(source->task_rows()[at] == rows);
+        auto readers = source->readers(1, alone ? &only_c : nullptr);
+        int64_t read = 0;
+        const auto count = [&](fft::Batch batch) { read += batch.rows; };
+        if (rows > held[at]) {
+          REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[at], 7, count),
+                              damaged + ": failed to read row group " + std::to_string(group) +
+                                  ": the columns read hold " + std::to_string(held[at]) +
+                                  " rows where the footer states " + std::to_string(rows));
+          // Each row the pages hold is handed on before the refusal.
+          REQUIRE(read == held[at]);
+        } else {
+          // Arrow's reader stops at the rows the footer states.
+          readers[0]->read_batches(source->plan_tasks()[at], 7, count);
+          REQUIRE(read == rows);
+        }
+        read = 0;
+        readers[0]->read_batches(source->plan_tasks()[1 - at], 7, count);
+        REQUIRE(read == held[1 - at]);
+      }
+    }
+  }
+  // A row group whose pages hold no row is refused before it gives a batch.
+  const std::string empty = (dir.path / "empty.parquet").string();
+  write_pages(empty, *words_table(0, false), {300, 0, false, false});
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(empty);
+    REQUIRE(file->metadata()->num_row_groups() == 1);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+    REQUIRE(row_group->num_rows() == 0);
+    restate_footer(empty, row_group->total_byte_size(), 0, 5);
+  }
+  for (const bool alone : {false, true}) {
+    CAPTURE(alone);
+    auto source = fft::open_source({empty});
+    auto readers = source->readers(1, alone ? &only_c : nullptr);
+    int64_t batches = 0;
+    REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], 7, [&](fft::Batch) { ++batches; }),
+                        empty + ": failed to read row group 0: the columns read hold 0 rows where the footer states 5");
+    REQUIRE(batches == 0);
+  }
+}
+
+TEST_CASE("a column chunk whose size leaves out its dictionary page header is read as Arrow reads it") {
+  // parquet-mr 1.2.8 and earlier wrote such sizes. For a file such a writer
+  // wrote, Arrow reads up to 100 bytes past the column chunk the footer
+  // states, so the chunk's last page is whole; for any other, the last page
+  // is refused.
+  TempDir dir;
+  for (const std::string writer : {"parquet-mr version 1.2.8 (build 0)", "parquet-mr version 1.2.9 (build 0)"}) {
+    CAPTURE(writer);
+    const std::string clean = (dir.path / "clean.parquet").string();
+    write_as(clean, *words_table(400, false), writer, parquet::Compression::UNCOMPRESSED, false);
+    const std::string damaged = (dir.path / "damaged.parquet").string();
+    write_contents(damaged, file_contents(clean));
+    const ChunkPlace place = chunk_place(clean, 0, 1);
+    const HeaderField body = page_header_field(file_contents(clean), place.dictionary, 3);
+    const auto header = static_cast<int64_t>(place.first_data - place.dictionary) - body.value;
+    const auto size = static_cast<int64_t>(place.end - place.dictionary);
+    restate_footer(damaged, place.uncompressed, size, size - header);
+    const int64_t last = page_header_field(file_contents(clean), place.last_data, 3).value;
+    for (const bool alone : {false, true}) {
+      CAPTURE(alone);
+      const std::vector<std::shared_ptr<arrow::Array>> written = read_c(clean, alone);
+      REQUIRE(written.size() == 58);
+      if (writer.find("1.2.8") != std::string::npos) {
+        REQUIRE(same_arrays(read_c(damaged, alone), written));
+      } else {
+        REQUIRE_THROWS_WITH(read_c(damaged, alone),
+                            damaged +
+                                ": failed to read row group 0: column 'c' cannot be decoded: Invalid: a page "
+                                "states " +
+                                std::to_string(last) + " bytes where its column chunk has " +
+                                std::to_string(last - header) + " left");
+      }
+    }
+  }
+}
+
+TEST_CASE("a compressed column chunk whose footer states fewer bytes uncompressed than a page holds is read") {
+  // Arrow's page reader sizes the buffer it decompresses a page into by the
+  // page's header, and does not read the footer's total_uncompressed_size.
+  // A chunk whose footer states 0 there, or the chunk's compressed size,
+  // reads as its pages hold it, as pyarrow reads it.
+  TempDir dir;
+  struct Case {
+    std::string name;
+    bool data_page_v2;
+    parquet::Compression::type compression;
+  };
+  const std::vector<Case> cases{
+      {"Snappy", false, parquet::Compression::SNAPPY}, {"Zstd, data page v2", true, parquet::Compression::ZSTD},
+      {"Gzip", false, parquet::Compression::GZIP},     {"Brotli", false, parquet::Compression::BROTLI},
+      {"LZ4", false, parquet::Compression::LZ4},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    // Strings taken in turn: a codec shrinks their page of indices so far
+    // that the whole chunk takes fewer bytes compressed than that page holds
+    // uncompressed.
+    const std::string clean = (dir.path / (c.name + ".parquet")).string();
+    write_pages(clean, *words_table(2000, true), {1 << 20, 0, c.data_page_v2, false}, c.compression);
+    const ChunkPlace place = chunk_place(clean, 0, 1);
+    REQUIRE(place.first_data == place.last_data);
+    const int64_t page = page_header_field(file_contents(clean), place.last_data, 2).value;
+    const auto compressed = static_cast<int64_t>(place.end - place.dictionary);
+    for (const int64_t stated : {int64_t{0}, compressed}) {
+      CAPTURE(stated);
+      REQUIRE(stated < page);
+      const std::string damaged = (dir.path / (c.name + "-" + std::to_string(stated) + ".parquet")).string();
+      write_contents(damaged, file_contents(clean));
+      // A column chunk's num_values comes before its total_uncompressed_size.
+      restate_footer(damaged, 2000, place.uncompressed, stated);
+      for (const bool alone : {false, true}) {
+        CAPTURE(alone);
+        const std::vector<std::shared_ptr<arrow::Array>> written = read_c(clean, alone);
+        REQUIRE(written.size() == 286);
+        REQUIRE(same_arrays(read_c(damaged, alone), written));
+      }
+    }
+  }
+}
+
+TEST_CASE("a column chunk that the footer places past the end of the file is refused as Arrow refuses it") {
+  TempDir dir;
+  const std::string clean = (dir.path / "clean.parquet").string();
+  write_pages(clean, *words_table(400, false), {1 << 20, 0, false, false});
+  const std::string damaged = (dir.path / "damaged.parquet").string();
+  write_contents(damaged, file_contents(clean));
+  int64_t uncompressed = 0;
+  int64_t size = 0;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(clean);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(1);
+    uncompressed = chunk->total_uncompressed_size();
+    size = chunk->total_compressed_size();
+  }
+  // The largest size whose varint takes as many bytes (see restate_page).
+  const int64_t stated = (int64_t{1} << (7 * zigzag_varint(size).size() - 1)) - 1;
+  REQUIRE(stated > static_cast<int64_t>(file_contents(clean).size()));
+  restate_footer(damaged, uncompressed, size, stated);
+  for (const bool alone : {false, true}) {
+    CAPTURE(alone);
+    REQUIRE(read_c(clean, alone).size() == 58);
+    REQUIRE_THROWS_WITH(read_c(damaged, alone),
+                        damaged + ": failed to read row group 0: IOError: Invalid column metadata (corrupt file?)");
+  }
+}
+
+TEST_CASE("a column chunk that the footer marks as encrypted is refused as Arrow refuses it") {
+  // Arrow's reader refuses such a chunk, without the key, before it reads a
+  // page. The file's pages are plaintext, so a reader that read them would
+  // decode them.
+  TempDir dir;
+  const std::string clean = (dir.path / "clean.parquet").string();
+  write_pages(clean, *words_table(400, false), {1 << 20, 0, false, false});
+  std::optional<parquet::IndexLocation> index;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(clean);
+    index = file->metadata()->RowGroup(0)->ColumnChunk(1)->GetOffsetIndexLocation();
+  }
+  REQUIRE(index.has_value());
+  // A column chunk with an offset index and no column index ends with the
+  // index's offset (field 4, an i64: 0x16) and length (field 5, an i32:
+  // 0x15), then a 0 byte. Its crypto_metadata (field 8, a struct: 0x3c) is a
+  // union whose ENCRYPTION_WITH_FOOTER_KEY (field 1, a struct: 0x1c) is empty.
+  std::string bytes = file_contents(clean);
+  const std::string end = '\x16' + zigzag_varint(index->offset) + '\x15' + zigzag_varint(index->length) + '\0';
+  const std::size_t at = bytes.find(end);
+  REQUIRE(at != std::string::npos);
+  REQUIRE(bytes.find(end, at + 1) == std::string::npos);
+  bytes.insert(at + end.size() - 1, std::string("\x3c\x1c\0\0", 4));
+  // The footer's length, 4 little-endian bytes before the closing PAR1.
+  uint32_t footer = 0;
+  std::memcpy(&footer, bytes.data() + bytes.size() - 8, 4);
+  footer += 4;
+  std::memcpy(bytes.data() + bytes.size() - 8, &footer, 4);
+  const std::string marked = (dir.path / "marked.parquet").string();
+  write_contents(marked, bytes);
+  for (const bool alone : {false, true}) {
+    CAPTURE(alone);
+    REQUIRE(read_c(clean, alone).size() == 58);
+    REQUIRE_THROWS_WITH(read_c(marked, alone),
+                        marked +
+                            ": failed to read row group 0: IOError: Column is noted as encrypted but no file "
+                            "decryptor");
+  }
+}
+
+TEST_CASE("a data page v2 that parquet-cpp before Arrow 3.0.0 compressed and marked uncompressed is decompressed") {
+  // Arrow reads such a page as the compressed page it is.
+  TempDir dir;
+  // Arrow writes as uncompressed a data page v2 that the codec does not
+  // shrink, which such a writer did not, so 'c' is the file's only column.
+  const std::string clean = (dir.path / "clean.parquet").string();
+  const std::shared_ptr<arrow::Array> words = random_words(400, 11, true);
+  write_as(clean, *arrow::Table::Make(arrow::schema({arrow::field("c", words->type())}), {words}),
+           "parquet-cpp version 1.5.1", parquet::Compression::SNAPPY, true);
+  const std::string damaged = (dir.path / "damaged.parquet").string();
+  std::string bytes = file_contents(clean);
+  // A data page v2 header holds fields 1 to 3 (see page_header_field), then
+  // its data page v2 header (field 8, a struct: 0x5c), which opens with
+  // fields 1 to 6, each an i32, and then is_compressed (field 7, a bool that
+  // is true: 0x11, or false: 0x12).
+  const ChunkPlace place = chunk_place(clean, 0, 0);
+  REQUIRE(place.first_data == place.last_data);
+  std::size_t at = page_header_field(bytes, place.last_data, 3).at;
+  while ((static_cast<uint8_t>(bytes.at(at)) & 0x80u) != 0) ++at;
+  REQUIRE(bytes.at(++at) == '\x5c');
+  for (int field = 1; field <= 6; ++field) {
+    REQUIRE(bytes.at(++at) == '\x15');
+    while ((static_cast<uint8_t>(bytes.at(++at)) & 0x80u) != 0) {
+    }
+  }
+  REQUIRE(bytes.at(++at) == '\x11');
+  bytes[at] = '\x12';
+  write_contents(damaged, bytes);
+  for (const bool alone : {false, true}) {
+    CAPTURE(alone);
+    const std::vector<std::shared_ptr<arrow::Array>> written = read_c(clean, alone);
+    REQUIRE(written.size() == 58);
+    REQUIRE(same_arrays(read_c(damaged, alone), written));
+  }
 }
 
 namespace {

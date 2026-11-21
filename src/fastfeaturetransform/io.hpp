@@ -45,7 +45,8 @@ class TaskReader {
   virtual ~TaskReader() = default;
   // Hand the task's rows to `consume` in order, at most `batch_size` at a time;
   // an empty task gives one empty batch. ParquetSource's reader decodes one
-  // batch at a time instead of the whole row group first.
+  // batch at a time instead of the whole row group first, and refuses a row
+  // group whose pages hold fewer rows than its footer states.
   virtual void read_batches(const Task& task, int64_t batch_size, const std::function<void(Batch)>& consume) = 0;
 };
 
