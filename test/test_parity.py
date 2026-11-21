@@ -348,7 +348,7 @@ def test_power_transformer_stays_inside_the_measured_sklearn_deviation(tmp_path:
     )
 
 
-# The largest deviation from scikit-learn 1.9.0 measured over the eleven
+# The largest deviation from scikit-learn 1.9.0 measured over the thirteen
 # SplineTransformer fixture cases of degree 2 or more, at
 # spline/extrapolation-continue height_sp_1[0], where the value is about -300.
 # The committed tolerance sits about nine times above it.
@@ -360,15 +360,23 @@ SPLINE_COMMITTED_TOLERANCE: float = 5e-13
 # there is nothing for scipy's fused multiply-add to round differently: those
 # cases are compared exactly and carry no tolerance at all.
 SPLINE_EXACT_CASES: frozenset[str] = frozenset(
-    {"spline/degree-0", "spline/degree-1", "spline/extrapolation-linear-degree-1"}
+    {
+        "spline/degree-0",
+        "spline/degree-1",
+        "spline/extrapolation-linear-degree-1",
+        "spline/extrapolation-constant-degree-0",
+        "spline/extrapolation-linear-degree-0-low-ties",
+        "spline/extrapolation-constant-degree-1-low-ties",
+        "spline/extrapolation-linear-degree-1-low-ties",
+    }
 )
 
 
 def test_spline_transformer_stays_inside_the_measured_sklearn_deviation(tmp_path: Path) -> None:
     """Every SplineTransformer case stays inside the measured deviation.
 
-    The eleven cases of degree 2 or more carry a tolerance of 5e-13, about
-    nine times the largest deviation measured over them, and the three of
+    The thirteen cases of degree 2 or more carry a tolerance of 5e-13, about
+    nine times the largest deviation measured over them, and the seven of
     degree 0 or 1 carry none. This walks the shipped fixture, measures what
     our basis actually produces against what scikit-learn recorded, and fails
     if a case's tolerance changes, if an exact case deviates at all, or if the
@@ -380,7 +388,7 @@ def test_spline_transformer_stays_inside_the_measured_sklearn_deviation(tmp_path
 
     """
     cases: list[dict[str, Any]] = [case for case in SKLEARN_CASES if case["name"].startswith("spline/")]
-    assert len(cases) == 14
+    assert len(cases) == 20
     worst: float = 0.0
     for case in cases:
         exact: bool = case["name"] in SPLINE_EXACT_CASES

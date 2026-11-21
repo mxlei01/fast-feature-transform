@@ -277,6 +277,80 @@ def test_spline_transform_extrapolation_modes(numbers: list[str], tmp_path: Path
         strict.transform_parquet([outside], output_dir=tmp_path / "outside-out")
 
 
+def test_spline_constant_and_linear_extrapolation_give_scikit_learn_values(tmp_path: Path) -> None:
+    """Constant and linear extrapolation give scikit-learn's values at degree 0 and at knots repeated on the minimum.
+
+    Both set only the first ``degree`` basis functions below the knots and the
+    last ``degree`` above them, one more under linear at degree 0 and 1, even
+    where the boundary basis or its slope is non-zero past that reach. Every
+    expected row is the output of scikit-learn 1.9.0's SplineTransformer for
+    the same fit, parameters and value, and every generated column is compared
+    exactly, through the batch path and the record path. At degree 0, constant
+    extrapolation above the knots is the one case scikit-learn cannot answer.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    even: str = write_parquet(tmp_path / "even.parquet", pa.table({"x": [0.0, 1.0, 2.0, 3.0, 4.0]}))
+    lopsided: str = write_parquet(tmp_path / "lopsided.parquet", pa.table({"x": [0.0] * 10 + [4.0]}))
+    five_low: str = write_parquet(tmp_path / "five-low.parquet", pa.table({"x": [0.0] * 5 + [1.0, 2.0, 3.0, 4.0]}))
+    seven_zeros: list[float] = [0.0] * 7
+    cases: list[tuple[str, dict[str, Any], list[float], list[list[float]]]] = [
+        # Knots 0, 0, 0, 0, 4: four on the minimum at degree 3.
+        (
+            lopsided,
+            {"degree": 3, "knots": "quantile", "extrapolation": "constant"},
+            [-1.0, 0.0],
+            [seven_zeros, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]],
+        ),
+        (
+            lopsided,
+            {"degree": 3, "knots": "quantile", "extrapolation": "linear"},
+            [-1.0, 0.0, 5.0],
+            [
+                seven_zeros,
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0625, 0.6458333333333333, 0.29166666666666663],
+            ],
+        ),
+        # Knots 0, 0, 0, 2, 4: the third basis function carries over below
+        # the knots, and the fourth, 0 at the minimum with slope 1.5, does not.
+        (
+            five_low,
+            {"degree": 3, "knots": "quantile", "extrapolation": "linear"},
+            [-1.0],
+            [[0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0]],
+        ),
+        # Knots 0, 1, 2, 3, 4 at degree 0.
+        (
+            even,
+            {"degree": 0, "extrapolation": "constant"},
+            [-1.0, 0.0, 4.0],
+            [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        ),
+    ]
+    for index, (fit, params, values, expected) in enumerate(cases):
+        spline: SplineTransformer = SplineTransformer(columns=["x"], n_knots=5, **params).fit([fit])
+        probe: str = write_parquet(tmp_path / f"probe-{index}.parquet", pa.table({"x": values}))
+        rows: list[dict[str, Any]] = read_rows(spline.transform_parquet([probe], output_dir=tmp_path / f"out-{index}"))
+        assert [list(row) for row in rows] == [spline.output_columns] * len(values)
+        assert [list(row.values()) for row in rows] == expected, params
+        assert [list(spline.transform_dict({"x": value}).values()) for value in values] == expected, params
+
+    # Above the knots at degree 0, scikit-learn 1.9.0 raises a ValueError for
+    # constant extrapolation (its slice of the last `degree` columns is
+    # empty). This package carries nothing over there either and writes
+    # zeros, as below the knots, so a saved pipeline keeps answering as it did.
+    flat: SplineTransformer = SplineTransformer(columns=["x"], n_knots=5, degree=0, extrapolation="constant").fit(
+        [even]
+    )
+    above: str = write_parquet(tmp_path / "above.parquet", pa.table({"x": [5.0, 1e300]}))
+    zeros: dict[str, float] = {"x_sp_0": 0.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 0.0}
+    assert read_rows(flat.transform_parquet([above], output_dir=tmp_path / "above-out")) == [zeros, zeros]
+    assert [flat.transform_dict({"x": value}) for value in (5.0, 1e300)] == [zeros, zeros]
+
+
 def test_spline_transform_missing_and_fit_refusals(numbers: list[str], tmp_path: Path) -> None:
     holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 8.0]}))
     with pytest.raises(EngineError, match="has nulls and handle_missing is 'error'"):
@@ -520,40 +594,3 @@ def test_spline_knots_do_not_depend_on_the_row_group_split(tmp_path: Path) -> No
             states.add(json.dumps(fitted._state(), sort_keys=True))
     assert len(states) == 1, states
     assert "-0.0" not in states.pop()
-
-
-def test_spline_extrapolation_holds_boundary_basis_for_degree_zero_and_tied_knots(tmp_path: Path) -> None:
-    """Constant and linear extrapolation keep non-zero boundary functions at degree 0 and tied knots.
-
-    Args:
-        tmp_path: pytest temporary directory.
-
-    """
-    uniform: str = write_parquet(tmp_path / "uniform.parquet", pa.table({"x": [0.0, 1.0, 2.0, 3.0, 4.0]}))
-    zero_deg: SplineTransformer = SplineTransformer(columns=["x"], n_knots=5, degree=0, extrapolation="constant").fit(
-        [uniform]
-    )
-    probe: str = write_parquet(tmp_path / "probe.parquet", pa.table({"x": [-1.0, 0.0, 4.0, 5.0]}))
-    expected_zero: list[dict[str, float]] = [
-        {"x_sp_0": 1.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 0.0},
-        {"x_sp_0": 1.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 0.0},
-        {"x_sp_0": 0.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 1.0},
-        {"x_sp_0": 0.0, "x_sp_1": 0.0, "x_sp_2": 0.0, "x_sp_3": 1.0},
-    ]
-    assert read_rows(zero_deg.transform_parquet([probe], output_dir=tmp_path / "zero-out")) == expected_zero
-    assert [zero_deg.transform_dict({"x": value}) for value in (-1.0, 0.0, 4.0, 5.0)] == expected_zero
-
-    skewed: str = write_parquet(tmp_path / "skewed.parquet", pa.table({"x": [0.0] * 10 + [4.0]}))
-    skewed_probe: str = write_parquet(tmp_path / "skewed-probe.parquet", pa.table({"x": [-1.0, 0.0]}))
-    for mode, expected_low in (("constant", 1.0), ("linear", 1.75)):
-        tied: SplineTransformer = SplineTransformer(
-            columns=["x"], n_knots=5, degree=3, knots="quantile", extrapolation=mode
-        ).fit([skewed])
-        assert tied.knots_ == {"x": [0.0, 0.0, 0.0, 0.0, 4.0]}
-        rows: list[dict[str, Any]] = read_rows(
-            tied.transform_parquet([skewed_probe], output_dir=tmp_path / f"tied-{mode}")
-        )
-        assert rows[0]["x_sp_3"] == pytest.approx(expected_low)
-        assert rows[1]["x_sp_3"] == pytest.approx(1.0)
-        assert tied.transform_dict({"x": -1.0})["x_sp_3"] == pytest.approx(expected_low)
-        assert tied.transform_dict({"x": 0.0})["x_sp_3"] == pytest.approx(1.0)

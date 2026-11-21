@@ -213,6 +213,15 @@ DATASETS: dict[str, dict[str, list[Any]]] = {
     # so only a single-column frame is comparable.
     "expand-single": {"price": [1.2, 3.4, 0.7, 8.1, 2.5, 4.9, 6.3, 1.8]},
     "expand-single-wide": {"price": [-4.0, 12.0, 0.5, 20.0, -1.0, 7.0, 3.0, 9.0]},
+    # Below and inside expand-single's range only: at degree 0, constant
+    # extrapolation above the knots raises in scikit-learn 1.9.0.
+    "expand-single-below": {"price": [-4.0, 0.5, 0.7, 3.0, -1.0, 8.1, 0.0, 6.3]},
+    # Five of eight values on the minimum, so quantile knots repeat it: three
+    # times at n_knots=5 (1, 1, 1, 2.25, 5) and four times at n_knots=7. The
+    # basis or its slope at the minimum is then non-zero past the first
+    # `degree` functions.
+    "expand-low-ties": {"price": [1.0, 3.0, 1.0, 1.0, 5.0, 1.0, 2.0, 1.0]},
+    "expand-low-ties-wide": {"price": [-3.0, 0.5, 1.0, 4.0, 5.0, 7.0, -0.25, 12.0]},
     # Ties, so the quantile knots repeat and the recursion meets equal knots.
     "expand-ties": {
         "price": [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 5.0, 5.0],
@@ -329,7 +338,7 @@ CAPPED_TOLERANCE: float = 1e-12
 # changes with how scipy itself was built, so the cases carry a slack instead.
 # Degree 0 and 1 have no accumulation step at all and stay exact.
 #
-# This tolerance is derived from a measurement over these eleven cases only.
+# This tolerance is derived from a measurement over these thirteen cases only.
 # The largest deviation is 5.7e-14 absolute, at spline/extrapolation-continue
 # height_sp_1[0], where the value itself is about -300; the largest relative
 # one is 3.7e-16 (three ulp) at spline/extrapolation-periodic price_sp_3[0].
@@ -971,6 +980,59 @@ CASES: list[dict[str, Any]] = [
         "params": {"columns": ["price"], "extrapolation": "linear", "degree": 1},
         "fit": "expand-single",
         "transform": "expand-single-wide",
+    },
+    {
+        # Constant and linear extrapolation carry over only the first `degree`
+        # basis functions below the knots (one more under linear at degree 0
+        # and 1). So at degree 0, constant extrapolation writes zeros below
+        # the knots, and where knots repeat the minimum, the non-zero boundary
+        # functions past that reach are dropped. The linear cases of degree 0
+        # and 1 need single columns for the reason given above, and the
+        # constant cases use single columns too.
+        "name": "spline/extrapolation-constant-degree-0",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "constant", "degree": 0},
+        "fit": "expand-single",
+        "transform": "expand-single-below",
+    },
+    {
+        "name": "spline/extrapolation-linear-degree-0-low-ties",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "linear", "degree": 0, "knots": "quantile"},
+        "fit": "expand-low-ties",
+        "transform": "expand-low-ties-wide",
+    },
+    {
+        "name": "spline/extrapolation-constant-degree-1-low-ties",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "constant", "degree": 1, "knots": "quantile"},
+        "fit": "expand-low-ties",
+        "transform": "expand-low-ties-wide",
+    },
+    {
+        "name": "spline/extrapolation-linear-degree-1-low-ties",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "linear", "degree": 1, "knots": "quantile"},
+        "fit": "expand-low-ties",
+        "transform": "expand-low-ties-wide",
+    },
+    {
+        # Four knots on the minimum, one more than the degree.
+        "name": "spline/extrapolation-constant-low-ties",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "constant", "knots": "quantile", "n_knots": 7},
+        "fit": "expand-low-ties",
+        "transform": "expand-low-ties-wide",
+        "tolerance": SPLINE_TOLERANCE,
+    },
+    {
+        # Three knots on the minimum, as many as the degree.
+        "name": "spline/extrapolation-linear-low-ties",
+        "transformer": "SplineTransformer",
+        "params": {"columns": ["price"], "extrapolation": "linear", "knots": "quantile"},
+        "fit": "expand-low-ties",
+        "transform": "expand-low-ties-wide",
+        "tolerance": SPLINE_TOLERANCE,
     },
     {
         "name": "spline/extrapolation-continue",
