@@ -138,6 +138,11 @@ double manifest_number(const nlohmann::json& value, const std::string& where) {
 //     then degree by degree, and within a degree by the column order given
 //   * interaction_only drops any monomial with an exponent above 1, so only
 //     products of distinct columns survive
+//   * interaction_only without the bias and with a minimum degree above the
+//     column count leaves no monomial: the step drops its columns and adds
+//     none, as sklearn's transform returns no column for it. The constructor
+//     accepts it, because a manifest load runs the constructor and saved
+//     pipelines hold such steps
 //   * the width is a function of the params alone, so this kernel never fits:
 //     resolve() declares its outputs before any data is read, and a later
 //     step in the same pipeline can name them
@@ -172,11 +177,6 @@ class PolynomialFeatures final : public Kernel {
     // an artifact-loaded kernel (which carries no state) declares what it
     // reads and writes without ever seeing a schema.
     build_monomials();
-    if (monomials_.empty()) {
-      throw Error("polynomial_features: " + std::to_string(columns_.size()) +
-                  " columns with interaction_only true, include_bias false and min degree " +
-                  std::to_string(min_degree_) + " would generate no columns");
-    }
     inputs = columns_;
     outputs = names_;
   }

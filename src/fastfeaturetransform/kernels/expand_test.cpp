@@ -564,6 +564,46 @@ TEST_CASE("polynomial_features honours interaction_only and a degree range") {
   REQUIRE(column_of(out, "a*b^2") == std::vector<double>{50.0});
 }
 
+// REGRESSION: interaction_only without the bias and with a minimum degree
+// above the column count leaves no monomial, and the step drops its columns
+// and adds none, as sklearn's transform returns no column for it. The
+// constructor, which a manifest load runs too, used to refuse these params,
+// so a pipeline saved with such a step no longer loaded.
+TEST_CASE("polynomial_features with no monomial left drops its columns and adds none") {
+  const nlohmann::json params{
+      {"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", false}};
+  auto kernel = fft::make_kernel("polynomial_features", params);
+  REQUIRE(kernel->params() == params);
+  REQUIRE(kernel->inputs == std::vector<std::string>{"a", "b"});
+  REQUIRE(kernel->outputs.empty());
+  kernel->stage = "expand";
+  fft::Schema schema{{{"a", "f64"}, {"keep", "f64"}, {"b", "f64"}}};
+  kernel->resolve(schema);
+  REQUIRE(schema.cols == fft::Schema{{{"keep", "f64"}}}.cols);
+
+  const fft::Batch out =
+      kernel->transform(make_batch({"a", "keep", "b"}, {f64_column({2.0, 3.0}), f64_column({5.0, 7.0}),
+                                                        numeric_column<arrow::DoubleType>({std::nullopt, 1.0})}));
+  REQUIRE(out.names == std::vector<std::string>{"keep"});
+  REQUIRE(out.rows == 2);
+  REQUIRE(column_of(out, "keep") == std::vector<double>{5.0, 7.0});
+  REQUIRE(kernel->transform_row({{"a", 2.0}, {"keep", 5.0}, {"b", std::monostate{}}}) == fft::Row{{"keep", 5.0}});
+  // The dropped columns are still read under the step's rules, so a value
+  // that is not a number, a missing key and an infinity are refused.
+  REQUIRE_THROWS_WITH(kernel->transform_row({{"a", std::string("x")}, {"b", 1.0}}),
+                      ContainsSubstring("must be a number or null"));
+  REQUIRE_THROWS_WITH(kernel->transform_row({{"a", 1.0}}), ContainsSubstring("key 'b' missing from record"));
+  const double infinity = std::numeric_limits<double>::infinity();
+  REQUIRE_THROWS_WITH(kernel->transform(make_batch({"a", "b"}, {f64_column({1.0}), f64_column({infinity})})),
+                      Equals("expand: column 'b': value inf is not finite"));
+
+  // With a bias column, the same range still emits the constant column "1".
+  auto bias_only = fft::make_kernel(
+      "polynomial_features",
+      {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", true}});
+  REQUIRE(bias_only->outputs == std::vector<std::string>{"1"});
+}
+
 TEST_CASE("polynomial_features load_state rejects a table a hand-edited manifest put there") {
   auto fresh = [] {
     auto kernel = fft::make_kernel("polynomial_features", {{"columns", {"a"}}});
@@ -1175,17 +1215,4 @@ TEST_CASE("polynomial suffix reuse distinguishes a source named 1 from the bias"
     auto row = kernel->transform_row({{"1", value}});
     REQUIRE(std::get<double>(*fft::row_find(row, "1^2")) == value * value);
   }
-}
-
-TEST_CASE("polynomial_features refuses interaction_only ranges that generate no columns") {
-  REQUIRE_THROWS_WITH(
-      (fft::make_kernel(
-          "polynomial_features",
-          {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", false}})),
-      ContainsSubstring("would generate no columns"));
-  // With a bias column, the same range still emits the constant column "1".
-  auto bias_only = fft::make_kernel(
-      "polynomial_features",
-      {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", true}});
-  REQUIRE(bias_only->outputs == std::vector<std::string>{"1"});
 }
