@@ -1318,6 +1318,12 @@ std::shared_ptr<arrow::Array> strings_from_views(const std::shared_ptr<arrow::Ar
   const std::string where = "column '" + name + "'";
   auto offsets = arrow::AllocateBuffer((rows + 1) * static_cast<int64_t>(sizeof(int64_t)));
   if (!offsets.ok()) throw Error(where + ": " + offsets.status().ToString());
+  // mutable_data() returns null for a buffer that is not mutable or not in
+  // CPU memory, and a buffer just allocated from the default pool is mutable
+  // and in CPU memory. Stating that leaves no path on which the stores below
+  // go through null; without it, gcc 14 reports the first store as a
+  // potential null pointer dereference.
+  if (!(*offsets)->is_cpu() || !(*offsets)->is_mutable()) std::unreachable();
   auto* ends = reinterpret_cast<int64_t*>((*offsets)->mutable_data());
   int64_t bytes = 0;
   ends[0] = 0;
@@ -1327,8 +1333,12 @@ std::shared_ptr<arrow::Array> strings_from_views(const std::shared_ptr<arrow::Ar
       ends[row + 1] = bytes;
     }
   } else {
+    // Read once: the loop stores int64_t values through ends, and the
+    // compiler cannot tell those stores from the column's offset, also an
+    // int64_t, so it would read the offset again for every row.
+    const int64_t start = views.offset();
     for (int64_t row = 0; row < rows; ++row) {
-      const bool valid = arrow::bit_util::GetBit(validity, static_cast<uint64_t>(views.offset() + row));
+      const bool valid = arrow::bit_util::GetBit(validity, static_cast<uint64_t>(start + row));
       bytes += valid ? view[row].size() : 0;
       ends[row + 1] = bytes;
     }
