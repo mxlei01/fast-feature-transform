@@ -910,17 +910,16 @@ TEST_CASE("dictionary indices outside their dictionary are refused") {
   REQUIRE(column.dictionary()->length() == 3);
   REQUIRE(column.GetValueIndex(95) == 2);
   // From row 16 on, index 3 (one past the end) at bit width 2, or 0xffffffff
-  // (-1 as int32) at bit width 32: a run of 16 zeros, then a run of 80. Rows
-  // 0 to 15 are whole, but the page that holds them and row 16 is checked as
-  // it is read, for the first batch. In "short", index 3 fills rows 16 to 31,
-  // and then comes a run of 1,016 values that the page cannot hold: the page
-  // is left to Arrow's decoder, which hands rows 0 to 15 on whole, and the
-  // check of each batch refuses rows 16 to 23 before the decoder runs out.
-  const std::vector<std::tuple<std::string, std::string, std::size_t>> corrupt{
-      {"past", std::string("\x02\x20\x00\xa0\x01\x03", 6), 0},
-      {"negative", std::string("\x20\x20\x00\x00\x00\x00\xa0\x01\xff\xff\xff\xff", 12), 0},
-      {"short", std::string("\x02\x20\x00\x20\x03\xff\x01", 7), 2}};
-  for (const auto& [name, runs, whole] : corrupt) {
+  // (-1 as int32) at bit width 32: a run of 16 zeros, then a run of 80. In
+  // "short", index 3 fills rows 16 to 31, and then comes a run of 1,016
+  // values that the page cannot hold. The chunk holds no plain page, so only
+  // Arrow's decoder reads its page of indices, and the check of each batch
+  // refuses rows 16 to 23, before the decoder runs out in "short".
+  const std::vector<std::pair<std::string, std::string>> corrupt{
+      {"past", std::string("\x02\x20\x00\xa0\x01\x03", 6)},
+      {"negative", std::string("\x20\x20\x00\x00\x00\x00\xa0\x01\xff\xff\xff\xff", 12)},
+      {"short", std::string("\x02\x20\x00\x20\x03\xff\x01", 7)}};
+  for (const auto& [name, runs] : corrupt) {
     CAPTURE(name);
     const std::string path = dictionary_file(dir, name, runs);
     auto corrupt_source = fft::open_source({path});
@@ -929,7 +928,7 @@ TEST_CASE("dictionary indices outside their dictionary are refused") {
     auto readers = corrupt_source->readers(1, nullptr);
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(task, 8, [&](fft::Batch) { ++batches; }), ContainsSubstring(message));
-    REQUIRE(batches == whole);
+    REQUIRE(batches == 2);  // rows 0 to 15 are whole, row 16 is not
   }
 }
 
@@ -1042,18 +1041,12 @@ TEST_CASE("dictionary indices outside a dictionary inside a list, struct or map 
     drop_last_dictionary_entry(clean, c.leaf + 1, damaged);
     auto damaged_source = fft::open_source({damaged});
     auto readers = damaged_source->readers(1, nullptr);
-    // Two rows a batch: the first rows use no damaged index. Strings read as
-    // a dictionary have the indices of a page checked as the page is read,
-    // for the first batch. Strings read plain have each index checked as it
-    // is decoded, so the batches before the damaged rows arrive whole.
+    // Two rows a batch: the first rows use no damaged index, so the batches
+    // that hold them arrive whole, and the failure comes in a later batch.
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(damaged_source->plan_tasks()[0], 2, [&](fft::Batch) { ++batches; }),
                         damaged + ": failed to read row group 0: " + c.problem);
-    if (c.read_as == arrow::Type::DICTIONARY) {
-      REQUIRE(batches == 0);
-    } else {
-      REQUIRE(batches > 0);
-    }
+    REQUIRE(batches > 0);
     // With 'c' read alone, it is the first column read and the second in the
     // file: the error names it all the same.
     const std::vector<std::string> selected{"c"};
@@ -1139,7 +1132,8 @@ void repeat_dictionary_value(const std::string& path, int group, int leaf, const
 }
 
 // The data pages of column chunk (`group`, `leaf`) of the file at `path`, in
-// order: whether each is plain (else it holds dictionary indices).
+// order: whether each is plain (else it holds dictionary indices, which
+// format 1.0 marks PLAIN_DICTIONARY).
 std::vector<bool> plain_data_pages(const std::string& path, int group, int leaf) {
   std::vector<bool> plain;
   const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
@@ -1148,18 +1142,36 @@ std::vector<bool> plain_data_pages(const std::string& path, int group, int leaf)
   while (const std::shared_ptr<parquet::Page> page = pages->NextPage()) {
     if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
       const parquet::Encoding::type encoding = static_cast<const parquet::DataPage&>(*page).encoding();
-      REQUIRE((encoding == parquet::Encoding::PLAIN || encoding == parquet::Encoding::RLE_DICTIONARY));
+      REQUIRE((encoding == parquet::Encoding::PLAIN || encoding == parquet::Encoding::RLE_DICTIONARY ||
+               encoding == parquet::Encoding::PLAIN_DICTIONARY));
       plain.push_back(encoding == parquet::Encoding::PLAIN);
     }
   }
   return plain;
 }
 
-// Moves the plain data pages of column chunk (0, `leaf`) of the file at
-// `path` in front of its pages of dictionary indices, each kind in its own
-// order. Parquet allows the order, though no writer here produces it.
-void plain_pages_first(const std::string& path, int leaf) {
-  const std::vector<bool> plain = plain_data_pages(path, 0, leaf);
+// The data pages of column chunk (`group`, `leaf`) of the file at `path`, in
+// order: the values each states, and its bytes after its header as Arrow's
+// page reader gives them, which in an uncompressed chunk are those of the file.
+std::vector<std::pair<int32_t, std::string>> data_page_contents(const std::string& path, int group, int leaf) {
+  std::vector<std::pair<int32_t, std::string>> contents;
+  const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+  const std::shared_ptr<parquet::RowGroupReader> row_group = file->RowGroup(group);
+  const std::unique_ptr<parquet::PageReader> pages = row_group->GetColumnPageReader(leaf);
+  while (const std::shared_ptr<parquet::Page> page = pages->NextPage()) {
+    if (page->type() == parquet::PageType::DATA_PAGE || page->type() == parquet::PageType::DATA_PAGE_V2) {
+      const auto& data = static_cast<const parquet::DataPage&>(*page);
+      contents.emplace_back(data.num_values(), std::string(reinterpret_cast<const char*>(data.data()),
+                                                           static_cast<std::size_t>(data.size())));
+    }
+  }
+  return contents;
+}
+
+// Rewrites the data pages of column chunk (0, `leaf`) of the file at `path`
+// in `order`, which lists their positions in the chunk. Parquet allows any
+// order of a chunk's data pages, though no writer here changes it.
+void reorder_data_pages(const std::string& path, int leaf, const std::vector<std::size_t>& order) {
   std::vector<parquet::PageLocation> locations;
   std::size_t start = 0;
   std::size_t end = 0;
@@ -1174,18 +1186,47 @@ void plain_pages_first(const std::string& path, int leaf) {
     start = static_cast<std::size_t>(chunk->dictionary_page_offset());
     end = start + static_cast<std::size_t>(chunk->total_compressed_size());
   }
-  REQUIRE(plain.size() == locations.size());
+  REQUIRE(order.size() == locations.size());
   const std::string bytes = file_contents(path);
   std::string pages = bytes.substr(start, static_cast<std::size_t>(locations.front().offset) - start);
-  for (const bool want : {true, false}) {
-    for (std::size_t i = 0; i < locations.size(); ++i) {
-      if (plain[i] != want) continue;
-      pages += bytes.substr(static_cast<std::size_t>(locations[i].offset),
-                            static_cast<std::size_t>(locations[i].compressed_page_size));
-    }
+  for (const std::size_t i : order) {
+    pages += bytes.substr(static_cast<std::size_t>(locations.at(i).offset),
+                          static_cast<std::size_t>(locations.at(i).compressed_page_size));
   }
   REQUIRE(pages.size() == end - start);
   write_contents(path, bytes.substr(0, start) + pages + bytes.substr(end));
+}
+
+// Moves the plain data pages of column chunk (0, `leaf`) of the file at
+// `path` in front of its pages of dictionary indices, each kind in its own
+// order.
+void plain_pages_first(const std::string& path, int leaf) {
+  const std::vector<bool> plain = plain_data_pages(path, 0, leaf);
+  std::vector<std::size_t> order;
+  for (const bool want : {true, false}) {
+    for (std::size_t i = 0; i < plain.size(); ++i) {
+      if (plain[i] == want) order.push_back(i);
+    }
+  }
+  reorder_data_pages(path, leaf, order);
+}
+
+// Moves the last page of dictionary indices of column chunk (0, `leaf`) of
+// the file at `path` behind its plain pages, and returns its position in the
+// chunk before the move.
+std::size_t last_page_of_indices_last(const std::string& path, int leaf) {
+  const std::vector<bool> plain = plain_data_pages(path, 0, leaf);
+  const auto last = static_cast<std::size_t>(std::find(plain.rbegin(), plain.rend(), false).base() - plain.begin()) - 1;
+  REQUIRE(last < plain.size());
+  std::vector<std::size_t> order;
+  for (const bool want : {false, true}) {
+    for (std::size_t i = 0; i < plain.size(); ++i) {
+      if (plain[i] == want && i != last) order.push_back(i);
+    }
+  }
+  order.push_back(last);
+  reorder_data_pages(path, leaf, order);
+  return last;
 }
 
 // The values of string leaf `leaf` of the file at `path`, nulls left out, as
@@ -1378,6 +1419,11 @@ TEST_CASE("an index past the dictionary page is refused in a chunk that falls ba
     if (row < 2049) return "c" + std::to_string(row % 39);
     return row == 2049 ? std::string(60, 'x') : numbered("u")(row);
   });
+  // 300 rows that cycle through 5 values, then 300 values each its own: of
+  // two row groups of 300 rows, only the second falls back to plain pages,
+  // and every index of the first is below 5.
+  const std::shared_ptr<arrow::Array> second_falls_back =
+      strings_column(600, [&](int64_t row) { return row < 300 ? "c" + std::to_string(row % 5) : numbered("u")(row); });
 
   struct Case {
     std::string name;
@@ -1408,6 +1454,7 @@ TEST_CASE("an index past the dictionary page is refused in a chunk that falls ba
       {"map keys", map, 0, v1, none, 0, false},
       {"map values with nulls, data page v2", map, 1, v2, none, 0, false},
       {"second row group", distinct, 0, {300, 300, false, false}, none, 1, false},
+      {"second row group, the first never falls back", second_falls_back, 0, {300, 300, false, false}, none, 1, false},
       {"plain pages first", distinct, 0, {300, 300, false, false}, none, 0, true},
   };
   const std::vector<std::string> only_c{"c"};
@@ -1479,6 +1526,126 @@ TEST_CASE("an index past the dictionary page is refused in a chunk that falls ba
           REQUIRE(std::equal(values.begin(), values.end(), written.begin()));
         }
       }
+    }
+  }
+}
+
+namespace {
+
+// 3,000 strings: 2,049 rows that cycle through 39 short values, a long value
+// that takes a dictionary page of 300 bytes past its limit, and values each
+// its own. As write_pages writes them with that limit, the dictionary page
+// holds 40 values, its last entry, the long value, is used only in the last
+// row of the last of several pages of indices, and plain pages follow.
+std::shared_ptr<arrow::Array> last_entry_used_late() {
+  return strings_column(3000, [](int64_t row) {
+    if (row < 2049) return "c" + std::to_string(row % 39);
+    const std::string digits = std::to_string(row);
+    return row == 2049 ? std::string(60, 'x') : "u" + std::string(4 - digits.size(), '0') + digits;
+  });
+}
+
+}  // namespace
+
+TEST_CASE("an index past the dictionary page is refused in a page of indices that follows a plain page") {
+  // Arrow's reader decodes a page of indices that follows a plain page
+  // against a dictionary that already holds the plain page's values, which
+  // neither the check of each batch nor the second read of the pages before
+  // the first plain page sees: such a page is bounded as it passes.
+  TempDir dir;
+  const std::shared_ptr<arrow::Array> strings = last_entry_used_late();
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings});
+  const auto none = parquet::Compression::UNCOMPRESSED;
+  const std::vector<std::tuple<std::string, bool, parquet::Compression::type, bool>> layouts{
+      {"v1", false, none, false},
+      {"v2, Snappy", true, parquet::Compression::SNAPPY, false},
+      {"format 1.0", false, none, true}};
+  for (const auto& [name, v2, compression, format_1_0] : layouts) {
+    CAPTURE(name);
+    const std::string clean = (dir.path / (name + ".parquet")).string();
+    write_pages(clean, *table, {1 << 20, 300, v2, false}, compression, false, format_1_0);
+    const std::vector<bool> written_order = plain_data_pages(clean, 0, 0);
+    // A page of indices stays in front of the plain pages, so that Arrow's
+    // reader inserts the dictionary before it reads a plain value.
+    REQUIRE(std::count(written_order.begin(), written_order.end(), false) > 1);
+    REQUIRE(written_order.front() == false);
+    REQUIRE(written_order.back() == true);
+    last_page_of_indices_last(clean, 0);
+    const std::vector<bool> moved = plain_data_pages(clean, 0, 0);
+    REQUIRE(moved.front() == false);
+    REQUIRE(moved[moved.size() - 2] == true);
+    REQUIRE(moved.back() == false);
+    // The page's last entry cut off, which only the moved page uses; and
+    // every entry cut off, which the first index of the first page uses: the
+    // error names the first index past the page in the chunk.
+    std::vector<std::string> damaged;
+    for (const int32_t count : {39, 0}) {
+      damaged.push_back((dir.path / (name + "-" + std::to_string(count) + ".parquet")).string());
+      write_contents(damaged.back(), file_contents(clean));
+      REQUIRE(declare_dictionary_entries(damaged.back(), 0, 0, [&](int32_t) { return count; }) == 40);
+    }
+    const std::vector<std::string> written = page_values(clean, 0);
+    for (const int64_t batch_size : {int64_t{7}, int64_t{65536}}) {
+      CAPTURE(batch_size);
+      std::vector<std::size_t> batches;
+      std::vector<std::string> values;
+      engine_values(clean, batch_size, nullptr, values, batches);
+      REQUIRE(values == written);
+      for (std::size_t i = 0; i < damaged.size(); ++i) {
+        const std::string& path = damaged[i];
+        CAPTURE(path);
+        values.clear();
+        REQUIRE_THROWS_WITH(engine_values(path, batch_size, nullptr, values, batches),
+                            path +
+                                ": failed to read row group 0: column 'c' has a dictionary index outside its "
+                                "dictionary: Index " +
+                                (i == 0 ? "39" : "0") + " out of bounds");
+        // What comes out before the error is what the file holds.
+        REQUIRE(values.size() < written.size());
+        REQUIRE(std::equal(values.begin(), values.end(), written.begin()));
+      }
+    }
+  }
+}
+
+TEST_CASE("a page of indices with fewer definition levels than values is refused") {
+  // REGRESSION: the indices of such a page are counted from its definition
+  // levels, which are decoded until they end, and Arrow's reader then refuses
+  // the page. Counting them with Arrow's CountUpTo ended the process instead,
+  // in a debug build of Arrow, which asserts there that the levels fill the
+  // page. The page here follows a plain page, so it is bounded as it passes.
+  TempDir dir;
+  const std::shared_ptr<arrow::Array> strings = last_entry_used_late();
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings});
+  for (const bool v2 : {false, true}) {
+    CAPTURE(v2);
+    const std::string path = (dir.path / (v2 ? "v2.parquet" : "v1.parquet")).string();
+    write_pages(path, *table, {1 << 20, 300, v2, false});
+    // The last page of indices holds a value in each of its rows, whose
+    // definition levels are one run: its length doubled, then the level 1.
+    // A version 1 page holds the 4 bytes of their length in front of them.
+    const std::vector<bool> plain = plain_data_pages(path, 0, 0);
+    const auto last = static_cast<std::size_t>(std::find(plain.begin(), plain.end(), true) - plain.begin()) - 1;
+    const auto [values, data] = data_page_contents(path, 0, 0).at(last);
+    REQUIRE(values < 64);
+    std::string bytes = file_contents(path);
+    const std::size_t at = bytes.find(data);
+    REQUIRE(at != std::string::npos);
+    REQUIRE(bytes.find(data, at + 1) == std::string::npos);
+    const std::size_t run = at + (v2 ? std::size_t{0} : std::size_t{4});
+    if (!v2) REQUIRE(bytes.substr(at, 4) == std::string("\x02\x00\x00\x00", 4));
+    REQUIRE(bytes.substr(run, 2) == std::string{static_cast<char>(values << 1), '\x01'});
+    bytes[run] = static_cast<char>((values - 1) << 1);
+    write_contents(path, bytes);
+    REQUIRE(last_page_of_indices_last(path, 0) == last);
+    for (const int64_t batch_size : {int64_t{7}, int64_t{65536}}) {
+      CAPTURE(batch_size);
+      auto source = fft::open_source({path});
+      auto readers = source->readers(1, nullptr);
+      REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], batch_size, [](fft::Batch) {}),
+                          path +
+                              ": failed to read row group 0: column 'c' cannot be decoded: IOError: Number of decoded "
+                              "rep / def levels do not match num_values in page header");
     }
   }
 }
@@ -1633,6 +1800,183 @@ TEST_CASE("a dictionary page whose values a batch shows is read once") {
   // The copy now in its place is refused.
   REQUIRE_THROWS_WITH(fft::testing::read_task(*fft::open_source({path}), 1),
                       path + ": failed to read row group 1: column 'c' has a dictionary page that repeats a value");
+}
+
+namespace {
+
+// The bytes of the file at `path` with the dictionary page of column chunk
+// (0, `leaf`) zeroed, header and values: a read of the chunk's pages that
+// starts there fails.
+std::string zero_dictionary_page(const std::string& path, int leaf) {
+  std::size_t start = 0;
+  std::size_t end = 0;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(leaf);
+    REQUIRE(chunk->has_dictionary_page());
+    start = static_cast<std::size_t>(chunk->dictionary_page_offset());
+    end = static_cast<std::size_t>(chunk->data_page_offset());
+  }
+  std::string bytes = file_contents(path);
+  REQUIRE(start < end);
+  REQUIRE(end <= bytes.size());
+  std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(start), bytes.begin() + static_cast<std::ptrdiff_t>(end), '\0');
+  return bytes;
+}
+
+// The bytes of the file at `path` with data page `page` of column chunk
+// (0, `leaf`) zeroed, header and values: a read of the chunk's pages fails
+// there.
+std::string zero_data_page(const std::string& path, int leaf, std::size_t page) {
+  parquet::PageLocation location{};
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::shared_ptr<parquet::PageIndexReader> index = file->GetPageIndexReader();
+    const std::shared_ptr<parquet::RowGroupPageIndexReader> group_index = index->RowGroup(0);
+    const std::shared_ptr<parquet::OffsetIndex> offsets = group_index->GetOffsetIndex(leaf);
+    location = offsets->page_locations().at(page);
+  }
+  std::string bytes = file_contents(path);
+  const auto start = static_cast<std::size_t>(location.offset);
+  const std::size_t end = start + static_cast<std::size_t>(location.compressed_page_size);
+  REQUIRE(start < end);
+  REQUIRE(end <= bytes.size());
+  std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(start), bytes.begin() + static_cast<std::ptrdiff_t>(end), '\0');
+  return bytes;
+}
+
+// The values of the first column of `batch`, a dictionary of strings.
+std::vector<std::string> batch_words(const fft::Batch& batch) {
+  const auto& column = static_cast<const arrow::DictionaryArray&>(*batch.cols.at(0));
+  const auto& words = static_cast<const arrow::StringArray&>(*column.dictionary());
+  std::vector<std::string> out;
+  for (int64_t row = 0; row < column.length(); ++row) out.push_back(words.GetString(column.GetValueIndex(row)));
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("a chunk without plain pages has its pages of indices decoded by Arrow's reader alone") {
+  // Until a plain page has gone to Arrow's reader, a batch's dictionary
+  // holds only the values of the dictionary page, and the check of each
+  // batch bounds its indices by them. A damaged index in a later page of
+  // indices is refused by the batch that holds it, and the batches before it
+  // arrive whole: the page is not decoded as it passes, nor read again by any
+  // batch, as a copy whose dictionary page is zeros, written over the file
+  // after the first batch, would show.
+  TempDir dir;
+  const std::string path = (dir.path / "strings.parquet").string();
+  // 3,000 rows that cycle through the first 12 of the 13 values, but for row
+  // 2,525, which holds the 13th, the page's last entry. The writer looks at
+  // the size of a page every 50 rows, and ends one near every 400 bytes.
+  std::vector<int32_t> indices;
+  for (int32_t row = 0; row < 3000; ++row) indices.push_back(row == 2525 ? 12 : row % 12);
+  const std::shared_ptr<arrow::Array> strings = thirteen_value_column(indices);
+  write_pages(path, *arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings}),
+              {1 << 20, 1 << 20, false, false});
+  const std::vector<bool> plain = plain_data_pages(path, 0, 0);
+  REQUIRE(plain.size() > 2);
+  REQUIRE(std::count(plain.begin(), plain.end(), true) == 0);
+  const std::vector<std::string> written = page_values(path, 0);
+  REQUIRE(declare_dictionary_entries(path, 0, 0, [](int32_t entries) { return entries - 1; }) == 13);
+  const std::string zeroed = zero_dictionary_page(path, 0);
+
+  auto source = fft::open_source({path});
+  auto readers = source->readers(1, nullptr);
+  std::vector<std::string> read;
+  std::size_t batches = 0;
+  REQUIRE_THROWS_WITH(readers[0]->read_batches(source->plan_tasks()[0], 7,
+                                               [&](fft::Batch batch) {
+                                                 if (batches++ == 0) write_contents(path, zeroed);
+                                                 for (std::string& word : batch_words(batch)) {
+                                                   read.push_back(std::move(word));
+                                                 }
+                                               }),
+                      path +
+                          ": failed to read row group 0: column 'c' has a dictionary index outside its dictionary: "
+                          "Index 12 out of bounds");
+  // Rows 0 to 2,519 in 360 batches of 7; the next holds row 2,525.
+  REQUIRE(batches == 360);
+  REQUIRE(read == std::vector<std::string>(written.begin(), written.begin() + 2520));
+}
+
+TEST_CASE("the pages before a chunk's first plain page are read again once, and that page is not") {
+  // The first batch after a chunk's first plain page reads the chunk's pages
+  // before it again, to bound the pages of indices among them; no later
+  // batch does, and the plain page itself is not read again. Here a copy of
+  // the file with one page zeroed, header and values, is written over it
+  // during the read. The chunk is smaller than the 64 KiB a reader buffers,
+  // so the reading holds the original's bytes from its first batch on, and
+  // only a second read of the pages sees the copy. With the dictionary page
+  // zeroed after the first batch, the batch that holds the first plain row
+  // fails on the copy; zeroed after that batch, the reading goes on to the
+  // end. With the first plain page zeroed after the first batch, the reading
+  // goes on to the end.
+  TempDir dir;
+  const std::string path = (dir.path / "strings.parquet").string();
+  // 600 values, each its own: the dictionary page holds the first 50 or so,
+  // pages of indices hold their rows, and plain pages hold the rest.
+  const std::shared_ptr<arrow::Array> strings = strings_column(600, [](int64_t row) {
+    const std::string digits = std::to_string(row);
+    return "u" + std::string(4 - digits.size(), '0') + digits;
+  });
+  write_pages(path, *arrow::Table::Make(arrow::schema({arrow::field("c", strings->type())}), {strings}),
+              {1 << 20, 300, false, false});
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(0);
+    REQUIRE(row_group->ColumnChunk(0)->total_compressed_size() < 64 * 1024);
+  }
+  const std::vector<bool> plain = plain_data_pages(path, 0, 0);
+  REQUIRE(plain.front() == false);
+  REQUIRE(plain.back() == true);
+  const auto plain_page = static_cast<std::size_t>(std::find(plain.begin(), plain.end(), true) - plain.begin());
+  // The first row of the first plain page.
+  int64_t first_plain = 0;
+  const std::vector<std::pair<int32_t, std::string>> contents = data_page_contents(path, 0, 0);
+  for (std::size_t page = 0; page < plain_page; ++page) first_plain += contents[page].first;
+  REQUIRE(first_plain > 7);
+  const std::vector<std::string> written = page_values(path, 0);
+  const std::string original = file_contents(path);
+  const std::string no_dictionary = zero_dictionary_page(path, 0);
+  const std::string no_plain = zero_data_page(path, 0, plain_page);
+
+  // Reads the file 7 rows a batch into `read`, writes `copy` over it after
+  // the first batch that ends past row `over`, and counts the batches read
+  // after that in `batches_after`.
+  const auto read_over = [&](const std::string& copy, int64_t over, std::vector<std::string>& read,
+                             std::size_t& batches_after) {
+    write_contents(path, original);
+    auto source = fft::open_source({path});
+    auto readers = source->readers(1, nullptr);
+    bool written_over = false;
+    readers[0]->read_batches(source->plan_tasks()[0], 7, [&](fft::Batch batch) {
+      if (written_over) ++batches_after;
+      for (std::string& word : batch_words(batch)) read.push_back(std::move(word));
+      if (!written_over && std::cmp_greater(read.size(), over)) {
+        write_contents(path, copy);
+        written_over = true;
+      }
+    });
+    REQUIRE(written_over);
+  };
+  std::vector<std::string> read;
+  std::size_t batches_after = 0;
+  REQUIRE_THROWS_WITH(read_over(no_dictionary, 0, read, batches_after),
+                      StartsWith(path + ": failed to read row group 0: "));
+  REQUIRE(std::cmp_less_equal(read.size(), first_plain));
+  REQUIRE(std::cmp_greater(read.size() + 7, first_plain));
+  REQUIRE(std::equal(read.begin(), read.end(), written.begin()));
+  for (const auto& [copy, over] : {std::pair{&no_dictionary, first_plain}, std::pair{&no_plain, int64_t{0}}}) {
+    read.clear();
+    batches_after = 0;
+    read_over(*copy, over, read, batches_after);
+    REQUIRE(batches_after > 10);
+    REQUIRE(read == written);
+    // The copy now in its place cannot be read.
+    REQUIRE_THROWS_AS(fft::testing::read_task(*fft::open_source({path}), 0), fft::Error);
+  }
 }
 
 namespace {
