@@ -3,6 +3,7 @@
 import json
 import math
 import pickle
+import re
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -326,8 +327,7 @@ def test_binning_is_independent_of_the_split_and_survives_the_artifact(prices: l
     assert pickle.loads(pickle.dumps(pipeline)).transform_dict(record) == pipeline.transform_dict(record)
     assert pipeline.transform_dict(record) == {"price": 0}
 
-    # A transform reads only the interior edges, so only those must not
-    # decrease; a fit can write an outer edge out of order.
+    # An interior edge below the one before it is refused at load.
     manifest["ops"][0]["params"]["n_bins"] = 3
     manifest["ops"][0]["state"]["bin_edges"]["price"] = [1.0, 6.0, 4.5, 8.0]
     with pytest.raises(EngineError, match="must not decrease between its outer edges"):
@@ -527,6 +527,100 @@ def test_every_fitted_bin_table_loads_back(tmp_path: Path) -> None:
             record: dict[str, Any] = {"price": values[0]}
             assert Pipeline.load(directory).transform_dict(record) == fitted.transform_dict(record), (what, strategy)
             assert pickle.loads(pickle.dumps(fitted)).transform_dict(record) == fitted.transform_dict(record)
+
+
+def test_a_fit_that_writes_an_outer_edge_out_of_order_loads_back(tmp_path: Path) -> None:
+    """A fit whose first or last edge is out of order is saved and loads back.
+
+    Both expected lists are scikit-learn 1.9.0's ``bin_edges_`` for the same
+    column and options. With ``strategy="kmeans"`` the centers of
+    ``[0.1, 0.1, 10.1, 10.1]`` are -4.9, taken by a cluster left empty,
+    0.09999999999999964 twice and 10.1: the midpoint -2.4000000000000004 is
+    dropped, and the next one, compared with that midpoint, is kept below the
+    first edge. With ``strategy="uniform"`` the step of ``np.linspace`` over 3
+    subnormal units in 5 bins rounds from 0.6 units up to 1, so the interior
+    edges pass the maximum, which is the last edge.
+
+    Args:
+        tmp_path: pytest temporary directory.
+
+    """
+    unit: float = 5e-324
+    cases: list[tuple[str, int, list[float], list[float]]] = [
+        ("kmeans", 4, [0.1, 0.1, 10.1, 10.1], [0.1, 0.09999999999999964, 5.1, 10.1]),
+        ("uniform", 5, [0.0, 3 * unit], [0.0, unit, 2 * unit, 3 * unit, 4 * unit, 3 * unit]),
+    ]
+    for strategy, n_bins, values, edges in cases:
+        source: str = write_parquet(tmp_path / f"{strategy}.parquet", pa.table({"price": values}))
+        binner: KBinsDiscretizer = KBinsDiscretizer(columns=["price"], n_bins=n_bins, strategy=strategy)
+        fitted: Pipeline = Pipeline([("bin", binner)]).fit([source])
+        fitted.save(tmp_path / strategy)
+        manifest: dict[str, Any] = json.loads((tmp_path / strategy / "manifest.json").read_text())
+        assert manifest["ops"][0]["state"]["bin_edges"] == {"price": edges}
+        loaded: Pipeline = Pipeline.load(tmp_path / strategy)
+        for value in values:
+            assert loaded.transform_dict({"price": value}) == fitted.transform_dict({"price": value})
+
+
+def test_edges_and_quantiles_no_fit_writes_are_refused_at_load(prices: list[str], tmp_path: Path) -> None:
+    """A saved table whose edges or quantiles no fit of the step's options writes is refused at load.
+
+    Each case changes one table of a saved manifest: a reversed pair and a
+    first edge of 1e308 under the default ``strategy="quantile"``, a
+    ``strategy="uniform"`` table missing its first edge, a
+    ``strategy="kmeans"`` table whose last edge is below the one before it,
+    and a quantile grid longer than ``n_quantiles`` allows.
+
+    REGRESSION: every one of these tables used to load and answer, and the
+    uniform table missing its first edge narrowed the one-hot output from 5
+    columns to 4.
+
+    Args:
+        prices: The shared Parquet fixture.
+        tmp_path: pytest temporary directory.
+
+    """
+
+    def saved(name: str, transformer: Any) -> dict[str, Any]:
+        Pipeline([("step", transformer)]).fit(prices).save(tmp_path / name)
+        return json.loads((tmp_path / name / "manifest.json").read_text())
+
+    def refused(manifest: dict[str, Any], message: str) -> None:
+        with pytest.raises(EngineError, match=re.escape(message)):
+            _core.FittedPipeline.load_json(json.dumps(manifest))
+
+    quantile: dict[str, Any] = saved("quantile", KBinsDiscretizer(columns=["price"], n_bins=5))
+    edges: list[float] = quantile["ops"][0]["state"]["bin_edges"]["price"]
+    reversed_pair: dict[str, Any] = json.loads(json.dumps(quantile))
+    reversed_pair["ops"][0]["state"]["bin_edges"]["price"] = [edges[-1], edges[0]]
+    refused(reversed_pair, "step: bin_edges['price'] must not decrease from its first edge to its second")
+    far_first: dict[str, Any] = json.loads(json.dumps(quantile))
+    far_first["ops"][0]["state"]["bin_edges"]["price"][0] = 1e308
+    refused(far_first, "step: bin_edges['price'] must not decrease from its first edge to its second")
+    # No manifest holds an edge that is not finite: JSON has no infinity, and
+    # a number past f64's range is refused as the manifest is parsed.
+    far_first["ops"][0]["state"]["bin_edges"]["price"][0] = 123456.75
+    with pytest.raises(EngineError, match=re.escape("invalid manifest: [json.exception.out_of_range.406] number")):
+        _core.FittedPipeline.load_json(json.dumps(far_first).replace("123456.75", "1e400"))
+
+    uniform: dict[str, Any] = saved("uniform", KBinsDiscretizer(columns=["price"], n_bins=5, strategy="uniform"))
+    assert len(uniform["ops"][0]["state"]["bin_edges"]["price"]) == 6
+    del uniform["ops"][0]["state"]["bin_edges"]["price"][0]
+    refused(
+        uniform,
+        "step: bin_edges['price'] holds 5 edges, where strategy='uniform' writes the 6 that 'n_bins' asks for, "
+        "or two equal ones for a constant column",
+    )
+
+    kmeans: dict[str, Any] = saved("kmeans", KBinsDiscretizer(columns=["price"], n_bins=3, strategy="kmeans"))
+    kmeans_edges: list[float] = kmeans["ops"][0]["state"]["bin_edges"]["price"]
+    kmeans_edges[-1] = kmeans_edges[-2] - 1.0
+    refused(kmeans, "step: bin_edges['price'] must not decrease from its second-to-last edge to its last")
+
+    grid: dict[str, Any] = saved("grid", QuantileTransformer(columns=["price"], n_quantiles=4))
+    assert len(grid["ops"][0]["state"]["references"]) == 4
+    grid["ops"][0]["params"]["n_quantiles"] = 3
+    refused(grid, "step: 'references' holds 4 points, more than the 3 that 'n_quantiles' allows")
 
 
 def test_a_fitted_table_naming_no_columns_is_refused(prices: list[str], tmp_path: Path) -> None:

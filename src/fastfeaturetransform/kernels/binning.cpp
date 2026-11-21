@@ -790,6 +790,12 @@ class QuantileTransform final : public Kernel {
       throw Error(stage + ": 'references' must be " + std::to_string(references_.size()) +
                   " points evenly spaced from 0 to 1");
     }
+    // The fit caps the grid at n_quantiles points, so a longer one is not a
+    // grid this step fitted.
+    if (references_.size() > quantiles_) {
+      throw Error(stage + ": 'references' holds " + std::to_string(references_.size()) + " points, more than the " +
+                  std::to_string(quantiles_) + " that 'n_quantiles' allows");
+    }
     for (const std::string& name : columns_) {
       const std::vector<double>& grid = grids_.at(name);
       if (grid.size() != references_.size()) {
@@ -1056,27 +1062,44 @@ class KBinsDiscretize final : public Kernel {
     edges_ = load_number_lists(state, "bin_edges", stage, columns_, explicit_columns_);
     for (const std::string& name : columns_) {
       const std::vector<double>& edges = edges_.at(name);
-      if (edges.size() < 2) throw Error(stage + ": bin_edges['" + name + "'] must hold at least two edges");
-      // Only the interior has to be in order, as bin_of reads nothing else.
-      // The outer edges bound the fit data and never split it, and a fit can
-      // write either one out of order: a k-means cluster left empty takes a
-      // center outside the data, as upstream's does, and over a subnormal span
-      // linspace's step can round up enough to put the last interior edge
-      // past the maximum, which upstream writes the same way.
-      if (!std::is_sorted(edges.begin() + 1, edges.end() - 1)) {
-        throw Error(stage + ": bin_edges['" + name + "'] must not decrease between its outer edges");
+      const std::size_t count = edges.size();
+      const std::string where = stage + ": bin_edges['" + name + "']";
+      if (count < 2) throw Error(where + " must hold at least two edges");
+      // A fit computes n_bins + 1 edges, and "quantile" and "kmeans" only
+      // ever drop some of them. "uniform" drops none, so it writes them all,
+      // or the minimum and the maximum of a constant column, which are equal.
+      if (count > bins_ + 1) {
+        throw Error(where + " holds " + std::to_string(count) + " edges, more than the " + std::to_string(bins_ + 1) +
+                    " that 'n_bins' allows");
       }
-      // Non-decreasing, not strictly increasing: linspace over a span of a few
-      // ulps repeats an edge, and strategy='uniform' keeps those (upstream
-      // keeps them too), so a strict check here would refuse a table finalize
-      // legitimately produced. bin_of reads a repeated interior edge the way
-      // upstream's searchsorted(side='right') does — that bin is empty.
-      //
-      // What the count means is fixed, though: n_bins + 1 edges at most, since
-      // the fit only ever drops edges from that grid.
-      if (edges.size() > bins_ + 1) {
-        throw Error(stage + ": bin_edges['" + name + "'] holds " + std::to_string(edges.size()) +
-                    " edges, more than the " + std::to_string(bins_ + 1) + " that 'n_bins' allows");
+      if (strategy_ == Strategy::Uniform && count != bins_ + 1 && !(count == 2 && edges[0] == edges[1])) {
+        throw Error(where + " holds " + std::to_string(count) + " edges, where strategy='uniform' writes the " +
+                    std::to_string(bins_ + 1) + " that 'n_bins' asks for, or two equal ones for a constant column");
+      }
+      // A fit writes its edges in non-decreasing order. Equal neighbors are
+      // valid: linspace over a span of a few ulps repeats an edge, as numpy's
+      // does, and bin_of leaves the bin between two equal edges empty, as
+      // upstream's searchsorted(side='right') does. The interior edges are
+      // all bin_of reads. The outer ones bound the fit data and never split
+      // it, and two strategies can write one of them out of order, as
+      // upstream does, so that edge is not compared with the one beside it.
+      // Under "kmeans" the first edge is the column's minimum, and a cluster
+      // left empty can take a center below the data, which can put the
+      // second edge below the first. Under "uniform" the last edge is the
+      // column's maximum, and linspace over a subnormal span can round its
+      // step up far enough that interior edges pass it; it is still at least
+      // the first edge.
+      if (!std::is_sorted(edges.begin() + 1, edges.end() - 1)) {
+        throw Error(where + " must not decrease between its outer edges");
+      }
+      if (strategy_ != Strategy::KMeans && edges[0] > edges[1]) {
+        throw Error(where + " must not decrease from its first edge to its second");
+      }
+      if (strategy_ != Strategy::Uniform && count > 2 && edges[count - 2] > edges[count - 1]) {
+        throw Error(where + " must not decrease from its second-to-last edge to its last");
+      }
+      if (strategy_ == Strategy::Uniform && edges[count - 1] < edges[0]) {
+        throw Error(where + " must not end below its first edge");
       }
     }
     name_outputs();

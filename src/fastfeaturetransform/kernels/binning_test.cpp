@@ -566,6 +566,16 @@ TEST_CASE("quantile_transform load_state rejects a malformed table") {
   broken([](nlohmann::json& state) { state["quantiles"]["x"] = {1.0, 4.5}; }, "one value per reference");
   broken([](nlohmann::json& state) { state["quantiles"]["x"] = {8.0, 4.5, 1.0}; }, "must not decrease");
   broken([](nlohmann::json& state) { state["quantiles"]["x"] = {1.0, 4.5, "far"}; }, "must hold finite numbers");
+  // The fit caps the grid at n_quantiles points, and below that at the fit
+  // row count, so a shorter grid loads and a longer one is refused.
+  REQUIRE_NOTHROW(
+      fresh()->load_state({{"columns", {"x"}}, {"references", {0.0, 1.0}}, {"quantiles", {{"x", {1.0, 8.0}}}}}));
+  broken(
+      [](nlohmann::json& state) {
+        state["references"] = {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0};
+        state["quantiles"]["x"] = {1.0, 3.0, 6.0, 8.0};
+      },
+      "bin: 'references' holds 4 points, more than the 3 that 'n_quantiles' allows");
 }
 
 TEST_CASE("k_bins_discretize validates its params") {
@@ -944,10 +954,9 @@ TEST_CASE("k_bins_discretize load_state rejects a malformed table") {
   broken([](nlohmann::json& state) { state["bin_edges"]["x"] = {1.0}; }, "must hold at least two edges");
   broken([](nlohmann::json& state) { state["bin_edges"]["x"] = {0.0, 2.0, 1.0, 3.0}; },
          "must not decrease between its outer edges");
-  // The outer edges bound the fit data and a transform never reads them, so
-  // either may sit out of order, as a fit can write it.
-  REQUIRE_NOTHROW(fresh()->load_state({{"columns", {"x"}}, {"bin_edges", {{"x", {1.5, 1.0, 2.0, 0.5}}}}}));
   broken([](nlohmann::json& state) { state["bin_edges"]["x"] = {0.0, 1.0, "two"}; }, "must hold finite numbers");
+  broken([](nlohmann::json& state) { state["bin_edges"]["x"] = {0.0, 1.0, std::numeric_limits<double>::infinity()}; },
+         "must hold finite numbers");
   broken([](nlohmann::json& state) { state["bin_edges"]["x"] = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0}; },
          "holds 7 edges, more than the 6 that 'n_bins' allows");
   // Repeated interior edges are what linspace gives over a span of a few ulps
@@ -959,6 +968,76 @@ TEST_CASE("k_bins_discretize load_state rejects a malformed table") {
   broken([](nlohmann::json& state) { state["bin_edges"] = nlohmann::json::object(); },
          "state 'columns' does not name the same columns as the fitted table");
   broken([](nlohmann::json& state) { state.erase("columns"); }, "state must hold a 'columns' list");
+}
+
+// A fit writes its edges in non-decreasing order, except that "kmeans" can
+// write its first edge above its second and "uniform" its last edge below
+// the one before it, and "uniform" always writes n_bins + 1 edges, or two
+// equal ones for a constant column. A table that breaks its strategy's rule
+// is refused, even where a transform would not read the edge at fault.
+TEST_CASE("k_bins_discretize load_state refuses edges that no fit of its strategy writes") {
+  const auto load = [](const char* strategy, const std::vector<double>& edges, const char* encode = "onehot") {
+    auto kernel = fft::make_kernel("k_bins_discretize",
+                                   {{"columns", {"x"}}, {"n_bins", 5}, {"encode", encode}, {"strategy", strategy}});
+    kernel->stage = "bin";
+    kernel->load_state({{"columns", {"x"}}, {"bin_edges", {{"x", edges}}}});
+    return kernel;
+  };
+  // The rules depend on the strategy alone, so each refusal holds for every
+  // encode.
+  const auto refused = [&](const char* strategy, const std::vector<double>& edges, const std::string& problem) {
+    for (const char* encode : {"onehot", "ordinal"}) {
+      CAPTURE(strategy, encode, edges);
+      REQUIRE_THROWS_WITH(load(strategy, edges, encode), Equals("bin: bin_edges['x'] " + problem));
+    }
+  };
+  // scikit-learn 1.9.0's bin_edges_ for [0.1, 0.1, 10.1, 10.1] with
+  // strategy='kmeans' and n_bins=4, which the kmeans fit here writes as well.
+  // Its centers are -4.9, taken by a cluster left empty, 0.09999999999999964
+  // twice and 10.1. The midpoint -2.4000000000000004 is dropped for being
+  // below the first edge, and the next one, compared with that midpoint, is
+  // kept below the first edge.
+  const std::vector<double> kmeans_fit{0.1, 0.09999999999999964, 5.1, 10.1};
+  // scikit-learn 1.9.0's bin_edges_ for [0, 3 * 5e-324] with
+  // strategy='uniform' and n_bins=5, which is np.linspace's grid: the step of
+  // 0.6 subnormal units rounds to 1, so the interior edges pass the maximum.
+  const double unit = std::numeric_limits<double>::denorm_min();
+  const std::vector<double> uniform_fit{0.0, unit, 2 * unit, 3 * unit, 4 * unit, 3 * unit};
+  REQUIRE_NOTHROW(load("kmeans", kmeans_fit));
+  REQUIRE_NOTHROW(load("uniform", uniform_fit));
+  // Equal neighbors, fewer edges than n_bins + 1 where the fit drops some,
+  // and the two equal edges of a constant column all load.
+  REQUIRE_NOTHROW(load("uniform", {0.0, 1.0, 1.0, 1.0, 2.0, 3.0}));
+  REQUIRE_NOTHROW(load("uniform", {3.0, 3.0}));
+  for (const char* strategy : {"quantile", "kmeans"}) {
+    REQUIRE_NOTHROW(load(strategy, {0.0, 1.0, 2.0}));
+    REQUIRE_NOTHROW(load(strategy, {3.0, 3.0}));
+  }
+
+  // The first edge above the second, which only "kmeans" writes.
+  const std::string first = "must not decrease from its first edge to its second";
+  refused("quantile", kmeans_fit, first);
+  refused("quantile", {1.0, 0.0}, first);
+  refused("quantile", {1e308, 1.0, 2.0, 3.0}, first);
+  refused("uniform", {1.5, 1.0, 2.0, 3.0, 4.0, 5.0}, first);
+  // Under "kmeans" the first edge is never compared with the one after it,
+  // even when that is the last of two.
+  REQUIRE_NOTHROW(load("kmeans", {1.5, 1.0, 2.0, 3.0, 4.0, 5.0}));
+  REQUIRE_NOTHROW(load("kmeans", {1.0, 0.5}));
+  // The last edge below the one before it, which only "uniform" writes.
+  const std::string last = "must not decrease from its second-to-last edge to its last";
+  refused("quantile", uniform_fit, last);
+  refused("kmeans", uniform_fit, last);
+  refused("kmeans", {0.0, 1.0, -1e308}, last);
+  // Under "uniform" the last edge is the maximum, never below the minimum.
+  refused("uniform", {0.0, 1.0, 2.0, 3.0, 4.0, -1.0}, "must not end below its first edge");
+  // "uniform" drops no edge: a missing one would narrow a one-hot output and
+  // renumber the bins of an ordinal one.
+  const std::string uniform_count =
+      " edges, where strategy='uniform' writes the 6 that 'n_bins' asks for, or two equal ones for a constant column";
+  refused("uniform", {1.0, 2.0, 3.0, 4.0, 5.0}, "holds 5" + uniform_count);
+  refused("uniform", {0.0, 5.0}, "holds 2" + uniform_count);
+  refused("uniform", kmeans_fit, "holds 4" + uniform_count);
 }
 
 TEST_CASE("kmeans bins a well-separated column into its clusters") {
@@ -1039,13 +1118,17 @@ TEST_CASE("every fitted bin table loads back") {
       {"ordinary", {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}},
       {"constant", {3.0, 3.0, 3.0}},
       {"an empty k-means cluster", {-3.0, 10.0, 10.0, -3.0, 5.0, 1.0}},
+      {"two values twice", {0.1, 0.1, 10.1, 10.1}},
       {"three subnormal ulps", {0.0, 1.5e-323}},
   };
-  std::size_t out_of_order = 0;  // fits whose edge list is not sorted end to end, which still load
+  // The two outer edges a fit writes out of order, each under one strategy,
+  // which load_state accepts there.
+  std::size_t first_above_second = 0;
+  std::size_t last_below_previous = 0;
   for (const Column& column : columns) {
     INFO(column.what);
     for (const char* strategy : {"uniform", "quantile", "kmeans"}) {
-      for (const int bins : {2, 5, 6}) {
+      for (const int bins : {2, 4, 5, 6}) {
         const nlohmann::json params{
             {"columns", {"x"}}, {"n_bins", bins}, {"encode", "ordinal"}, {"strategy", strategy}};
         std::unique_ptr<fft::Kernel> fitted;
@@ -1062,11 +1145,19 @@ TEST_CASE("every fitted bin table loads back") {
         REQUIRE_NOTHROW(reloaded->load_state(state));
         REQUIRE(reloaded->state() == state);
         const auto edges = state.at("bin_edges").at("x").get<std::vector<double>>();
-        if (!std::is_sorted(edges.begin(), edges.end())) ++out_of_order;
+        if (edges.size() > 2 && edges[0] > edges[1]) {
+          REQUIRE(std::string(strategy) == "kmeans");
+          ++first_above_second;
+        }
+        if (edges.size() > 2 && edges[edges.size() - 2] > edges.back()) {
+          REQUIRE(std::string(strategy) == "uniform");
+          ++last_below_previous;
+        }
       }
     }
   }
-  REQUIRE(out_of_order > 0);
+  REQUIRE(first_above_second > 0);
+  REQUIRE(last_below_previous > 0);
 }
 
 // REGRESSION: a fitted table that names no columns is malformed. With
