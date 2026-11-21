@@ -335,15 +335,17 @@ TEST_CASE("spline_transform extrapolates only the boundary functions sklearn car
   // 'linear' at degree 0 continues the first basis function along its slope,
   // which is 0. When the distance below the knots overflows to -inf, that is
   // 0 times infinity: scikit-learn 1.9.0 writes NaN, and a generated value
-  // that is not finite is an error here.
+  // that is not finite is an error here. The message prints the NaN with
+  // its sign, which x86-64 sets for this product and arm64 does not, so it
+  // reads "-nan" on one and "nan" on the other.
   auto far =
       fitted("spline_transform", {{"columns", {"x"}}, {"n_knots", 3}, {"degree", 0}, {"extrapolation", "linear"}},
              schema, {make_batch({"x"}, {f64_column({1e306, 3e306, 8e306})})});
   const double lowest = std::numeric_limits<double>::lowest();
-  REQUIRE_THROWS_WITH(far->transform(make_batch({"x"}, {f64_column({lowest})})),
-                      Equals("expand: column 'x_sp_0' generates the value nan, which is not finite"));
-  REQUIRE_THROWS_WITH(far->transform_row({{"x", lowest}}),
-                      Equals("expand: column 'x_sp_0' generates the value nan, which is not finite"));
+  const auto unsigned_nan = Equals("expand: column 'x_sp_0' generates the value nan, which is not finite");
+  const auto signed_nan = Equals("expand: column 'x_sp_0' generates the value -nan, which is not finite");
+  REQUIRE_THROWS_WITH(far->transform(make_batch({"x"}, {f64_column({lowest})})), unsigned_nan || signed_nan);
+  REQUIRE_THROWS_WITH(far->transform_row({{"x", lowest}}), unsigned_nan || signed_nan);
 }
 
 TEST_CASE("spline_transform finds a value's knot interval alike in its scan and its search") {
