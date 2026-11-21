@@ -514,10 +514,82 @@ def test_parquet_index_past_a_dictionary_page_that_plain_pages_follow_is_refused
             encoder.transform_memmap([corrupt], output_dir=tmp_path / f"memmap-{threads}")
 
 
+def _thrift_struct(data: bytes, at: int) -> tuple[dict[int, Any], int]:
+    """Reads a struct of Thrift's compact encoding with the kinds of fields that a page header holds.
+
+    Args:
+        data: The bytes that hold the struct.
+        at: Where the struct starts.
+
+    Returns:
+        Its fields by number, each an integer, a bool, bytes or a struct; and where the struct ends.
+    """
+    fields: dict[int, Any] = {}
+    number = 0
+    while data[at]:
+        kind, delta = data[at] & 0x0F, data[at] >> 4
+        assert delta, "a field number that is not a step from the last"
+        number += delta
+        at += 1
+        if kind in (1, 2):
+            fields[number] = kind == 1
+            continue
+        if kind == 12:
+            fields[number], at = _thrift_struct(data, at)
+            continue
+        assert kind in (5, 6, 8), f"a field of kind {kind}"
+        value, shift = 0, 0
+        while True:
+            value |= (data[at] & 0x7F) << shift
+            shift += 7
+            at += 1
+            if data[at - 1] < 0x80:
+                break
+        if kind == 8:
+            fields[number], at = data[at : at + value], at + value
+        else:
+            fields[number] = (value >> 1) ^ -(value & 1)
+    return fields, at + 1
+
+
+def _plain_pages_first(path: Path) -> None:
+    """Moves the plain data pages of the chunk of row group 0 and leaf 0 in front of its pages of dictionary indices.
+
+    Parquet allows any order of a chunk's data pages, though no writer here changes it.
+
+    Args:
+        path: The file, a pyarrow one of data pages v2, rewritten in place.
+    """
+    chunk = pq.ParquetFile(path).metadata.row_group(0).column(0)
+    data = path.read_bytes()
+    start, end = chunk.dictionary_page_offset, chunk.dictionary_page_offset + chunk.total_compressed_size
+    pages, at = [], start
+    while at < end:
+        header, body = _thrift_struct(data, at)
+        pages.append((header, data[at : body + header[3]]))
+        at = body + header[3]
+    assert at == end
+    # The page type (field 1) is 2 for a dictionary page and 3 for a data page
+    # v2, whose header (field 8) states the encoding in field 4: 0 is PLAIN.
+    assert [header[1] for header, _ in pages[:1]] == [2]
+    data_pages = pages[1:]
+    assert {header[1] for header, _ in data_pages} == {3}
+    plain = [page for header, page in data_pages if header[8][4] == 0]
+    indexed = [page for header, page in data_pages if header[8][4] != 0]
+    assert plain
+    assert indexed
+    path.write_bytes(data[:start] + pages[0][1] + b"".join(plain + indexed) + data[end:])
+
+
 # The indices of a page come after its levels, whose lengths a page of version 2
 # states in its header. A length past the page is left to Arrow's reader, which
-# refuses it, and the indices are not looked for 100,000,000 bytes on.
-def test_parquet_data_page_v2_whose_levels_state_more_bytes_than_the_page_is_refused(tmp_path: Path) -> None:
+# refuses it, and the indices are not looked for 100,000,000 bytes on. A page of
+# indices that follows a plain page is decoded a second time as it passes, so
+# the page here comes before the plain pages and after them.
+@pytest.mark.parametrize("position", ["before plain pages", "after plain pages"])
+def test_parquet_data_page_v2_whose_levels_state_more_bytes_than_the_page_is_refused(
+    tmp_path: Path, position: str
+) -> None:
     path = tmp_path / "levels.parquet"
     table = pa.table({"c": [f"u{row}" for row in range(600)]})
     pq.write_table(
@@ -548,6 +620,8 @@ def test_parquet_data_page_v2_whose_levels_state_more_bytes_than_the_page_is_ref
         rest >>= 7
     assert len(length) == 5
     path.write_bytes(data[:at] + bytes(length) + data[at + 5 :])
+    if position == "after plain pages":
+        _plain_pages_first(path)
     with pytest.raises(OSError, match=re.escape("Data page too small for levels (corrupt header?)")):
         pq.read_table(path)
     message = (
