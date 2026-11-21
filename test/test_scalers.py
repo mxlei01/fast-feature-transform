@@ -732,6 +732,48 @@ def test_normalizer_answers_a_row_just_past_the_largest_f64_in_every_column_orde
         assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / f"out{index}")) == [expected]
 
 
+@pytest.mark.parametrize(("norm", "low", "high"), [("l1", 2.3e307, 4.4e307), ("l2", 5.9e153, 6.5e153)])
+def test_normalizer_gives_each_row_of_a_batch_its_own_norm_in_the_top_binade(
+    tmp_path: Path, norm: str, low: float, high: float
+) -> None:
+    """Rows whose norm's exact sum lies in f64's top binade, many in one batch, each divide by their own norm.
+
+    The batch path reuses one exact sum for every row, and a sum in the top
+    binade is held in a wider form, which every row must start from zero.
+    Ordinary rows sit between them. The divisor is the sum of the row's
+    magnitudes, or the square root of the sum of its rounded squares, each
+    sum exact and rounded once, as fractions.Fraction gives it.
+
+    Args:
+        tmp_path: pytest temporary directory.
+        norm: The norm to divide by.
+        low: The smallest magnitude of a value in a top-binade row.
+        high: The largest magnitude of a value in a top-binade row.
+
+    """
+    generator: np.random.Generator = np.random.default_rng(5)
+    names: list[str] = ["a", "b", "c", "d"]
+    rows: list[dict[str, float]] = []
+    for index in range(60):
+        scale: tuple[float, float] = (low, high) if index % 5 != 2 else (0.5, 2.0)
+        signs: list[float] = [float(sign) for sign in generator.choice([1.0, -1.0], len(names))]
+        magnitudes: list[float] = [float(value) for value in generator.uniform(*scale, len(names))]
+        rows.append({name: sign * value for name, sign, value in zip(names, signs, magnitudes, strict=True)})
+    expected: list[dict[str, float]] = []
+    for index, row in enumerate(rows):
+        terms: list[Fraction] = [Fraction(abs(value) if norm == "l1" else value * value) for value in row.values()]
+        if index % 5 != 2:
+            assert Fraction(2) ** 1023 <= sum(terms) < Fraction(sys.float_info.max)
+        exact: float = float(sum(terms))
+        divisor: float = exact if norm == "l1" else math.sqrt(exact)
+        expected.append({name: value / divisor for name, value in row.items()})
+    table: pa.Table = pa.table({name: [row[name] for row in rows] for name in names})
+    path: str = write_parquet(tmp_path / "top.parquet", table)
+    normalizer: Normalizer = Normalizer(columns=names, norm=norm).fit([path])
+    assert read_rows(normalizer.transform_parquet([path], output_dir=tmp_path / "out")) == expected
+    assert [normalizer.transform_dict(row) for row in rows] == expected
+
+
 def test_normalizer_divides_a_row_whose_norm_is_the_largest_f64(tmp_path: Path) -> None:
     """A row whose exact l1 norm rounds to the largest f64 is normalized, on both paths."""
     largest: float = 1.7976931348623157e308
