@@ -194,6 +194,31 @@ def test_transform_parquet_replaces_stale_parts(tmp_path: Path) -> None:
     parts: list[Path] = encoder.transform_parquet([small], output_dir=out)
     assert sorted(os.listdir(out)) == [part.name for part in parts] == ["part-00000.parquet"]
     assert pq.read_table(str(out)).num_rows == 1
+    # A number of fewer than five digits is not one this package writes, so the file stays.
+    (out / "part-0001.parquet").touch()
+    (out / "part-0001.parquet.tmp").touch()
+    encoder.transform_parquet([small], output_dir=out)
+    assert sorted(os.listdir(out)) == ["part-00000.parquet", "part-0001.parquet", "part-0001.parquet.tmp"]
+
+
+def test_part_numbers_have_the_width_of_the_last_one_at_100000_and_100001_parts(tmp_path: Path) -> None:
+    # 100,000 parts are numbered 00000 to 99999 and 100,001 parts 000000 to 100000, so a sorted listing of either
+    # is the row order. A file of 1,000 row groups read 100 times makes 100,000 parts. A directory that cannot be
+    # removed stands where the first part's temporary file goes, so a run fails at its first part, with an error
+    # that names the file, before it writes any part.
+    thousand = tmp_path / "thousand.parquet"
+    pq.write_table(pa.table({"x": pa.array(np.arange(1_000), pa.int64())}), thousand, row_group_size=1)
+    assert pq.ParquetFile(thousand).metadata.num_row_groups == 1_000
+    one = write_parquet(tmp_path / "one.parquet", pa.table({"x": pa.array([1], pa.int64())}))
+    select = Select(columns=["x"]).fit([one], threads=1)
+    out = tmp_path / "out"
+    blockers = ["part-00000.parquet.tmp", "part-000000.parquet.tmp"]
+    for name in blockers:
+        (out / name / "kept").mkdir(parents=True)
+    for sources, first in (([str(thousand)] * 100, "part-00000"), ([str(thousand)] * 100 + [one], "part-000000")):
+        with pytest.raises(EngineError, match=f"/{first}\\.parquet\\.tmp: "):
+            select.transform_parquet(sources, output_dir=out)
+        assert sorted(os.listdir(out)) == blockers
 
 
 def test_output_statistics_use_only_values_in_the_row_group(tmp_path: Path) -> None:

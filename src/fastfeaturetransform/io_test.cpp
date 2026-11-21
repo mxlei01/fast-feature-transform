@@ -25,6 +25,7 @@
 #include <parquet/metadata.h>
 #include <parquet/page_index.h>
 #include <parquet/properties.h>
+#include <parquet/statistics.h>
 #include <parquet/types.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -2462,6 +2463,78 @@ TEST_CASE("PartWriter gives the batches of a row group one dictionary") {
   for (int64_t row = 0; row < column.length(); ++row) {
     REQUIRE(words.GetString(column.GetValueIndex(row)) == expected[static_cast<std::size_t>(row)]);
   }
+}
+
+TEST_CASE("PartWriter's statistics of a dictionary column name only values the rows of its row group hold") {
+  // Arrow's Parquet writer takes a dictionary column's minimum and maximum
+  // from the entries a batch uses, and counts a null row as one of them: a
+  // batch with a null that uses every entry but one reports that one too.
+  // So a column keeps its dictionary only when its rows use every entry, in
+  // a row group of one batch or of several. Each batch below holds no fewer
+  // values than entries, and each but the last a null.
+  const auto letters = utf8_column({"a", "m", "z"});
+  const auto range_of = [](const std::vector<std::shared_ptr<arrow::Array>>& batches) {
+    TempDir dir;
+    int64_t rows = 0;
+    for (const auto& column : batches) rows += column->length();
+    fft::PartWriter writer(dir.path.string(), 0, rows);
+    for (const auto& column : batches) writer.append(make_batch({"s"}, {column}));
+    const auto raw = parquet::ParquetFileReader::OpenFile(writer.finish());
+    REQUIRE(raw->metadata()->num_row_groups() == 1);
+    REQUIRE(raw->metadata()->RowGroup(0)->num_rows() == rows);
+    const auto statistics = raw->metadata()->RowGroup(0)->ColumnChunk(0)->statistics();
+    REQUIRE(statistics->HasMinMax());
+    return statistics->EncodeMin() + ".." + statistics->EncodeMax();
+  };
+  // Rows that use the entries in the order of the dictionary and stop
+  // before its last entry.
+  REQUIRE(range_of({dictionary_column(letters, {0, std::nullopt, 1, 0})}) == "a..m");
+  // Rows that reach the last entry out of that order and never use the
+  // first.
+  REQUIRE(range_of({dictionary_column(letters, {2, std::nullopt, 1, 2})}) == "m..z");
+  // A null row does not use the index stored in it, 0 here.
+  REQUIRE(range_of({dictionary_column(letters, {std::nullopt, 1, 2, 1})}) == "m..z");
+  // A slice reads the validity of its own rows: null, "z", "m", "z".
+  REQUIRE(range_of({dictionary_column(letters, {0, std::nullopt, 2, 1, 2})->Slice(1)}) == "m..z");
+  // Rows past the first 64 are read in their own place: "a" in row 0, "m" in
+  // row 65 and "a" in row 66, every other row of 130 null. Null rows 1 and 2
+  // store the indices of "m" and "z", so a check that read them in place of
+  // rows 65 and 66 would find every entry in use.
+  std::vector<std::optional<int32_t>> stored(130, 0);
+  stored[1] = 1;
+  stored[2] = 2;
+  stored[65] = 1;
+  auto validity = arrow::AllocateEmptyBitmap(130);
+  REQUIRE(validity.ok());
+  for (const int64_t row : {0, 65, 66}) arrow::bit_util::SetBit((*validity)->mutable_data(), row);
+  const std::shared_ptr<arrow::Buffer> values = numeric_column<arrow::Int32Type>(stored)->data()->buffers[1];
+  const auto long_indices = arrow::MakeArray(
+      arrow::ArrayData::Make(arrow::int32(), 130, {std::shared_ptr<arrow::Buffer>(std::move(*validity)), values}, 127));
+  const auto long_column = arrow::DictionaryArray::FromArrays(long_indices, letters);
+  REQUIRE(long_column.ok());
+  REQUIRE((*long_column)->ValidateFull().ok());
+  REQUIRE(range_of({*long_column}) == "a..m");
+  // A row group of two batches, neither of which uses the first entry.
+  REQUIRE(range_of({dictionary_column(letters, {1, std::nullopt, 2, 1}),
+                    dictionary_column(letters, {2, std::nullopt, 1, 2})}) == "m..z");
+  // A batch without nulls, and so without a validity bitmap, shares one
+  // dictionary with a batch that has a null: an entry it does not use would
+  // reach the statistics of the other.
+  const auto without_nulls = dictionary_column(utf8_column({"m", "z", "a"}), {0, 1, 0});
+  REQUIRE(without_nulls->null_bitmap_data() == nullptr);
+  REQUIRE(range_of({dictionary_column(utf8_column({"m", "z"}), {0, std::nullopt, 1}), without_nulls}) == "m..z");
+}
+
+TEST_CASE("PartWriter keeps a dictionary whose rows use every entry, with its numbering") {
+  // The rows use the entries out of the order of the dictionary, which a
+  // trim would renumber as "a", "m", "z".
+  TempDir dir;
+  fft::PartWriter writer(dir.path.string(), 0, 4);
+  writer.append(make_batch({"s"}, {dictionary_column(utf8_column({"z", "a", "m"}), {1, std::nullopt, 2, 0})}));
+  auto source = fft::open_source({writer.finish()});
+  const fft::Batch batch = read_task(*source, 0);
+  REQUIRE(entries_of(*batch.cols[0]) == Words{"z", "a", "m"});
+  REQUIRE(row_values(*batch.cols[0]) == Words{"a", std::nullopt, "m", "z"});
 }
 
 TEST_CASE("PartWriter writes a dictionary column that cannot share one dictionary as it came") {
