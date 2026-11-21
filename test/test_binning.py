@@ -220,6 +220,41 @@ def test_k_bins_discretizer_drops_collapsed_bins_and_bins_a_constant_column(tmp_
         assert chosen.n_bins_["price"] >= 1
 
 
+@pytest.mark.parametrize(
+    ("values", "n_bins", "edges", "bins"),
+    [
+        ([-1e308, -1e308, 1e308, 1e308], 2, [-1e308, 1e308], [0, 0, 0, 0]),
+        ([-1e308, -1e308, 1e308, 1e308, 1.7e308, 1.7e308], 3, [-1e308, 1.35e308, 1.7e308], [0, 0, 0, 0, 1, 1]),
+    ],
+)
+def test_k_bins_discretizer_drops_a_quantile_edge_that_overflows_as_scikit_learn_does(
+    values: list[float], n_bins: int, edges: list[float], bins: list[int], tmp_path: Path
+) -> None:
+    """A quantile edge that overflows and is dropped is not checked, and the fit answers as scikit-learn 1.9.0 does.
+
+    Between two neighbors more than f64's largest apart the default
+    averaged_inverted_cdf quantile interpolates to -inf, which pruning drops.
+    The expected edges and bins are scikit-learn 1.9.0's bin_edges_ and
+    transform for the same column and n_bins.
+
+    REGRESSION: a check of every computed edge before the pruning used to
+    refuse both fits with "fits a bin edge that is not finite".
+
+    Args:
+        values: The column.
+        n_bins: The number of bins asked for.
+        edges: scikit-learn's bin edges.
+        bins: scikit-learn's bin of each value.
+        tmp_path: pytest temporary directory.
+
+    """
+    source: str = write_parquet(tmp_path / "extreme.parquet", pa.table({"x": values}))
+    binner: KBinsDiscretizer = KBinsDiscretizer(columns=["x"], n_bins=n_bins, encode="ordinal").fit([source])
+    assert binner.bin_edges_ == {"x": edges}
+    assert [binner.transform_dict({"x": value})["x"] for value in values] == bins
+    assert [row["x"] for row in read_rows(binner.transform_parquet([source], output_dir=tmp_path / "out"))] == bins
+
+
 def test_k_bins_discretizer_refuses_a_null(tmp_path: Path) -> None:
     holes: str = write_parquet(tmp_path / "holes.parquet", pa.table({"price": [1.0, None, 3.0]}))
     with pytest.raises(EngineError, match="column 'price' has nulls, which k_bins_discretize refuses"):
@@ -534,15 +569,3 @@ def test_a_fitted_table_naming_no_columns_is_refused(prices: list[str], tmp_path
         del dropped_list["ops"][0]["state"]["columns"]
         with pytest.raises(EngineError, match="state must hold a 'columns' list"):
             _core.FittedPipeline.load_json(json.dumps(dropped_list))
-
-
-def test_kbins_quantile_refuses_extreme_finite_span_overflow(tmp_path: Path) -> None:
-    """An extreme finite span whose linear quantile overflows is refused instead of dropping a bin.
-
-    Args:
-        tmp_path: pytest temporary directory.
-
-    """
-    source: str = write_parquet(tmp_path / "extreme.parquet", pa.table({"x": [-1e308, -1e308, 1e308, 1e308]}))
-    with pytest.raises(EngineError, match="bin edge that is not finite"):
-        KBinsDiscretizer(columns=["x"], n_bins=2, strategy="quantile", quantile_method="linear").fit([source])

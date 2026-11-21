@@ -1287,16 +1287,31 @@ class KBinsDiscretize final : public Kernel {
         }
       } else {
         edges = kmeans_edges(name, buffer, low, high);
+        // An edge midway between two centers whose sum passes f64's largest
+        // overflows. The fit refuses it rather than let pruning drop a -inf
+        // edge and put two clusters in one bin. sklearn's own squared
+        // distances overflow on such a column, so its fit is no reference
+        // there.
+        for (double edge : edges) (void)fitted_number(edge, stage, name, "bin edge");
       }
-      // Validate every computed edge before narrow-bin pruning: a -inf edge
-      // from lerp overflowing on an extreme finite span would otherwise fail
-      // the width check and disappear silently instead of failing the fit.
-      for (double edge : edges) (void)fitted_number(edge, stage, name, "bin edge");
+      // sklearn's ediff1d mask: the first edge stays, and each other edge
+      // stays when it is more than kMinWidth above the computed edge before
+      // it. A quantile between two neighbors more than f64's largest apart
+      // interpolates to -inf, +inf or NaN. A -inf or NaN edge after the
+      // first fails the test and is dropped unchecked, as sklearn drops it,
+      // and so is the edge after a NaN. A kept edge that is not finite is
+      // refused below, because no manifest can hold it.
       kept.push_back(edges.front());
       for (std::size_t i = 1; i < edges.size(); ++i) {
         if (edges[i] - edges[i - 1] > kMinWidth) kept.push_back(edges[i]);
       }
       if (kept.size() < 2) {
+        // With every computed edge finite, only a column spanning at most
+        // about n_bins * kMinWidth loses its second edge, and
+        // strategy='uniform' bins it. An edge that is not finite means the
+        // span overflows, which strategy='uniform' refuses as well, so that
+        // edge is the error instead.
+        for (double edge : edges) (void)fitted_number(edge, stage, name, "bin edge");
         throw Error(stage + ": column '" + name + "' has no bin left: every edge after the first is within " +
                     std::format("{}", kMinWidth) +
                     " of the one before it (use strategy='uniform', which keeps every edge)");
