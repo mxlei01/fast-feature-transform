@@ -910,11 +910,17 @@ TEST_CASE("dictionary indices outside their dictionary are refused") {
   REQUIRE(column.dictionary()->length() == 3);
   REQUIRE(column.GetValueIndex(95) == 2);
   // From row 16 on, index 3 (one past the end) at bit width 2, or 0xffffffff
-  // (-1 as int32) at bit width 32: a run of 16 zeros, then a run of 80.
-  const std::vector<std::pair<std::string, std::string>> corrupt{
-      {"past", std::string("\x02\x20\x00\xa0\x01\x03", 6)},
-      {"negative", std::string("\x20\x20\x00\x00\x00\x00\xa0\x01\xff\xff\xff\xff", 12)}};
-  for (const auto& [name, runs] : corrupt) {
+  // (-1 as int32) at bit width 32: a run of 16 zeros, then a run of 80. Rows
+  // 0 to 15 are whole, but the page that holds them and row 16 is checked as
+  // it is read, for the first batch. In "short", index 3 fills rows 16 to 31,
+  // and then comes a run of 1,016 values that the page cannot hold: the page
+  // is left to Arrow's decoder, which hands rows 0 to 15 on whole, and the
+  // check of each batch refuses rows 16 to 23 before the decoder runs out.
+  const std::vector<std::tuple<std::string, std::string, std::size_t>> corrupt{
+      {"past", std::string("\x02\x20\x00\xa0\x01\x03", 6), 0},
+      {"negative", std::string("\x20\x20\x00\x00\x00\x00\xa0\x01\xff\xff\xff\xff", 12), 0},
+      {"short", std::string("\x02\x20\x00\x20\x03\xff\x01", 7), 2}};
+  for (const auto& [name, runs, whole] : corrupt) {
     CAPTURE(name);
     const std::string path = dictionary_file(dir, name, runs);
     auto corrupt_source = fft::open_source({path});
@@ -923,7 +929,7 @@ TEST_CASE("dictionary indices outside their dictionary are refused") {
     auto readers = corrupt_source->readers(1, nullptr);
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(task, 8, [&](fft::Batch) { ++batches; }), ContainsSubstring(message));
-    REQUIRE(batches == 2);  // rows 0 to 15 are whole, row 16 is not
+    REQUIRE(batches == whole);
   }
 }
 
@@ -1036,12 +1042,18 @@ TEST_CASE("dictionary indices outside a dictionary inside a list, struct or map 
     drop_last_dictionary_entry(clean, c.leaf + 1, damaged);
     auto damaged_source = fft::open_source({damaged});
     auto readers = damaged_source->readers(1, nullptr);
-    // Two rows a batch: the first rows use no damaged index, so the batches
-    // that hold them arrive whole, and the failure comes in a later batch.
+    // Two rows a batch: the first rows use no damaged index. Strings read as
+    // a dictionary have the indices of a page checked as the page is read,
+    // for the first batch. Strings read plain have each index checked as it
+    // is decoded, so the batches before the damaged rows arrive whole.
     std::size_t batches = 0;
     REQUIRE_THROWS_WITH(readers[0]->read_batches(damaged_source->plan_tasks()[0], 2, [&](fft::Batch) { ++batches; }),
                         damaged + ": failed to read row group 0: " + c.problem);
-    REQUIRE(batches > 0);
+    if (c.read_as == arrow::Type::DICTIONARY) {
+      REQUIRE(batches == 0);
+    } else {
+      REQUIRE(batches > 0);
+    }
     // With 'c' read alone, it is the first column read and the second in the
     // file: the error names it all the same.
     const std::vector<std::string> selected{"c"};
@@ -1061,12 +1073,13 @@ struct PageLayout {
   bool store_schema;
 };
 
-// Writes `table` to `path` uncompressed, without statistics and with a page
-// index, laid out as `layout` says. A dictionary limit also makes the writer
-// look at it every 50 values and end a data page near every 400 bytes.
-void write_pages(const std::string& path, const arrow::Table& table, const PageLayout& layout) {
+// Writes `table` to `path` with `compression`, without statistics and with a
+// page index, laid out as `layout` says. A dictionary limit also makes the
+// writer look at it every 50 values and end a data page near every 400 bytes.
+void write_pages(const std::string& path, const arrow::Table& table, const PageLayout& layout,
+                 parquet::Compression::type compression = parquet::Compression::UNCOMPRESSED) {
   parquet::WriterProperties::Builder properties;
-  properties.compression(parquet::Compression::UNCOMPRESSED)
+  properties.compression(compression)
       ->disable_statistics()
       ->set_size_statistics_level(parquet::SizeStatisticsLevel::None)
       ->enable_write_page_index();
@@ -1252,7 +1265,218 @@ std::shared_ptr<arrow::Array> strings_column(int64_t rows, const std::function<s
   return utf8_column(values);
 }
 
+// Rewrites the count of entries that the dictionary page of column chunk
+// (`group`, `leaf`) of the file at `path` declares to `count(declared)`, and
+// returns the count it declared. The page's values stay as they are. In
+// Thrift's compact encoding the dictionary page header (field 7 of the page
+// header, a struct: 0x4c) opens with num_values (field 1, an i32: 0x15) as a
+// zigzag varint; the new count must take as many bytes as the old one.
+int32_t declare_dictionary_entries(const std::string& path, int group, int leaf,
+                                   const std::function<int32_t(int32_t)>& count) {
+  std::size_t start = 0;
+  std::size_t end = 0;
+  {
+    const std::unique_ptr<parquet::ParquetFileReader> file = parquet::ParquetFileReader::OpenFile(path);
+    const std::unique_ptr<parquet::RowGroupMetaData> row_group = file->metadata()->RowGroup(group);
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = row_group->ColumnChunk(leaf);
+    REQUIRE(chunk->has_dictionary_page());
+    start = static_cast<std::size_t>(chunk->dictionary_page_offset());
+    end = static_cast<std::size_t>(chunk->data_page_offset());
+  }
+  std::string bytes = file_contents(path);
+  const std::string field("\x4c\x15", 2);
+  const std::size_t at = bytes.find(field, start);
+  REQUIRE(at < end);
+  REQUIRE(bytes.find(field, at + 1) >= end);
+  uint32_t zigzag = 0;
+  std::size_t length = 0;
+  for (int shift = 0;; shift += 7) {
+    const auto byte = static_cast<uint8_t>(bytes.at(at + 2 + length++));
+    zigzag |= static_cast<uint32_t>(byte & 0x7fu) << shift;
+    if ((byte & 0x80u) == 0) break;
+  }
+  const auto declared = static_cast<int32_t>(zigzag >> 1);
+  std::string fresh;
+  for (auto rest = static_cast<uint32_t>(count(declared)) << 1; fresh.empty() || rest != 0; rest >>= 7) {
+    fresh.push_back(static_cast<char>((rest & 0x7fu) | (rest > 0x7fu ? 0x80u : 0u)));
+  }
+  REQUIRE(fresh.size() == length);
+  bytes.replace(at + 2, length, fresh);
+  write_contents(path, bytes);
+  return declared;
+}
+
+// Appends to `out` the values of leaf `leaf` under `data`, a column of a
+// batch, nulls left out. The leaves are the arrays without children, in the
+// order Parquet numbers a column's leaves; `seen` counts those passed.
+void leaf_values(const std::shared_ptr<arrow::ArrayData>& data, int leaf, int& seen, std::vector<std::string>& out) {
+  if (!data->child_data.empty()) {
+    for (const std::shared_ptr<arrow::ArrayData>& child : data->child_data) leaf_values(child, leaf, seen, out);
+    return;
+  }
+  if (seen++ != leaf) return;
+  REQUIRE(data->type->id() == arrow::Type::DICTIONARY);
+  const auto column = std::static_pointer_cast<arrow::DictionaryArray>(arrow::MakeArray(data));
+  REQUIRE(arrow::is_binary_like(column->dictionary()->type_id()));
+  const auto& words = static_cast<const arrow::BinaryArray&>(*column->dictionary());
+  for (int64_t row = 0; row < column->length(); ++row) {
+    if (column->IsValid(row)) out.push_back(words.GetString(column->GetValueIndex(row)));
+  }
+}
+
 }  // namespace
+
+TEST_CASE("an index past the dictionary page is refused in a chunk that falls back to plain pages") {
+  // Arrow's reader appends the values of the plain pages that follow a
+  // dictionary page to the batch's dictionary. An index at or past the
+  // page's count used to name such a value, without an error, whenever the
+  // batch held it.
+  TempDir dir;
+  // 600 values, each its own. With a dictionary page limit of 300 bytes,
+  // looked at every 50 values, the page holds the first 50 or so values,
+  // pages of indices hold their rows, and plain pages hold the rest.
+  const auto numbered = [](const std::string& prefix) {
+    return [prefix](int64_t row) {
+      const std::string digits = std::to_string(row);
+      return prefix + std::string(4 - digits.size(), '0') + digits;
+    };
+  };
+  const std::shared_ptr<arrow::Array> distinct = strings_column(600, numbered("u"));
+  std::shared_ptr<arrow::ArrayData> bytes = distinct->data()->Copy();
+  bytes->type = arrow::binary();
+  // The same values with every seventh one null: a page then holds fewer
+  // indices than levels.
+  std::vector<std::optional<std::string>> words;
+  for (int64_t row = 0; row < 600; ++row) {
+    words.push_back(row % 7 == 3 ? std::nullopt : std::optional<std::string>(numbered("u")(row)));
+  }
+  const std::shared_ptr<arrow::Array> sparse = utf8_column(words);
+  std::vector<std::optional<int32_t>> offsets;
+  for (int32_t offset = 0; offset <= 600; offset += 3) offsets.emplace_back(offset);
+  std::vector<std::optional<int64_t>> numbers;
+  for (int64_t row = 0; row < 600; ++row) numbers.emplace_back(row);
+  const auto offsets32 = numeric_column<arrow::Int32Type>(offsets);
+  const auto pool = arrow::default_memory_pool();
+  const auto list = [&](const std::shared_ptr<arrow::Array>& values) -> std::shared_ptr<arrow::Array> {
+    return arrow::ListArray::FromArrays(*offsets32, *values, pool).ValueOrDie();
+  };
+  const std::shared_ptr<arrow::Array> structs =
+      arrow::StructArray::Make({sparse, numeric_column<arrow::Int64Type>(numbers)},
+                               std::vector<std::string>{"name", "n"})
+          .ValueOrDie();
+  const std::shared_ptr<arrow::Array> map = arrow::MapArray::FromArrays(offsets32, distinct, sparse, pool).ValueOrDie();
+  // 2,049 rows that cycle through 39 short values, a long value that takes
+  // the dictionary past its limit, and values each its own: the page's last
+  // entry, the long value, is used only in the last row of the last page of
+  // indices, several pages after the first.
+  const std::shared_ptr<arrow::Array> late = strings_column(3000, [&](int64_t row) {
+    if (row < 2049) return "c" + std::to_string(row % 39);
+    return row == 2049 ? std::string(60, 'x') : numbered("u")(row);
+  });
+
+  struct Case {
+    std::string name;
+    std::shared_ptr<arrow::Array> column;  // column 'c'
+    int leaf;                              // the leaf of 'c' that holds the damaged chunk
+    PageLayout layout;
+    parquet::Compression::type compression;
+    int group;         // the row group of the damaged chunk
+    bool plain_first;  // whether row group 0 holds its plain pages before its pages of indices
+  };
+  const auto none = parquet::Compression::UNCOMPRESSED;
+  const PageLayout v1{1 << 20, 300, false, false};
+  const PageLayout v2{1 << 20, 300, true, false};
+  const PageLayout stored{1 << 20, 300, false, true};  // with the Arrow schema, which names large_string
+  const std::vector<Case> cases{
+      {"string", distinct, 0, v1, none, 0, false},
+      {"string, data page v2", distinct, 0, v2, none, 0, false},
+      {"string past the first page of indices", late, 0, v1, none, 0, false},
+      {"string with nulls", sparse, 0, v1, none, 0, false},
+      {"string with nulls, data page v2", sparse, 0, v2, none, 0, false},
+      {"string, Snappy", distinct, 0, v1, parquet::Compression::SNAPPY, 0, false},
+      {"string, Zstd, data page v2", distinct, 0, v2, parquet::Compression::ZSTD, 0, false},
+      {"binary", arrow::MakeArray(bytes), 0, v1, none, 0, false},
+      {"large_string with nulls", fft::testing::large_utf8_column(words), 0, stored, none, 0, false},
+      {"list", list(distinct), 0, v1, none, 0, false},
+      {"list with nulls, data page v2, Snappy", list(sparse), 0, v2, parquet::Compression::SNAPPY, 0, false},
+      {"struct with nulls", structs, 0, v1, none, 0, false},
+      {"map keys", map, 0, v1, none, 0, false},
+      {"map values with nulls, data page v2", map, 1, v2, none, 0, false},
+      {"second row group", distinct, 0, {300, 300, false, false}, none, 1, false},
+      {"plain pages first", distinct, 0, {300, 300, false, false}, none, 0, true},
+  };
+  const std::vector<std::string> only_c{"c"};
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    // A clean string column before 'c', which the error does not name.
+    const auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("before", arrow::utf8()), arrow::field("c", c.column->type())}),
+        {strings_column(c.column->length(), [](int64_t row) { return "w" + std::to_string(row % 5); }), c.column});
+    const std::string clean = (dir.path / (c.name + ".parquet")).string();
+    write_pages(clean, *table, c.layout, c.compression);
+    const int leaf = c.leaf + 1;  // in the file
+    const std::vector<bool> plain = plain_data_pages(clean, c.group, leaf);
+    REQUIRE(std::count(plain.begin(), plain.end(), true) > 0);
+    REQUIRE(std::count(plain.begin(), plain.end(), false) > 0);
+    REQUIRE(plain.front() == false);
+    if (c.plain_first) {
+      plain_pages_first(clean, leaf);
+      REQUIRE(plain_data_pages(clean, 0, leaf).front() == true);
+    }
+    const std::vector<std::string> written = page_values(clean, leaf);
+    // The page's last entry cut off, so that the rows that use it point one
+    // past the page; and every entry cut off.
+    std::vector<std::pair<std::string, int32_t>> damaged;
+    for (const bool all : {false, true}) {
+      const std::string path = (dir.path / (c.name + (all ? "-none" : "-one") + ".parquet")).string();
+      write_contents(path, file_contents(clean));
+      int32_t count = 0;
+      const int32_t declared = declare_dictionary_entries(path, c.group, leaf, [&](int32_t entries) {
+        count = all ? 0 : entries - 1;
+        return count;
+      });
+      REQUIRE(declared > 1);
+      damaged.emplace_back(path, count);
+    }
+    // The values of the leaf, `batch_size` rows a batch, as the engine reads
+    // them from every row group of the file at `path`.
+    const auto read_leaf = [&](const std::string& path, int64_t batch_size, const std::vector<std::string>* columns,
+                               std::vector<std::string>& out) {
+      auto source = fft::open_source({path});
+      auto readers = source->readers(1, columns);
+      for (const fft::Task& task : source->plan_tasks()) {
+        readers[0]->read_batches(task, batch_size, [&](fft::Batch batch) {
+          const auto name = std::find(batch.names.begin(), batch.names.end(), "c");
+          REQUIRE(name != batch.names.end());
+          int seen = 0;
+          leaf_values(batch.cols[static_cast<std::size_t>(name - batch.names.begin())]->data(), c.leaf, seen, out);
+        });
+      }
+    };
+    // Batches of 7 rows, and of the engine's 65,536, which is one batch a
+    // row group here.
+    for (const int64_t batch_size : {int64_t{7}, int64_t{65536}}) {
+      CAPTURE(batch_size);
+      for (const std::vector<std::string>* columns : {static_cast<const std::vector<std::string>*>(nullptr), &only_c}) {
+        CAPTURE(columns == nullptr);
+        std::vector<std::string> values;
+        read_leaf(clean, batch_size, columns, values);
+        REQUIRE(values == written);
+        for (const auto& [path, count] : damaged) {
+          CAPTURE(count);
+          values.clear();
+          REQUIRE_THROWS_WITH(read_leaf(path, batch_size, columns, values),
+                              path + ": failed to read row group " + std::to_string(c.group) +
+                                  ": column 'c' has a dictionary index outside its dictionary: Index " +
+                                  std::to_string(count) + " out of bounds");
+          // What comes out before the error is what the file holds.
+          REQUIRE(values.size() < written.size());
+          REQUIRE(std::equal(values.begin(), values.end(), written.begin()));
+        }
+      }
+    }
+  }
+}
 
 TEST_CASE("a dictionary page that repeats a value is refused, and one that does not is read as written") {
   // Arrow's reader of strings as a dictionary keeps each value of the page
