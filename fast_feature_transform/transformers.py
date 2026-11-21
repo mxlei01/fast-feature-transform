@@ -3242,10 +3242,14 @@ class KBinsDiscretizer(Transformer):
     the first edge is bin 0 and one past the last is the top bin. The
     ``"quantile"`` and ``"kmeans"`` strategies then drop every edge within
     ``1e-8`` of the one before it, as scikit-learn does, so a column can end
-    up with fewer bins than ``n_bins`` asked for. A constant column is one
-    bin holding everything. ``encode="ordinal"`` replaces the column with an
-    i64 bin index in place. ``"onehot"`` and ``"onehot-dense"`` mean the same
-    thing here, because the output is always dense columns: both drop the
+    up with fewer bins than ``n_bins`` asked for. Values near f64's largest
+    can make a computed edge overflow: that rule drops such an edge where
+    scikit-learn drops it, and a kept edge that is not finite is an error,
+    because a saved pipeline cannot hold it. So is a ``"kmeans"`` edge
+    midway between two centers whose sum overflows. A constant column is
+    one bin holding everything. ``encode="ordinal"`` replaces the column with
+    an i64 bin index in place. ``"onehot"`` and ``"onehot-dense"`` mean the
+    same thing here, because the output is always dense columns: both drop the
     column and append one i64 column per bin, named ``<column>_<bin>``, after
     the columns that stay, so how many columns there are is known only after
     the fit and a later step in the same pipeline cannot name them, and one

@@ -411,6 +411,25 @@ TEST_CASE("k_bins_discretize's kmeans scales a column far from its mean by a pow
                       ContainsSubstring("column 'x' spans past the range of f64"));
 }
 
+TEST_CASE("k_bins_discretize's kmeans refuses a center midpoint that is not finite") {
+  const fft::Schema schema{{{"x", "f64"}}};
+  const auto fit = [&](const std::vector<double>& values, int bins) {
+    const nlohmann::json params{{"columns", {"x"}}, {"n_bins", bins}, {"encode", "ordinal"}, {"strategy", "kmeans"}};
+    return fit_binning("k_bins_discretize", params, schema, {make_batch({"x"}, {f64_column(values)})});
+  };
+  const std::string not_finite = "column 'x' fits a bin edge that is not finite; its values are too large";
+  // At 3 bins the two lowest values are centers of their own, and their
+  // midpoint, (-1.7e308 + -1.6e308) * 0.5, overflows to -inf. Pruning
+  // would drop that edge and bin both clusters together. scikit-learn
+  // 1.9.0 refuses this column at 3 bins ("Input contains infinity").
+  std::vector<double> low{-1.7e308, -1.6e308};
+  low.insert(low.end(), 20, 9e306);
+  REQUIRE_THROWS_WITH(fit(low, 3), ContainsSubstring(not_finite));
+  // Here the midpoint of the two highest centers at 3 bins overflows to
+  // +inf, which pruning would keep and the check after it would refuse.
+  REQUIRE_THROWS_WITH(fit({-0.7e308, -0.7e308, 0.9e308, 1e308}, 3), ContainsSubstring(not_finite));
+}
+
 TEST_CASE("quantile_transform interpolates between quantiles too close for numpy's slope") {
   // REGRESSION: a rank between two quantiles closer than the reference step
   // over f64's largest is a number in [0, 1]. numpy's slope overflows there,
@@ -715,6 +734,82 @@ TEST_CASE("k_bins_discretize drops bins that collapse and bins a constant column
   const auto& only = static_cast<const arrow::Int64Array&>(*out.cols[0]);
   REQUIRE(only.Value(0) == 1);
   REQUIRE(only.Value(2) == 1);
+}
+
+namespace {
+
+// The edges of a quantile fit of one f64 column.
+std::vector<double> quantile_edges(const std::vector<double>& values, int bins, const char* method) {
+  const nlohmann::json params{{"columns", {"x"}},
+                              {"n_bins", bins},
+                              {"encode", "ordinal"},
+                              {"strategy", "quantile"},
+                              {"quantile_method", method}};
+  const auto kernel =
+      fit_binning("k_bins_discretize", params, fft::Schema{{{"x", "f64"}}}, {make_batch({"x"}, {f64_column(values)})});
+  return kernel->state().at("bin_edges").at("x").get<std::vector<double>>();
+}
+
+}  // namespace
+
+TEST_CASE("k_bins_discretize drops a quantile edge that overflows, as scikit-learn does") {
+  // REGRESSION: an edge that the pruning drops is not checked, so these
+  // fits answer. A check of every computed edge before the pruning used to
+  // refuse them.
+  // Between two neighbors more than f64's largest apart a quantile
+  // interpolates to -inf, which is not above the edge before it. Every
+  // expected list is scikit-learn 1.9.0's bin_edges_ for the same column,
+  // n_bins and quantile_method; 1.35e308 is its middle edge exactly.
+  const std::vector<double> halves{-1e308, -1e308, 1e308, 1e308};
+  for (const char* method : {"averaged_inverted_cdf", "linear"}) {
+    REQUIRE(quantile_edges(halves, 2, method) == std::vector<double>{-1e308, 1e308});
+  }
+  // The edge after the dropped one is more than the width above -inf, so it
+  // stays, and the column keeps two of its three bins.
+  const std::vector<double> thirds{-1e308, -1e308, 1e308, 1e308, 1.7e308, 1.7e308};
+  REQUIRE(quantile_edges(thirds, 3, "averaged_inverted_cdf") == std::vector<double>{-1e308, 1.35e308, 1.7e308});
+  REQUIRE(quantile_edges(thirds, 3, "linear") == std::vector<double>{-1e308, 0x1.5f43d696f9994p+1023, 1.7e308});
+  // Between two order statistics averaged_inverted_cdf takes the upper one
+  // as 1e308 - inf * 0, NaN, which is not above anything. The edge after it
+  // is dropped too, because each edge is compared with the computed edge
+  // before it, not with the last one kept.
+  const std::vector<double> quarters{-1e308, 1e308, 1e308, 1.5e308, 1.7e308};
+  REQUIRE(quantile_edges(quarters, 4, "averaged_inverted_cdf") == std::vector<double>{-1e308, 1.5e308, 1.7e308});
+}
+
+TEST_CASE("k_bins_discretize refuses a quantile edge that is kept and is not finite") {
+  const std::string not_finite = "column 'x' fits a bin edge that is not finite; its values are too large";
+  // weibull's second edge interpolates up from -1e308 to +inf, which is
+  // kept: scikit-learn 1.9.0's edges are [-1e308, inf].
+  REQUIRE_THROWS_WITH(quantile_edges({-1e308, 1e308, 1e308, 1e308}, 4, "weibull"), ContainsSubstring(not_finite));
+  // linear's first edge is -1e308 + inf * 0, NaN, and the first edge is
+  // always kept: scikit-learn's edges are [nan, 1e308].
+  REQUIRE_THROWS_WITH(quantile_edges({-1e308, 1e308}, 2, "linear"), ContainsSubstring(not_finite));
+}
+
+TEST_CASE("k_bins_discretize tells a column with no bin left to use strategy='uniform' only where uniform bins it") {
+  const std::string not_finite = "column 'x' fits a bin edge that is not finite; its values are too large";
+  // A NaN median is dropped, and so is the maximum after it, which leaves
+  // one edge: scikit-learn's edges are [-1e308]. The error names the edge
+  // that is not finite, because strategy='uniform', which a column with no
+  // bin left is told to use, refuses this column as well.
+  const std::vector<double> wide{-1e308, -1e308, 1e308};
+  REQUIRE_THROWS_WITH(quantile_edges(wide, 2, "linear"), ContainsSubstring(not_finite));
+  const nlohmann::json uniform{{"columns", {"x"}}, {"n_bins", 2}, {"encode", "ordinal"}, {"strategy", "uniform"}};
+  const fft::Schema schema{{{"x", "f64"}}};
+  REQUIRE_THROWS_WITH(fit_binning("k_bins_discretize", uniform, schema, {make_batch({"x"}, {f64_column(wide)})}),
+                      ContainsSubstring(not_finite));
+  // A column whose finite edges each lie within 1e-8 of the one before it
+  // is told to use strategy='uniform', which bins it.
+  const std::vector<double> narrow{1.0, 1.0 + 1e-9, 1.0 + 2e-9, 1.0 + 3e-9};
+  REQUIRE_THROWS_WITH(quantile_edges(narrow, 2, "linear"),
+                      ContainsSubstring("column 'x' has no bin left: every edge after the first is within 1e-08 of "
+                                        "the one before it (use strategy='uniform', which keeps every edge)"));
+  REQUIRE(fit_binning("k_bins_discretize", uniform, schema, {make_batch({"x"}, {f64_column(narrow)})})
+              ->state()
+              .at("bin_edges")
+              .at("x")
+              .size() == 3);
 }
 
 TEST_CASE("k_bins_discretize refuses a null and a value that is not finite at fit") {
@@ -1202,19 +1297,4 @@ TEST_CASE("paired quantile interpolation retains mirrored searches at duplicate 
       REQUIRE(std::bit_cast<uint64_t>(actual.Value(static_cast<int64_t>(row))) == std::bit_cast<uint64_t>(expected));
     }
   }
-}
-
-TEST_CASE("k_bins_discretize refuses a non-finite quantile edge before pruning narrow bins") {
-  // REGRESSION: lerp overflows high - low to +inf on [-1e308, -1e308, 1e308,
-  // 1e308], giving -inf at q=0.5. Narrow-bin deduplication used to run before
-  // fitted_number(), silently dropping -inf and collapsing two bins into one.
-  const fft::Schema schema{{{"x", "f64"}}};
-  const nlohmann::json params{{"columns", {"x"}},
-                              {"n_bins", 2},
-                              {"encode", "ordinal"},
-                              {"strategy", "quantile"},
-                              {"quantile_method", "linear"}};
-  const fft::Batch extreme = make_batch({"x"}, {f64_column({-1e308, -1e308, 1e308, 1e308})});
-  REQUIRE_THROWS_WITH(fit_binning("k_bins_discretize", params, schema, {extreme}),
-                      ContainsSubstring("bin edge that is not finite"));
 }
