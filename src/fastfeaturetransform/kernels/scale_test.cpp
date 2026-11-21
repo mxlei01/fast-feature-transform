@@ -114,7 +114,7 @@ void check_standard_fit_blocks() {
         reference_values.push_back(value);
       }
       reference_values.push_back(std::nullopt);
-      const auto storage = arrow::Buffer::FromVector(std::move(backing));
+      const auto storage = fft::testing::buffer_of(backing);
       const std::vector<uint8_t> before(storage->data(), storage->data() + storage->size());
       const auto parent = std::make_shared<arrow::NumericArray<ArrowType>>(length + 7, storage, nullptr, 0);
       const auto source = parent->Slice(3, length);
@@ -445,8 +445,9 @@ TEST_CASE("standard_scale fits a column whose squares sum just under the largest
   }
 
   // These squares sum to 0.08 of a step below the largest double.
-  // REGRESSION: adding the larger rounded square before its residual used
-  // to overflow the partials in one order. Both orders fit the same state.
+  // REGRESSION: both orders of these values fit the same state. Adding the
+  // larger rounded square before its residual used to overflow the partials
+  // in one order.
   const Doubles near{0x1.6a01f4e4a04bbp+511, 0x1.6a11d7beaa3e1p+511};
   const auto forward = fit_scaler("standard_scale", params, schema, {make_batch({"a"}, {doubles(near)})});
   const auto reversed =

@@ -138,11 +138,12 @@ def parquet_to_memmap(X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None =
     list holding the same number of values in every row.
 
     Args:
-        X: List of Parquet file paths.
+        X: A list or tuple of Parquet file paths.
         output_dir: Directory for ``data.mmap`` and ``index.json``; a temporary
-            directory is created when omitted and removed with its files if the call
-            raises. A previous memmap there is replaced only after every row is
-            written, so a run that fails before then leaves it untouched.
+            directory is created when omitted and removed with its files if
+            the call raises. A previous memmap there is replaced only after
+            every row is written, so a run that fails before then leaves it
+            untouched.
         threads: Worker threads; 0 uses all cores.
 
     Returns:
@@ -152,11 +153,12 @@ def parquet_to_memmap(X: _ParquetPaths[_PathT], *, output_dir: _StrPath | None =
         EngineError: If the input cannot be read or holds a string column, a
             null, a list column whose rows differ in length or are empty, or
             a type a memmap cannot store.
-        TypeError: If X is a single path instead of a list of paths, or
-            output_dir is not None and is neither a str nor an os.PathLike
-            that gives a str.
-        ValueError: If threads is not an integer from 0 to 2**32 - 1, or
-            output_dir is empty or holds a NUL character.
+        TypeError: If X is a single path instead of a list of paths or holds
+            an os.PathLike that gives bytes, or output_dir is not None and is
+            neither a str nor an os.PathLike that gives a str.
+        ValueError: If threads is not an integer from 0 to 2**32 - 1,
+            output_dir is empty or holds a NUL character, or a path in X or
+            output_dir cannot be encoded as UTF-8.
 
     """
     sources: list[str] = _source_paths(X)
@@ -293,8 +295,10 @@ class Pipeline:
     ) -> Self:
         """Fit on the given Parquet files.
 
-        Fitting again replaces the fitted state. Each read sees one fit, even
-        when another thread fits the same object.
+        A pipeline fits all its steps, nested ones included, in one engine
+        call. Fitting again, or fitting a pipeline that holds this object,
+        replaces its fitted state at once: a thread that uses it meanwhile
+        sees the old fit or the new one.
 
         Fit reads Parquet in batches. Steps that need every value (exact
         medians, quantiles, k-means and power fits) keep those values within a
@@ -316,13 +320,13 @@ class Pipeline:
 
         Raises:
             EngineError: If the input cannot be read or a column is missing or mistyped.
-            TypeError: If X is a single path instead of a list of paths, or
-                temp_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If threads is not an integer from 0 to 2**32 - 1, or
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or temp_dir is not None
+                and is neither a str nor an os.PathLike that gives a str.
+            ValueError: If threads is not an integer from 0 to 2**32 - 1,
                 temp_dir holds a NUL character or is not an existing
-                directory.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+                directory, or a path in X or temp_dir cannot be encoded as
+                UTF-8.
 
         """
         # REGRESSION: the fit compiles and binds one reading of the steps, and
@@ -346,6 +350,10 @@ class Pipeline:
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
         """Transform a single record through the record path.
 
+        The record path takes no binary value: a ``bytes`` value raises
+        EngineError, even for a binary column that the batch path passes
+        through, so a record leaves out the keys of such columns.
+
         Args:
             X: One record as a flat dict of str, int, float, bool, datetime,
                 or None values (numpy scalars are converted, and a datetime
@@ -356,7 +364,7 @@ class Pipeline:
 
         Raises:
             EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
             TypeError: If X is not a dict.
 
         """
@@ -375,12 +383,12 @@ class Pipeline:
         Args:
             X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted and removed with its files if the call raises.
-                Once the run starts, the files named ``part-<number>.parquet``
-                whose number has five or more digits, and the same names
-                ending in ``.tmp``, are deleted, and a run that fails midway
-                leaves none. Each part number has the width of the last part
-                number, with at least five digits.
+                is created when omitted and removed with its files if the
+                call raises. Once the run starts, the files named
+                ``part-<number>.parquet`` whose number has five or more
+                digits, and the same names ending in ``.tmp``, are deleted,
+                and a run that fails midway leaves none. Each part number has
+                the width of the last part number, with at least five digits.
 
         Returns:
             The paths of the part files written, one per input row group, in
@@ -390,12 +398,12 @@ class Pipeline:
             EngineError: If the input cannot be read, does not match the fitted schema, or
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is a single path instead of a list of paths, or
-                output_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or output_dir is not
+                None and is neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         handle: _core.FittedPipeline = self._require_handle()
@@ -404,11 +412,14 @@ class Pipeline:
             return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
     def transform_memmap(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath) -> Path:
-        """Write transformed training records without intermediate Parquet files.
+        """Transform Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
+
+        The records go from the transformed batches into the memmap without
+        intermediate Parquet files.
 
         Args:
             X: Input Parquet files, in their desired row order.
-            output_dir: Directory for packed data.mmap and index.json.
+            output_dir: Directory for ``data.mmap`` and ``index.json``.
 
         Returns:
             The path of ``index.json``. The memmap has the layout that
@@ -419,12 +430,12 @@ class Pipeline:
                 fitted schema, or the output has no columns or holds a string
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is a single path instead of a list of paths, or
-                output_dir is neither a str nor an os.PathLike that gives a
-                str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or output_dir is
+                neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         return Path(
@@ -446,19 +457,20 @@ class Pipeline:
         Args:
             X: A record dict, or a list or tuple of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
-                directory is created when omitted and removed with its files if the call raises.
+                directory is created when omitted and removed with its files
+                if the call raises.
 
         Returns:
             A transformed record dict, or the list of written part-file paths.
 
         Raises:
             EngineError: If the engine rejects the input.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is neither a dict nor a list of paths, or
-                output_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is neither a dict nor a list of paths, X holds an
+                os.PathLike that gives bytes, or output_dir is not None and is
+                neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         if isinstance(X, dict):
@@ -479,25 +491,29 @@ class Pipeline:
         """Fit the pipeline, then transform the same files with transform_parquet.
 
         Args:
-            X: List of Parquet file paths.
+            X: A list or tuple of Parquet file paths.
             y: Ignored; present to match scikit-learn's ``fit_transform(X, y)``.
             threads: Worker threads for the engine; 0 uses all cores.
-            temp_dir: Existing parent directory for temporary spill files;
-                defaults to the system temporary directory.
+            temp_dir: Existing parent directory for private temporary spill files;
+                defaults to the system temporary directory. The files are
+                deleted when the fit ends or fails.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted and removed with its files if the call raises.
+                is created when omitted and removed with its files if the
+                call raises.
 
         Returns:
             The list of written part-file paths.
 
         Raises:
             EngineError: If fit or transform_parquet raises it.
-            TypeError: If X is a single path instead of a list of paths, or
-                temp_dir or output_dir is not None and is neither a str nor an
-                os.PathLike that gives a str.
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or temp_dir or
+                output_dir is not None and is neither a str nor an os.PathLike
+                that gives a str.
             ValueError: If threads is not an integer from 0 to 2**32 - 1,
                 output_dir is empty, temp_dir or output_dir holds a NUL
-                character, or temp_dir is not an existing directory. Both
+                character, temp_dir is not an existing directory, or a path in
+                X, temp_dir or output_dir cannot be encoded as UTF-8. Both
                 directories are checked before the fit starts.
 
         """
@@ -516,7 +532,8 @@ class Pipeline:
             EngineError: If the directory or manifest cannot be written.
             RuntimeError: If unfitted, or if this pipeline is a step of a larger one.
             TypeError: If path is neither a str nor an os.PathLike that gives a str.
-            ValueError: If path is empty or holds a NUL character.
+            ValueError: If path is empty, holds a NUL character, or cannot be
+                encoded as UTF-8.
 
         """
         self._require_handle().save(_directory_path(path, "path"))
@@ -576,8 +593,9 @@ class Pipeline:
             EngineError: If the manifest is missing or invalid, or its layout
                 (``schema_version``) is one this build does not read.
             TypeError: If path is neither a str nor an os.PathLike that gives a str.
-            ValueError: If path is empty or holds a NUL character, or
-                threads is not an integer from 0 to 2**32 - 1.
+            ValueError: If path is empty, holds a NUL character or cannot be
+                encoded as UTF-8, or threads is not an integer from 0 to
+                2**32 - 1.
 
         """
         return cls._from_handle(_core.FittedPipeline.load(_directory_path(path, "path"), _check_threads(threads)))

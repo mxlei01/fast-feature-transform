@@ -175,7 +175,7 @@ def test_polynomial_features_that_generates_no_column_drops_its_columns(tmp_path
         alone.transform_parquet([only], output_dir=tmp_path / "only")
 
 
-# The manifest version 0.0.3 wrote for a PolynomialFeatures step that
+# The manifest that version 0.0.3 wrote for a PolynomialFeatures step that
 # generates no column followed by a StandardScaler fitted on y = [0, 4]. It
 # is that version's text byte for byte, except the time in created_at.
 _EMPTY_EXPANSION_SAVED_BY_0_0_3: str = (

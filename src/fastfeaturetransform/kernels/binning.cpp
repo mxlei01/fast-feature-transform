@@ -1365,10 +1365,11 @@ class KBinsDiscretize final : public Kernel {
       throw Error(stage + ": column '" + name + "' has " + std::to_string(count) + " values, fewer than the " +
                   std::to_string(bins_) + " clusters strategy='kmeans' needs");
     }
+    // consume_values refused every value that is not finite, and
+    // ExactSum::add fails for no other, so only the total can leave the
+    // range of f64.
     ExactSum total;
-    sorted.for_each([&](std::size_t, double value) {
-      if (!total.add(value)) throw Error(stage + ": column '" + name + "' sums past the range of f64");
-    });
+    sorted.for_each([&](std::size_t, double value) { (void)total.add(value); });
     if (total.outside_range()) throw Error(stage + ": column '" + name + "' sums past the range of f64");
     const double mean = total.value() / static_cast<double>(count);
     // Past 2^500 from the mean the squares, ||c||^2 - 2xc and the center

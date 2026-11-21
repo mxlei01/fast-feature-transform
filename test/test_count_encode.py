@@ -78,15 +78,29 @@ def test_count_encode_keeps_nulls_under_return_nan(events: list[str], tmp_path: 
     assert read_rows(encoder.transform_parquet(events, output_dir=tmp_path / "out"))[3]["device"] is None
 
 
+_NAME_NEEDS_SIZE = "min_group_name needs min_group_size; set min_group_size, or leave min_group_name unset"
+_COMBINE_NEEDS_SIZE = (
+    "combine_min_nan_groups={} needs min_group_size; set min_group_size, or leave combine_min_nan_groups at True"
+)
+
+
 @pytest.mark.parametrize(
-    "options", [{"min_group_name": ""}, {"combine_min_nan_groups": False}, {"combine_min_nan_groups": "force"}]
+    ("options", "problem"),
+    [
+        ({"min_group_name": ""}, _NAME_NEEDS_SIZE),
+        ({"combine_min_nan_groups": False}, _COMBINE_NEEDS_SIZE.format("False")),
+        ({"combine_min_nan_groups": "force"}, _COMBINE_NEEDS_SIZE.format("'force'")),
+        # With both set, the message names min_group_name.
+        ({"min_group_name": "rare", "combine_min_nan_groups": "force"}, _NAME_NEEDS_SIZE),
+    ],
 )
 def test_count_encode_group_options_require_a_threshold_at_fit(
-    events: list[str], tmp_path: Path, options: dict[str, Any]
+    events: list[str], tmp_path: Path, options: dict[str, Any], problem: str
 ) -> None:
     encoder = CountEncoder(columns=["device"], **options)
-    with pytest.raises(EngineError, match="require min_group_size"):
+    with pytest.raises(EngineError) as raised:
         encoder.fit(events)
+    assert str(raised.value) == f"countencoder: {problem}"
 
     # Earlier versions saved these options and fitted ordinary counts.
     saved = tmp_path / "saved"

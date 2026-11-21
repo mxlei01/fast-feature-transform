@@ -313,7 +313,6 @@ def test_readers_see_the_old_fit_or_the_new_one_while_a_transformer_is_fitted_ag
 # runs in a child process.
 FIRST_FIT_COPY_CHILD: str = """
 import copy
-import shutil
 import pickle
 import sys
 import threading

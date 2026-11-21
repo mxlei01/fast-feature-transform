@@ -29,8 +29,10 @@ jobs:
     # cannot change what CI tests. On ubuntu-26.04 the dependency build stops
     # at snappy 1.2.2, which does not compile with that image's g++-14.
     runs-on: ubuntu-24.04
-    # A cold Arrow build takes about 45 minutes and a warm run about 17. The
-    # default is six hours, which a hung test would otherwise spend.
+    # In this workflow's runs on GitHub's hosted runners, a Test job that
+    # passed took 20 to 31 minutes when it built Arrow (4 jobs) and 7 to 13
+    # when it restored Arrow from the cache (159 jobs). The default is six
+    # hours, which a hung test would otherwise spend.
     timeout-minutes: 90
     env:
       CC: gcc-14

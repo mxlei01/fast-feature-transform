@@ -533,12 +533,13 @@ class ExactSum {
   // from other splits, can leave other doubles with the same total. A reader
   // that rounds something it computes from each double, such as a product
   // that underflows, reads these, and its result is then the same for every
-  // order and split.
-  std::vector<double> terms() const {
+  // order and split. A sum that rounds past f64 has no such doubles: it is
+  // an error, whose message `where`, the caller's stage and column, begins.
+  std::vector<double> terms(const std::string& where) const {
     ExactSum rest = *this;
     std::vector<double> all;
     for (double top = rest.value(); top != 0.0; top = rest.value()) {
-      if (!std::isfinite(top)) throw Error("exact sum terms exceed the range of f64");
+      if (!std::isfinite(top)) throw Error(where + ": a sum leaves the range of f64");
       all.push_back(top);
       (void)rest.add(-top);
     }

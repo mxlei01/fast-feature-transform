@@ -1917,8 +1917,9 @@ def test_every_fitted_attribute_takes_the_fit_it_answers_for_from_one_read_of_th
     # state from one read of the binding, so a refit on another thread right
     # after that read leaves the answer for the old fit. data_range_ used to
     # read data_max_ and data_min_ one after the other and answered with one
-    # from each fit, and vocab_size answered a column the old fit did not
-    # encode from the new fit's state.
+    # from each fit. vocab_size, asked for a column the old fit did not
+    # encode, used to give the new fit's whole answer after its first read
+    # had taken the old fit's binding.
     old: Path = tmp_path / "old.parquet"
     new: Path = tmp_path / "new.parquet"
     pq.write_table(

@@ -246,9 +246,9 @@ RowValue read_other_value(nb::handle value, const std::string& name) {
     return std::monostate{};
   }
   if (numpy == "bool" || numpy == "bool_") {  // numpy's bool (2.x / 1.x names)
-    const int truth = PyObject_IsTrue(value.ptr());
-    if (truth < 0) throw nb::python_error();
-    return truth == 1;
+    // numpy's own bool answers its truth test from its value, which cannot
+    // fail; a subclass is a heap type, which numpy_type_name never names.
+    return PyObject_IsTrue(value.ptr()) == 1;
   }
   if (optional_attr(value, "__index__").is_valid()) {  // integer-like: fits int64 or fails, never widens
     nb::object index = nb::steal(PyNumber_Index(value.ptr()));

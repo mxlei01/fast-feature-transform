@@ -1250,8 +1250,9 @@ TEST_CASE("group_agg refuses an integer sum that overflows and non-finite floats
 }
 
 TEST_CASE("group_agg count skips null entries stored inside a dictionary") {
-  // REGRESSION: count_only checked array.IsNull(row) alone, which only tests
-  // the index bitmap and counted rows pointing at a null dictionary entry.
+  // REGRESSION: count skips a row whose index points at a null dictionary
+  // entry. count_only used to test array.IsNull(row) alone, which tests only
+  // the index bitmap, and counted such rows.
   auto dict_values = arrow::DictionaryArray::FromArrays(numeric_column<arrow::Int32Type>({0, 1, std::nullopt, 2, 1}),
                                                         utf8_column({"a", std::nullopt, "b"}));
   REQUIRE(dict_values.ok());

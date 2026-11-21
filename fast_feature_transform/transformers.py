@@ -138,7 +138,9 @@ def _source_paths(X: object) -> list[str]:
         The paths as strings, in order.
 
     Raises:
-        TypeError: If X is a single path, or holds anything but paths.
+        TypeError: If X is a single path, holds anything but paths, or holds
+            an os.PathLike that gives bytes.
+        ValueError: If a path cannot be encoded as UTF-8.
 
     """
     if isinstance(X, (str, os.PathLike)):
@@ -154,7 +156,21 @@ def _source_paths(X: object) -> list[str]:
 
 
 def _utf8_path(path: object, what: str) -> str:
-    """Return the path as the UTF-8 text the engine accepts."""
+    """Return the path as the UTF-8 text the engine accepts.
+
+    Args:
+        path: The caller's value, a str or an os.PathLike.
+        what: The argument's name, for the error message.
+
+    Returns:
+        The path as a plain str.
+
+    Raises:
+        TypeError: If path is bytes, an os.PathLike that gives bytes, or
+            neither a str nor an os.PathLike.
+        ValueError: If path cannot be encoded as UTF-8.
+
+    """
     text: object = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
     if isinstance(text, bytes):
         raise TypeError(f"{what} must be a str path, got bytes; decode it with os.fsdecode")
@@ -185,7 +201,8 @@ def _directory_path(path: object, what: str) -> str:
 
     Raises:
         TypeError: If path is neither a str nor an os.PathLike that gives a str.
-        ValueError: If path is empty or holds a NUL character.
+        ValueError: If path is empty, holds a NUL character, or cannot be
+            encoded as UTF-8.
 
     """
     text: str = _utf8_path(path, what)
@@ -216,7 +233,8 @@ def _output_directory(output_dir: _StrPath | None) -> Iterator[str]:
     Raises:
         TypeError: If output_dir is not None and is neither a str nor an
             os.PathLike that gives a str.
-        ValueError: If output_dir is empty or holds a NUL character.
+        ValueError: If output_dir is empty, holds a NUL character, or cannot
+            be encoded as UTF-8.
 
     """
     if output_dir is not None:
@@ -295,10 +313,10 @@ def _fit_engine(threads: int, temp_dir: _StrPath | None) -> _core.Engine:
     Raises:
         TypeError: If temp_dir is not None and is neither a str nor an
             os.PathLike that gives a str.
-        ValueError: If threads is invalid, or temp_dir holds a NUL character
-            or is not an existing directory. The engine opens
-            temp_dir only when the fit first spills, so a typo would
-            otherwise pass on small data.
+        ValueError: If threads is invalid, or temp_dir holds a NUL character,
+            cannot be encoded as UTF-8 or is not an existing directory. The
+            engine opens temp_dir only when the fit first spills, so a typo
+            would otherwise pass on small data.
 
     """
     directory: str = ""
@@ -448,8 +466,10 @@ class Transformer:
     ) -> Self:
         """Fit on the given Parquet files.
 
-        Fitting again replaces the fitted state. Each read sees one fit, even
-        when another thread fits the same object.
+        A pipeline fits all its steps, nested ones included, in one engine
+        call. Fitting again, or fitting a pipeline that holds this object,
+        replaces its fitted state at once: a thread that uses it meanwhile
+        sees the old fit or the new one.
 
         Fit reads Parquet in batches. Steps that need every value (exact
         medians, quantiles, k-means and power fits) keep those values within a
@@ -471,13 +491,13 @@ class Transformer:
 
         Raises:
             EngineError: If the input cannot be read or a column is missing or mistyped.
-            TypeError: If X is a single path instead of a list of paths, or
-                temp_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If threads is not an integer from 0 to 2**32 - 1, or
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or temp_dir is not None
+                and is neither a str nor an os.PathLike that gives a str.
+            ValueError: If threads is not an integer from 0 to 2**32 - 1,
                 temp_dir holds a NUL character or is not an existing
-                directory.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+                directory, or a path in X or temp_dir cannot be encoded as
+                UTF-8.
 
         """
         from fast_feature_transform.pipeline import Pipeline
@@ -494,6 +514,10 @@ class Transformer:
     def transform_dict(self, X: dict[str, Any]) -> dict[str, Any]:
         """Transform a single record through the record path.
 
+        The record path takes no binary value: a ``bytes`` value raises
+        EngineError, even for a binary column that the batch path passes
+        through, so a record leaves out the keys of such columns.
+
         Args:
             X: One record as a flat dict of str, int, float, bool, datetime,
                 or None values (numpy scalars are converted, and a datetime
@@ -504,7 +528,7 @@ class Transformer:
 
         Raises:
             EngineError: If a value cannot be converted, a required key is missing, or the record holds one key twice.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
             TypeError: If X is not a dict.
 
         """
@@ -522,12 +546,12 @@ class Transformer:
         Args:
             X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
-                is created when omitted and removed with its files if the call raises.
-                Once the run starts, the files named ``part-<number>.parquet``
-                whose number has five or more digits, and the same names
-                ending in ``.tmp``, are deleted, and a run that fails midway
-                leaves none. Each part number has the width of the last part
-                number, with at least five digits.
+                is created when omitted and removed with its files if the
+                call raises. Once the run starts, the files named
+                ``part-<number>.parquet`` whose number has five or more
+                digits, and the same names ending in ``.tmp``, are deleted,
+                and a run that fails midway leaves none. Each part number has
+                the width of the last part number, with at least five digits.
 
         Returns:
             The paths of the part files written, one per input row group, in
@@ -537,12 +561,12 @@ class Transformer:
             EngineError: If the input cannot be read, does not match the fitted schema, or
                 has rows while the pipeline emits no columns, which Parquet output
                 cannot hold; ``transform_dict`` returns them.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is a single path instead of a list of paths, or
-                output_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or output_dir is not
+                None and is neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         handle: _core.FittedPipeline = self._standalone_handle()
@@ -551,11 +575,14 @@ class Transformer:
             return [Path(path) for path in handle.transform_batch(sources, out_dir)]
 
     def transform_memmap(self, X: _ParquetPaths[_PathT], *, output_dir: _StrPath) -> Path:
-        """Write transformed training records without intermediate Parquet files.
+        """Transform Parquet files into one memmap: ``data.mmap`` plus ``index.json``.
+
+        The records go from the transformed batches into the memmap without
+        intermediate Parquet files.
 
         Args:
             X: Input Parquet files, in their desired row order.
-            output_dir: Directory for packed data.mmap and index.json.
+            output_dir: Directory for ``data.mmap`` and ``index.json``.
 
         Returns:
             The path of ``index.json``. The memmap has the layout that
@@ -566,12 +593,12 @@ class Transformer:
                 fitted schema, or the output has no columns or holds a string
                 column, a null, a list column whose rows differ in length or
                 are empty, or a type a memmap cannot store.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is a single path instead of a list of paths, or
-                output_dir is neither a str nor an os.PathLike that gives a
-                str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is a single path instead of a list of paths or
+                holds an os.PathLike that gives bytes, or output_dir is
+                neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         return Path(
@@ -595,19 +622,20 @@ class Transformer:
         Args:
             X: A record dict, or a list or tuple of Parquet file paths.
             output_dir: Directory for batch output part files; a temporary
-                directory is created when omitted and removed with its files if the call raises.
+                directory is created when omitted and removed with its files
+                if the call raises.
 
         Returns:
             A transformed record dict, or the list of written part-file paths.
 
         Raises:
             EngineError: If the engine rejects the input.
-            RuntimeError: If unfitted or fitted as a step of another pipeline.
-            TypeError: If X is neither a dict nor a list of paths, or
-                output_dir is not None and is neither a str nor an os.PathLike
-                that gives a str.
-            ValueError: If output_dir is empty or holds a NUL character.
-                A path that cannot be encoded as UTF-8 raises ValueError.
+            RuntimeError: If unfitted, or fitted as a step of a pipeline.
+            TypeError: If X is neither a dict nor a list of paths, X holds an
+                os.PathLike that gives bytes, or output_dir is not None and is
+                neither a str nor an os.PathLike that gives a str.
+            ValueError: If output_dir is empty or holds a NUL character, or a
+                path in X or output_dir cannot be encoded as UTF-8.
 
         """
         if isinstance(X, dict):
@@ -861,9 +889,10 @@ class LabelEncoder(Transformer):
         try:
             return handle.vocab_size(stage, column)
         except _core.EngineError, TypeError:
-            # A column this encoder does not encode — or a lone surrogate that
-            # the UTF-8 binding refuses — raises KeyError, as its docstring
-            # says, from a lookup in the state of the same fit.
+            # A column this encoder does not encode, and a str with a lone
+            # surrogate, which the binding cannot convert to UTF-8, raise
+            # KeyError, as the docstring says, from a lookup in the state of
+            # the same fit.
             return self._state_of(binding)["vocab_sizes"][column]
 
 
@@ -1110,15 +1139,16 @@ class CountEncoder(Transformer):
     ``"return_nan"``, and an error under ``"error"`` — refused at transform
     as well as at fit. Under ``"return_nan"`` the null stays null for every
     ``handle_unknown`` setting. category_encoders fills it with an integer
-    ``handle_unknown`` and rejects it under ``"error"``. An unseen category yields 0
-    under ``handle_unknown="value"`` (a null when ``handle_missing`` is
-    ``"return_nan"``), that integer when an integer is given, a null under
-    ``"return_nan"``, and an error under ``"error"``; an integer is the
-    literal number you asked to see, so ``normalize=True`` scales a real
-    count and leaves that number alone. A ``min_group_size`` group whose name
-    is already a category that survived the fold is a fit-time error rather
-    than a silent overwrite. A fit with ``min_group_name`` set or with
-    ``combine_min_nan_groups`` set to False or "force" requires ``min_group_size``.
+    ``handle_unknown`` and rejects it under ``"error"``. An unseen category
+    yields 0 under ``handle_unknown="value"`` (a null when
+    ``handle_missing`` is ``"return_nan"``), that integer when an integer is
+    given, a null under ``"return_nan"``, and an error under ``"error"``; an
+    integer is the literal number you asked to see, so ``normalize=True``
+    scales a real count and leaves that number alone. A ``min_group_size``
+    group whose name is already a category that survived the fold is a
+    fit-time error rather than a silent overwrite. A fit with
+    ``min_group_name`` set, or with ``combine_min_nan_groups`` set to False
+    or "force", and without ``min_group_size`` raises EngineError.
     """
 
     kernel_id: ClassVar[str] = "count_encode"
@@ -3304,12 +3334,16 @@ class KBinsDiscretizer(Transformer):
     stopping iteration computed. What this package cannot follow is
     scikit-learn's arbitrary choice among points that tie on distance from
     their center, which scikit-learn makes over the rows in file order and
-    this package over the sorted values. The fit of a column whose squared
-    deviations from its mean sum past the range of f64 stops after its first
-    pass, as scikit-learn's does, while every value is less than 2^512 from
-    the mean; from 2^512 on, where scikit-learn's own squares overflow, the
-    column is fit as scikit-learn fits it divided by a power of two that
-    brings it into range.
+    this package over the sorted values. On ``[-1, -1, 1, 1]`` at 4 bins the
+    edges here are ``[-1, -1, 0, 1]`` and the values fall in bins 1 and 2,
+    where scikit-learn 1.9.0 gives the edges ``[-1, 0, 1]`` and the bins 0
+    and 1; for the rows in the order ``[1, 1, -1, -1]`` it gives the edges
+    and bins of this package. The fit of a column whose squared deviations
+    from its mean sum past the range of f64 stops after its first pass, as
+    scikit-learn's does, while every value is less than 2^512 from the mean;
+    from 2^512 on, where scikit-learn's own squares overflow, the column is
+    fit as scikit-learn fits it divided by a power of two that brings it into
+    range.
 
     ``strategy="uniform"`` over a column spanning a few ulps returns bin edges
     that repeat, as ``np.linspace`` and scikit-learn do; the saved pipeline
@@ -3365,10 +3399,16 @@ class KBinsDiscretizer(Transformer):
 
     @property
     def bin_edges_(self) -> dict[str, list[float]]:
-        """The fitted bin edges per column, ascending.
+        """The fitted bin edges per column, outer bounds included.
+
+        The interior edges never decrease. An outer edge can lie on the
+        wrong side of its neighbor, as scikit-learn's can: a ``"kmeans"`` fit
+        can write its first edge above its second, and a ``"uniform"`` fit
+        over a span of a few subnormal steps its last edge below the one
+        before.
 
         Returns:
-            Mapping of column name to its edges, outer bounds included.
+            Mapping of column name to its edges.
 
         """
         return self._state()["bin_edges"]
@@ -3601,14 +3641,21 @@ class SplineTransformer(Transformer):
     inside it.
 
     ``extrapolation`` says what happens outside the fitted range:
-    ``"error"`` refuses the value, ``"constant"`` holds the boundary basis
-    values, ``"linear"`` continues them along the boundary derivative,
-    ``"continue"`` evaluates the boundary polynomial pieces on, and
+    ``"error"`` refuses the value, ``"constant"`` holds basis functions at
+    their boundary values, ``"linear"`` continues them along their boundary
+    slopes, ``"continue"`` evaluates the boundary polynomial pieces on, and
     ``"periodic"`` wraps the column onto the interval between the first and
     last knot (which needs ``degree < n_knots`` and gives ``n_knots - 1``
-    columns). ``include_bias=False`` drops the last basis function per
-    column. ``handle_missing="error"`` refuses a null, at transform as well
-    as at fit; ``"zeros"`` encodes it as zeros in every generated column.
+    columns). ``"constant"`` and ``"linear"`` carry over only the first
+    ``degree`` basis functions below the range and the last ``degree`` above
+    it, one more under ``"linear"`` at degree 0 and 1, and write 0 in every
+    other column, as scikit-learn does, even where another basis function is
+    not 0 at the boundary, as at degree 0 and where knots repeat the minimum.
+    So ``"constant"`` at degree 0 writes zeros outside the range, where
+    scikit-learn 1.9.0 raises above it once ``n_knots`` is 3 or more.
+    ``include_bias=False`` drops the last basis function per column.
+    ``handle_missing="error"`` refuses a null, at transform as well as at
+    fit; ``"zeros"`` encodes it as zeros in every generated column.
 
     The width comes from the parameters alone even though the knot positions
     are fitted, so a later step in the same pipeline can name the outputs.

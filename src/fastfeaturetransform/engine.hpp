@@ -54,10 +54,12 @@ class FittedPipeline {
   FittedPipeline& operator=(const FittedPipeline&) = delete;
 
   // The batch path: one streaming pass, Parquet in -> ordered part files out.
-  // Once the run starts, existing part-NNNNN.parquet files in output_dir are
-  // replaced and a run that fails midway leaves none; a failure before the
-  // run starts (bad input, schema mismatch) leaves the directory's files
-  // untouched.
+  // Once the run starts, the files in output_dir named part-<number>.parquet
+  // whose number has five or more digits, and the same names ending in
+  // .tmp, are deleted, and a run that fails midway leaves none; a failure
+  // before the run starts (bad input, schema mismatch) leaves the
+  // directory's files untouched. Each part number has the width of the last
+  // part number, with at least five digits.
   std::vector<std::string> transform_batch(const std::vector<std::string>& sources,
                                            const std::string& output_dir) const;
   // Training output goes directly from transformed Arrow batches to packed

@@ -352,8 +352,11 @@ void check_dictionary_indices(const arrow::ArrayData& column, const std::string&
 // entries are distinct. After plain pages add values, a repeated entry
 // places the page's last value before its declared position. Plain pages
 // append only previously unseen values, so they cannot restore it there.
-// A batch may contain only earlier plain rows. Check the original page
-// once if the count and last value do not prove that its entries are unique.
+// A batch can also hold only plain rows that came before the pages of
+// indices, and its dictionary then need not show the page at all. When
+// neither the count nor the last value proves the page's entries distinct,
+// the page is read again, once per chunk, and checked for a repeated value
+// (dictionary_page_repeats).
 struct DictionaryChunk {
   bool watched = false;
   int32_t entries = -1;
@@ -797,7 +800,9 @@ void watch_dictionary_leaves(const parquet::arrow::SchemaField& field, const par
   // extension. Only a projected leaf will enter its stream reader.
   if (type.id() == arrow::Type::EXTENSION && storage_type(type).id() == arrow::Type::DICTIONARY &&
       (selected == nullptr || std::binary_search(selected->begin(), selected->end(), field.column_index))) {
-    throw Error(path + ": column '" + name + "' has an extension with dictionary storage, which cannot be streamed");
+    throw Error(
+        path + ": column '" + name +
+        "' has an extension with dictionary storage, which cannot be streamed; leave it out with a Select step");
   }
   chunks[static_cast<std::size_t>(field.column_index)].watched =
       type.id() == arrow::Type::DICTIONARY &&
@@ -837,11 +842,13 @@ bool shows_dictionary_page(const arrow::ArrayData& dictionary, const DictionaryC
   return value == *chunk.last;
 }
 
-// Whether the dictionary page of column chunk (`row_group`, `leaf`) holds a
-// value twice, read from the file again.
+// Whether the dictionary page of column chunk (`row_group`, `leaf`), a leaf
+// of column `name`, holds a value twice, read from the file again. Arrow's
+// reader has decoded the same page by then, so a page whose bytes end
+// before its values do means the file changed between the two reads.
 bool dictionary_page_repeats(const std::shared_ptr<arrow::io::RandomAccessFile>& input,
                              const std::shared_ptr<parquet::FileMetaData>& metadata, int row_group, int leaf,
-                             const std::string& where) {
+                             const std::string& where, const std::string& name) {
   try {
     const auto file = parquet::ParquetFileReader::Open(input, buffered_properties(), metadata);
     const std::shared_ptr<parquet::RowGroupReader> group = file->RowGroup(row_group);
@@ -852,11 +859,14 @@ bool dictionary_page_repeats(const std::shared_ptr<arrow::io::RandomAccessFile>&
       std::vector<std::string_view> values;
       const uint8_t* at = dictionary.data();
       if (dictionary.num_values() <= 0) return false;
-      if (!at || dictionary.size() == 0) throw Error(where + ": incomplete dictionary page");
+      const auto incomplete = [&] {
+        return Error(where + ": column '" + name + "' has an incomplete dictionary page");
+      };
+      if (!at || dictionary.size() == 0) throw incomplete();
       const uint8_t* const end = at + dictionary.size();
       for (int32_t entry = 0; entry < dictionary.num_values(); ++entry) {
         const std::optional<std::string_view> value = next_plain_value(at, end);
-        if (!value) throw Error(where + ": incomplete dictionary page");
+        if (!value) throw incomplete();
         values.push_back(*value);
       }
       std::sort(values.begin(), values.end());
@@ -1100,14 +1110,20 @@ bool uses_every_entry(const arrow::Array& column, const int32_t* indices, int64_
 // 0.25 of the time and 0.24 of the bytes it takes with every batch's
 // dictionary left whole.
 //
-// Only a top-level column of strings or bytes with int32 indices, which are
-// the reader's, is cut. A dictionary inside a list or a struct stays whole.
-// So does one whose indices have another width, and one whose type says the
-// order of its entries has a meaning, which the new numbering would change:
-// only an array made in memory is either. A null row's index is not a value:
-// it is not followed, and the row is written with index 0. When a row's
-// index lies outside the dictionary the column stays as it is; the reader
-// refuses such a batch before this (check_dictionary_indices).
+// The reader cuts only a top-level column, and only when its dictionary has
+// more entries than the batch has rows that hold a value. A sink's writer
+// passes `for_statistics` for a column one of whose batches holds a null
+// row in a dictionary (trim_for_statistics), at the top level or inside a
+// list or a struct (trim_children): its dictionaries are cut whenever their
+// rows leave an entry unused, and one that holds a null stays whole. Either
+// way only a dictionary of strings or bytes with int32 indices, which are
+// the reader's, is cut. One whose indices have another width stays whole,
+// and so does one whose type says the order of its entries has a meaning,
+// which the new numbering would change: only an array made in memory is
+// either. A null row's index is not a value: it is not followed, and the
+// row is written with index 0. When a row's index lies outside the
+// dictionary the column stays as it is; the reader refuses such a batch
+// before this (check_dictionary_indices).
 std::shared_ptr<arrow::Array> trim_dictionary(const std::shared_ptr<arrow::Array>& column, const std::string& name,
                                               bool for_statistics = false) {
   if (column->type_id() != arrow::Type::DICTIONARY) return column;
@@ -1553,7 +1569,7 @@ class ParquetSource::Reader final : public TaskReader {
       if (!chunk.plain && column.dictionary->length == chunk.entries) {
         chunk.settled = true;
       } else if (!shows_dictionary_page(*column.dictionary, chunk)) {
-        if (dictionary_page_repeats(input_, file.metadata, row_group, column_index, where)) {
+        if (dictionary_page_repeats(input_, file.metadata, row_group, column_index, where, name)) {
           throw Error(where + ": column '" + name + "' has a dictionary page that repeats a value");
         }
         chunk.settled = true;
@@ -1772,12 +1788,16 @@ struct PartWriter::Impl {
     // another, it writes the rest of the row group's values plain, and
     // batches do differ: a column read from plain pages comes with a
     // dictionary that grows from batch to batch. So the batches of a row
-    // group are given one dictionary first. A column goes to the writer as
-    // it came in three cases: a null row of it holds an index outside its
-    // dictionary, which the unifier would follow; its index type is too
-    // narrow to count the entries of the one dictionary; or its dictionary
-    // holds a null, which the Parquet writer then refuses, as it does in a
-    // row group of one batch.
+    // group are given one dictionary first. Before that, a column with a
+    // null row in a dictionary has its dictionaries cut to the entries its
+    // rows use, and the null rows of a cut one hold index 0
+    // (trim_for_statistics). A column of more than one batch is then
+    // unified, except in three cases, where it goes to the writer as the
+    // cut left it: a null row of it holds an index outside its dictionary,
+    // which the unifier would follow; its index type is too narrow to count
+    // the entries of the one dictionary; or its dictionary holds a null,
+    // which the Parquet writer then refuses, as it does in a row group of
+    // one batch.
     arrow::ChunkedArrayVector columns = group->columns();
     for (int i = 0; i < group->num_columns(); ++i) {
       auto& column = columns[static_cast<std::size_t>(i)];
@@ -1980,8 +2000,12 @@ std::string write_part(const std::string& dir, std::size_t index, const Batch& b
 
 namespace {
 
-// Thread-safe errno formatting (std::strerror is not required to be
-// thread-safe, and write_slice / flush_to_disk run on worker threads).
+// The text of an errno value. std::strerror need not be thread-safe, and
+// MemmapSink::write_slice runs on engine workers while saves and other sinks
+// can fail on several caller threads at once, so the text comes from
+// std::error_code, as in spill.cpp. Each caller copies errno right after the
+// call that failed: building the rest of its message allocates, which can
+// change errno.
 std::string errno_message(int error) { return std::error_code(error, std::generic_category()).message(); }
 
 }  // namespace
@@ -2188,13 +2212,20 @@ MemmapSink::MemmapSink(const std::string& dir, const Schema& schema, const std::
   std::filesystem::create_directories(dir_, ec);
   if (ec) throw Error(dir_ + ": cannot create output directory: " + ec.message());
   files_->fd = ::open(files_->temp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (files_->fd < 0) throw Error(files_->temp + ": cannot create: " + errno_message(errno));
+  if (files_->fd < 0) {
+    const int error = errno;
+    throw Error(files_->temp + ": cannot create: " + errno_message(error));
+  }
   files_->owns_temp = true;
   struct stat info{};
-  if (::fstat(files_->fd, &info) != 0) throw Error(files_->temp + ": cannot inspect: " + errno_message(errno));
+  if (::fstat(files_->fd, &info) != 0) {
+    const int error = errno;
+    throw Error(files_->temp + ": cannot inspect: " + errno_message(error));
+  }
   if (!S_ISREG(info.st_mode)) throw Error(files_->temp + ": cannot preallocate: output is not a regular file");
   if (::ftruncate(files_->fd, static_cast<off_t>(rows_) * static_cast<off_t>(itemsize_)) != 0) {
-    throw Error(files_->temp + ": cannot preallocate: " + errno_message(errno));
+    const int error = errno;
+    throw Error(files_->temp + ": cannot preallocate: " + errno_message(error));
   }
 }
 
@@ -2296,8 +2327,9 @@ void MemmapSink::write_slice(std::size_t task, int64_t row_offset, const Batch& 
     while (remaining > 0) {
       const ssize_t written = ::pwrite(files_->fd, cursor, std::min(remaining, std::size_t{1} << 30), position);
       if (written < 0) {
-        if (errno == EINTR) continue;
-        throw Error(temp_path(dir_) + ": write failed: " + errno_message(errno));
+        const int error = errno;
+        if (error == EINTR) continue;
+        throw Error(temp_path(dir_) + ": write failed: " + errno_message(error));
       }
       if (written == 0) throw Error(temp_path(dir_) + ": write failed: zero-byte write");
       cursor += written;
@@ -2327,35 +2359,53 @@ std::string MemmapSink::finish() {
                                {"byte_order", "little"},
                                {"columns", std::move(columns)}};
     const std::string metadata = index.dump(2);
-    if (sync_to_disk(files.fd) != 0) throw Error(files.temp + ": flush failed: " + errno_message(errno));
-    if (Files::close(files.fd) != 0) throw Error(files.temp + ": close failed: " + errno_message(errno));
+    if (sync_to_disk(files.fd) != 0) {
+      const int error = errno;
+      throw Error(files.temp + ": flush failed: " + errno_message(error));
+    }
+    if (Files::close(files.fd) != 0) {
+      const int error = errno;
+      throw Error(files.temp + ": close failed: " + errno_message(error));
+    }
 
     files.index_fd = ::open(files.index_temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (files.index_fd < 0) throw Error(files.index_temp + ": cannot write: " + errno_message(errno));
+    if (files.index_fd < 0) {
+      const int error = errno;
+      throw Error(files.index_temp + ": cannot write: " + errno_message(error));
+    }
     files.owns_index_temp = true;
     std::size_t offset = 0;
     while (offset < metadata.size()) {
       const ssize_t written =
           ::write(files.index_fd, metadata.data() + offset, std::min(metadata.size() - offset, std::size_t{1} << 30));
       if (written < 0) {
-        if (errno == EINTR) continue;
-        throw Error(files.index_temp + ": write failed: " + errno_message(errno));
+        const int error = errno;
+        if (error == EINTR) continue;
+        throw Error(files.index_temp + ": write failed: " + errno_message(error));
       }
       if (written == 0) throw Error(files.index_temp + ": write failed: zero-byte write");
       offset += static_cast<std::size_t>(written);
     }
-    if (sync_to_disk(files.index_fd) != 0) throw Error(files.index_temp + ": flush failed: " + errno_message(errno));
-    if (Files::close(files.index_fd) != 0) throw Error(files.index_temp + ": close failed: " + errno_message(errno));
+    if (sync_to_disk(files.index_fd) != 0) {
+      const int error = errno;
+      throw Error(files.index_temp + ": flush failed: " + errno_message(error));
+    }
+    if (Files::close(files.index_fd) != 0) {
+      const int error = errno;
+      throw Error(files.index_temp + ": close failed: " + errno_message(error));
+    }
 
     // Publish data first, then its index. The pair is not atomic: an index
     // rename failure leaves the new data in place. Release each temporary
     // immediately so later cleanup cannot unlink a subsequent writer's file.
     if (::rename(files.temp.c_str(), files.data.c_str()) != 0) {
-      throw Error(files.data + ": " + errno_message(errno));
+      const int error = errno;
+      throw Error(files.data + ": " + errno_message(error));
     }
     files.owns_temp = false;
     if (::rename(files.index_temp.c_str(), files.index.c_str()) != 0) {
-      throw Error(files.index + ": " + errno_message(errno));
+      const int error = errno;
+      throw Error(files.index + ": " + errno_message(error));
     }
     files.owns_index_temp = false;
     flush_to_disk(dir_, true);  // both new names, so they survive once finish returns

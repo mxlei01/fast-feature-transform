@@ -106,7 +106,9 @@ std::optional<double> number_value(const RowValue& value, const std::string& sta
   throw Error(where + " must be a number or null");
 }
 
-// The exact sum, by Shewchuk's partials. Spilled fit buffers are read
+// The exact sum of fn over the values, which ExactSum holds even where a
+// running sum passes the range of f64 on the way; a term that is not finite
+// and a total that rounds past f64 are errors. Spilled fit buffers are read
 // sequentially in bounded chunks; chunk boundaries do not change the
 // accumulator or any arithmetic operation.
 template <typename F>
@@ -570,10 +572,13 @@ bool basis_at(const std::vector<double>& knots, std::size_t degree, double x, bo
 //     width comes from the params alone, so a later step in the same pipeline
 //     can name the outputs even though the knots are fitted
 //   * extrapolation says what happens outside the fitted range: 'error'
-//     refuses the value, 'constant' holds the boundary basis values, 'linear'
-//     continues them along the boundary derivative, 'continue' evaluates the
-//     boundary polynomial pieces on, and 'periodic' wraps the column onto the
-//     interval between the first and last base knot
+//     refuses the value, 'constant' holds basis functions at their boundary
+//     values, 'linear' continues them along their boundary slopes,
+//     'continue' evaluates the boundary polynomial pieces on, and 'periodic'
+//     wraps the column onto the interval between the first and last base
+//     knot; 'constant' and 'linear' carry over only the first `degree`
+//     basis functions below the knots and the last `degree` above them (one
+//     more under 'linear' at degree 0 and 1), as evaluate() says
 //   * handle_missing='error' refuses a null, at transform as well as at fit;
 //     'zeros' encodes it as zeros in every generated column
 //   * outputs are f64 whatever the inputs are (sklearn keeps a float32 input

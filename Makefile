@@ -98,7 +98,10 @@ cpp-tsan:  ## native ThreadSanitizer suite in its own build directory (cannot sh
 	TSAN_OPTIONS="suppressions=$(PWD)/tsan.supp print_suppressions=1" \
 		PATH="$(PWD)/.venv/bin:$$PATH" ctest --test-dir build/cpp-tsan --output-on-failure
 
-cpp-flags:  ## every one of our translation units must be compiled with -ffp-contract=off
+# A test build compiles the core and its tests but not src/bindings/module.cpp,
+# which only the extension's build compiles, through fft_project_options like
+# the rest; so this check never sees that file.
+cpp-flags:  ## every translation unit of the core and its tests must be compiled with -ffp-contract=off
 	@uv run python -c "import json, sys; \
 	db = json.load(open('$(CPP_FLAGS_DIR)/compile_commands.json')); \
 	ours = [e for e in db if '/src/fastfeaturetransform/' in e['file'] or '/src/bindings/' in e['file']]; \

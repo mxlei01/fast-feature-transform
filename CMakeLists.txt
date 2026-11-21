@@ -214,8 +214,9 @@ else()
   # nothing but those helpers around a kernel call, and it is the serving path.
   nanobind_add_module(_core FREE_THREADED NOMINSIZE src/bindings/module.cpp)
   target_link_libraries(_core PRIVATE fftcore fft_project_options)
-  # Export only the module initializer. Both the static Arrow and template
-  # instantiations in our own objects stay private when pyarrow is loaded.
+  # Export only the module initializer, so the static Arrow and the template
+  # instantiations in this package's own objects stay private, whether or not
+  # pyarrow is loaded in the same process.
   if(APPLE)
     target_link_options(_core PRIVATE "LINKER:-exported_symbol,_PyInit__core")
   else()
