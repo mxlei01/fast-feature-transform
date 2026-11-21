@@ -223,12 +223,17 @@ def _output_directory(output_dir: _StrPath | None) -> Iterator[str]:
     Yields:
         The directory's path. A temporary directory made here is removed
         with all its output if the call raises. A KeyboardInterrupt that
-        lands in the removal starts it over, however often one lands. Once
-        the directory is gone, the call raises the exception that made it
+        lands in the removal starts it over, however often one lands, but
+        one that lands at the jump between two attempts stops it. Once the
+        directory is gone, the call raises the exception that made it
         remove the directory. If that exception is not a KeyboardInterrupt
         and an interrupt landed in the removal, the call raises the first
         such interrupt instead, with that exception as its context, so that
-        a Ctrl-C is never lost.
+        the Ctrl-C reaches the caller. An interrupt that lands as the with
+        statement begins to exit, before it resumes this generator, leaves
+        the removal to the generator's finalizer, and an interrupt that
+        lands in the removal there is reported through sys.unraisablehook
+        instead.
 
     Raises:
         TypeError: If output_dir is not None and is neither a str nor an
@@ -249,29 +254,31 @@ def _output_directory(output_dir: _StrPath | None) -> Iterator[str]:
         # removal, such as a second Ctrl-C, starts it over instead of
         # stopping it with output left. An attempt keeps what earlier ones
         # removed, so the removal ends unless interrupts keep arriving faster
-        # than an attempt can remove a file. An interrupt in the few
-        # instructions between two attempts, outside the try, still stops it.
+        # than an attempt can remove a file. An interrupt at the jump between
+        # two attempts, outside the retried try, still stops it.
         interrupt: KeyboardInterrupt | None = None
-        while True:
-            try:
-                shutil.rmtree(created, ignore_errors=True)
-            except KeyboardInterrupt as landed:
-                if interrupt is None:
-                    interrupt = landed
-                continue
-            break
-        # An interrupt that landed in the removal is raised in place of an
-        # exception that is not one, such as an EngineError: code that
-        # catches that exception and carries on would otherwise lose the
-        # Ctrl-C. Raised here, the interrupt has that exception as its
-        # context.
         try:
+            while True:
+                try:
+                    shutil.rmtree(created, ignore_errors=True)
+                except KeyboardInterrupt as landed:
+                    if interrupt is None:
+                        interrupt = landed
+                    continue
+                break
+            # An interrupt that landed in the removal is raised in place of an
+            # exception that is not one, such as an EngineError: code that
+            # catches that exception and carries on would otherwise lose the
+            # Ctrl-C. Raised here, the interrupt has that exception as its
+            # context.
             if interrupt is not None and not isinstance(error, KeyboardInterrupt):
                 raise interrupt
         finally:
-            # The interrupt's traceback holds this frame, so a reference to
-            # it left here would keep the caller's frames alive until the
-            # garbage collector runs.
+            # REGRESSION: the interrupt is deleted on every way out of the
+            # removal. Its traceback holds this frame, so a reference to it
+            # left here keeps the caller's frames alive until the garbage
+            # collector runs. It used to be deleted only after the retries,
+            # so an interrupt at the jump between two attempts left it.
             del interrupt
         raise
 
@@ -500,14 +507,14 @@ class Transformer:
                 UTF-8.
 
         """
-        from fast_feature_transform.pipeline import Pipeline
+        from fast_feature_transform.pipeline import Pipeline, _Fit
 
         # REGRESSION: a standalone fit binds this transformer once, as
         # standalone. It used to fit a one-step Pipeline, which bound it as a
         # pipeline step first, so a thread that used it before it was marked
         # standalone was refused, and a copy taken then was unfitted.
         stage: str = type(self).__name__.lower()
-        plan: str = json.dumps(Pipeline([(stage, self)])._to_tree({}))
+        plan: str = json.dumps(Pipeline([(stage, self)])._to_tree({}, _Fit()))
         self._bind(_fit_engine(threads, temp_dir).fit(plan, _source_paths(X)), stage, standalone=True)
         return self
 
