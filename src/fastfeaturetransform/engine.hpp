@@ -59,7 +59,10 @@ class FittedPipeline {
   // .tmp, are deleted, and a run that fails midway leaves none; a failure
   // before the run starts (bad input, schema mismatch) leaves the
   // directory's files untouched. Each part number has the width of the last
-  // part number, with at least five digits.
+  // part number, with at least five digits. Names are compared with their
+  // case: on a volume that ignores case, a file whose name differs from a
+  // part's only in case is not deleted, and a run that writes that part
+  // writes over it.
   std::vector<std::string> transform_batch(const std::vector<std::string>& sources,
                                            const std::string& output_dir) const;
   // Training output goes directly from transformed Arrow batches to packed
