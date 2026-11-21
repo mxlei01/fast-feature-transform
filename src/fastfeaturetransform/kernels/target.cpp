@@ -762,16 +762,20 @@ class TargetBlend final : public Kernel {
   }
 
   // The one weight every category of a column shares under
-  // james_stein_encode's pooled model.
+  // james_stein_encode's pooled model. Its sum of squared errors cannot
+  // leave f64's range, so nothing here tests for that: a target is below
+  // kMaxSquared in magnitude (an integer one at most 2^63), so the prior and
+  // every mean are at most kMaxSquared, each error at most twice that, and a
+  // fit has fewer than 2^63 rows, so fewer squares than that.
   double pooled_weight(const Column& column, const Totals& totals) const {
+    static_assert(0x1p63 * (2.0 * kMaxSquared) * (2.0 * kMaxSquared) < 0x1p1023);
     ExactSum errors;
     const auto add_error = [&](const Acc& acc) {
       const double error = sum_of(acc, target_family_) / static_cast<double>(acc.count) - prior_;
-      if (!errors.add(error * error)) throw Error(stage + ": the squared category means overflow f64");
+      (void)errors.add(error * error);
     };
     for (const Acc& acc : column.categories.values) add_error(acc);
     if (column.nulls.count > 0) add_error(column.nulls);
-    if (errors.outside_range()) throw Error(stage + ": the squared category means overflow f64");
     const double sse = errors.value();
     if (sse <= 0) return 0.0;  // every mean is the prior already, so the weight cannot matter
     const auto levels = static_cast<double>(totals.levels);

@@ -1031,6 +1031,20 @@ TEST_CASE("power_transform refuses what neither method can fit") {
                       ContainsSubstring("is not strictly positive, which box-cox requires"));
 }
 
+TEST_CASE("power_transform refuses a column whose completed sum leaves the range of f64") {
+  // Each squared deviation from the mean of 0 is 1.69e308, finite, and the
+  // four total 6.76e308, past f64's range: the column's variance, which the
+  // fit takes first to test for a constant column, has no value. Without
+  // this refusal the fit settles on lambda 1, as scikit-learn 1.9.0 does.
+  const fft::Schema schema{{{"a", "f64"}}};
+  for (const bool standardize : {true, false}) {
+    CAPTURE(standardize);
+    REQUIRE_THROWS_WITH(fitted("power_transform", {{"columns", {"a"}}, {"standardize", standardize}}, schema,
+                               {make_batch({"a"}, {f64_column({1.3e154, -1.3e154, 1.3e154, -1.3e154})})}),
+                        ContainsSubstring("column 'a': a sum over the fitted column left the range of f64"));
+  }
+}
+
 TEST_CASE("power_transform load_state rejects a malformed table") {
   auto fresh = [](bool standardize) {
     auto kernel = fft::make_kernel("power_transform", {{"columns", {"a"}}, {"standardize", standardize}});

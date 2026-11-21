@@ -1,7 +1,7 @@
 // Explicit C++ tests for ExactSum: its value, its terms and its refusals,
-// through add(), merge() and an Adder, against Shewchuk's partials written
-// out with no fast path, against 128-bit integer sums, and against values
-// worked out by hand.
+// through add(), merge() and an Adder, in its ordinary and its wide form,
+// against Shewchuk's partials written out with no fast path, against 128-bit
+// integer sums, and against values worked out by hand.
 
 #include "fastfeaturetransform/kernels/util.hpp"
 
@@ -180,6 +180,15 @@ std::optional<fft::ExactSum> through_adder(const std::vector<double>& values, bo
   return sum;
 }
 
+// The index of the first value a sum refuses, or nullopt when it takes all.
+template <typename Sum>
+std::optional<std::size_t> first_refusal(Sum& sum, const std::vector<double>& values) {
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (!sum.add(values[i])) return i;
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 TEST_CASE("ExactSum rounds the exact sum once, to nearest and half to even") {
@@ -356,6 +365,67 @@ TEST_CASE("ExactSum agrees with plain partials on adversarial values, in any ord
   }
 }
 
+TEST_CASE("ExactSum agrees with plain partials on sums through f64's top binade, in every split") {
+  // All but one of these running sums reach f64's top binade, which makes
+  // them wide, while every step of the plain partials stays finite in the
+  // order given: the partials are an oracle here too. Each expected sum is
+  // the exact sum, worked out by hand, rounded to f64.
+  struct Case {
+    std::string label;
+    std::vector<double> values;
+    double sum;
+  };
+  const std::vector<Case> cases{
+      {"the largest double alone", {kMax}, kMax},
+      {"under half a step past the largest double", {kMax, 0x1p969}, kMax},
+      {"in range by a hair", {0x1p1023, 0x1p971 - 0x1p969 - 0x1p960, 0x1p1023 - 0x1p972 + 0x1p970}, kMax},
+      {"through the top binade and back", {kMax, -kMax, 1.0}, 1.0},
+      {"cancelling in the top binade", {0x1.8p1023, -0x1p1023, 0x1.4p1023, -0x1.cp1023, 0x1p970}, 0x1p970},
+      {"small values under a large head", {0x1.fp1022, 1.0, 0x1p-1074, -1.0, 0x1p900}, 0x1.fp1022},
+      // The head, the carry, the spare and a partial all hold something when
+      // the head reaches the top binade.
+      {"entering the top binade with three terms",
+       {0x1.cp1022, 0x1p960, 0x1p900, 0x1p840, 0x1.cp1022, 0x1p1020},
+       0x1.ep1023},
+      {"under half a step past, small value last", {0x1.fffffffffffffp1022, 0x1.fffffffffffffp1022, 0x1.8p969}, kMax},
+  };
+  for (const Case& entry : cases) {
+    CAPTURE(entry.label);
+    Partials oracle;
+    REQUIRE(first_refusal(oracle, entry.values) == std::nullopt);
+    REQUIRE(bits(oracle.value()) == bits(entry.sum));
+    const std::vector<double> terms = terms_of(oracle);
+    fft::ExactSum sum;
+    REQUIRE(first_refusal(sum, entry.values) == std::nullopt);
+    REQUIRE(bits(sum.value()) == bits(entry.sum));
+    REQUIRE_FALSE(sum.outside_range());
+    REQUIRE(bits(sum.terms()) == bits(terms));
+    for (bool mixed : {true, false}) {
+      const std::optional<fft::ExactSum> through = through_adder(entry.values, mixed);
+      REQUIRE(through.has_value());
+      REQUIRE(bits(through->value()) == bits(entry.sum));
+      REQUIRE(bits(through->terms()) == bits(terms));
+    }
+    // Every split of the values, merged into a fresh sum, is the same sum.
+    for (std::size_t cut = 0; cut <= entry.values.size(); ++cut) {
+      CAPTURE(cut);
+      fft::ExactSum left;
+      fft::ExactSum right;
+      for (std::size_t i = 0; i < entry.values.size(); ++i) REQUIRE((i < cut ? left : right).add(entry.values[i]));
+      fft::ExactSum merged;
+      REQUIRE(merged.merge(left));
+      REQUIRE(merged.merge(right));
+      REQUIRE(bits(merged.value()) == bits(entry.sum));
+      REQUIRE(bits(merged.terms()) == bits(terms));
+    }
+  }
+  // A sum that still holds its three terms takes a merged sum that is in the
+  // top binade already.
+  fft::ExactSum fits = sum_of({0x1p1022, 0x1p-80});
+  REQUIRE(fits.merge(sum_of({0x1p1023, -0x1p-80})));
+  REQUIRE(fits.value() == 0x1.8p1023);
+}
+
 TEST_CASE("ExactSum keeps finite terms across overflowing partial sums in every order and split") {
   // The expectation in each case is an exact integer times 2^-1074,
   // rounded to f64. Even the smallest subnormal decides the overflow tie.
@@ -394,6 +464,116 @@ TEST_CASE("ExactSum keeps finite terms across overflowing partial sums in every 
   }
 }
 
+TEST_CASE("ExactSum rounds a wide sum to nearest and half to even, reading every bit below its last place") {
+  // The largest double twice and its negation twice take a sum out of f64's
+  // range and back, which leaves it wide and the tail its whole value. A wide
+  // sum counts units of 2^-1074 in 64-bit words: 2^53 + 1 has its guard bit,
+  // the one below its last place, at bit 50 of word 16. Each expectation is
+  // the tail's exact sum, rounded to f64 by hand.
+  const std::vector<double> wide{kMax, kMax, -kMax, -kMax};
+  struct Case {
+    std::vector<double> tail;
+    double rounded;
+  };
+  const std::vector<Case> cases{
+      // A tie on an even significand stays; on an odd one it rounds up.
+      {{0x1p53, 1.0}, 0x1p53},
+      {{0x1p53 + 2.0, 1.0}, 0x1p53 + 4.0},
+      // A sticky bit in a word below the guard word: 2^-1074, bit 0 of word 0.
+      {{0x1p53, 1.0, 0x1p-1074}, 0x1p53 + 2.0},
+      // A sticky bit in the guard word: 2^-40, bit 10 of word 16.
+      {{0x1p53, 1.0, 0x1p-40}, 0x1p53 + 2.0},
+      // The same below zero, where the words hold the two's complement, and
+      // a sum just short of a tie, whose guard bit is clear.
+      {{-0x1p53, -1.0}, -0x1p53},
+      {{-0x1p53, -1.0, -0x1p-1074}, -0x1p53 - 2.0},
+      {{-0x1p53, -1.0, -0x1p-40}, -0x1p53 - 2.0},
+      {{-0x1p53, -1.0, 0x1p-1074}, -0x1p53},
+      // At the top, guard bit 60 of word 31: a tie on the even significand
+      // below the largest double, and the same with a sticky bit in word 0.
+      {{0x1.ffffffffffffep1023, 0x1p970}, 0x1.ffffffffffffep1023},
+      {{0x1.ffffffffffffep1023, 0x1p970, 0x1p-1074}, kMax},
+      // At the bottom, guard bit 0 of word 0, which no word lies below.
+      {{0x1p-1021, 0x1p-1074}, 0x1p-1021},
+      {{0x1p-1021 + 0x1p-1073, 0x1p-1074}, 0x1p-1021 + 0x1p-1072},
+  };
+  for (const Case& entry : cases) {
+    CAPTURE(entry.tail);
+    std::vector<double> values = wide;
+    values.insert(values.end(), entry.tail.begin(), entry.tail.end());
+    const fft::ExactSum sum = sum_of(values);
+    REQUIRE(bits(sum.value()) == bits(entry.rounded));
+    // The terms read the bits below the last place too: they are the plain
+    // partials' terms of the tail alone.
+    REQUIRE(bits(sum.terms()) == bits(terms_of(partials_of(entry.tail))));
+    for (bool mixed : {true, false}) REQUIRE(bits(through_adder(values, mixed)->value()) == bits(entry.rounded));
+    // A wide sum that merges the tail, and the tail that merges a wide sum.
+    fft::ExactSum into_wide = sum_of(wide);
+    REQUIRE(into_wide.merge(sum_of(entry.tail)));
+    REQUIRE(bits(into_wide.value()) == bits(entry.rounded));
+    fft::ExactSum into_tail = sum_of(entry.tail);
+    REQUIRE(into_tail.merge(sum_of(wide)));
+    REQUIRE(bits(into_tail.value()) == bits(entry.rounded));
+  }
+}
+
+TEST_CASE("ExactSum taken past f64's range and back answers as the plain partials of the values in between") {
+  // Each prefix makes the sum wide: past f64's range, or in its top binade.
+  // The same values negated, in reverse order, bring it back, and the sum
+  // must then be the plain partials' sum of the values in between, bit for
+  // bit, and so must its terms, which read every bit below the last place.
+  // Split, a third of the values and the negated prefix go to a second sum,
+  // which the first merges at the end.
+  const std::vector<std::vector<double>> prefixes{
+      {kMax, kMax}, {-kMax, -kMax}, {kMax, 0x1p969, 0x1p969}, {0x1.8p1022, 0x1p-80, kMax}, {0x1.4p1023}};
+  uint64_t state = 29;
+  for (const std::vector<double>& prefix : prefixes) {
+    for (bool split : {false, true}) {
+      CAPTURE(prefix, split);
+      fft::ExactSum sum;
+      fft::ExactSum other;
+      Partials oracle;
+      for (double x : prefix) REQUIRE(sum.add(x));
+      for (int i = 0; i < 2000; ++i) {
+        const double value = full(state, between(state, -1074, 960));
+        REQUIRE(oracle.add(value));
+        REQUIRE((split && i % 3 == 0 ? other : sum).add(value));
+      }
+      for (auto x = prefix.rbegin(); x != prefix.rend(); ++x) REQUIRE((split ? other : sum).add(-*x));
+      REQUIRE(sum.merge(other));
+      REQUIRE(bits(sum.value()) == bits(oracle.value()));
+      REQUIRE_FALSE(sum.outside_range());
+      REQUIRE(bits(sum.terms()) == bits(terms_of(oracle)));
+    }
+  }
+}
+
+TEST_CASE("ExactSum agrees with scaled partials on a wide sum of values a few binades apart, read after every add") {
+  // Values within a few binades leave few bits below the sum's last place,
+  // so ties and lone sticky bits, on both sides of a word boundary, are
+  // common. The oracle sums every value times 2^-64, which is exact for
+  // values of 2^-958 or more, and keeps the sum inside f64's range.
+  uint64_t state = 31;
+  const int spans[] = {0, 1, 3, 8, 60};
+  for (int round = 0; round < 200; ++round) {
+    const int span = spans[round % 5];
+    const int low = between(state, -958, 1000 - span);
+    fft::ExactSum sum;
+    Partials scaled;
+    for (double big : {kMax, kMax, -kMax, -kMax}) {
+      REQUIRE(sum.add(big));
+      REQUIRE(scaled.add(std::ldexp(big, -64)));
+    }
+    for (int i = 0; i < 60; ++i) {
+      const double value = full(state, between(state, low, low + span));
+      CAPTURE(round, span, low, i, value);
+      REQUIRE(sum.add(value));
+      REQUIRE(scaled.add(std::ldexp(value, -64)));
+      REQUIRE(bits(sum.value()) == bits(std::ldexp(scaled.value(), 64)));
+    }
+  }
+}
+
 TEST_CASE("ExactSum refuses non-finite inputs and only a finite rounded sum has terms") {
   for (double value : {kInfinity, -kInfinity, kNaN}) {
     for (double head : {0.0, 1.0, kMax}) {
@@ -411,6 +591,86 @@ TEST_CASE("ExactSum refuses non-finite inputs and only a finite rounded sum has 
   REQUIRE_THROWS_AS(sum.terms(), fft::Error);
   REQUIRE(sum.add(-kMax));
   REQUIRE(sum.terms() == std::vector<double>{kMax, 0x1p-1073});
+}
+
+TEST_CASE("ExactSum leaves a sum as it was when it refuses a value, and goes on as the plain partials do") {
+  // Each list ends in a value that is not finite. The twelve powers of two
+  // 54 binades apart fill the three terms and nine partials, so the values
+  // after them that spill take the long walk.
+  std::vector<std::vector<double>> lists{
+      {kInfinity}, {-kInfinity}, {kNaN}, {1.0, 2.0, -kInfinity}, {1.0, 0x1p-60, 0x1p-120, 0x1p-180, kNaN}};
+  lists.emplace_back();
+  for (int exponent = 600; exponent > 600 - 12 * 54; exponent -= 54) lists.back().push_back(std::ldexp(1.0, exponent));
+  lists.back().push_back(kNaN);
+  uint64_t state = 11;
+  for (const std::vector<double>& values : lists) {
+    CAPTURE(values);
+    const std::size_t last = values.size() - 1;
+    Partials oracle;
+    for (std::size_t i = 0; i < last; ++i) REQUIRE(oracle.add(values[i]));
+    fft::ExactSum sum;
+    REQUIRE(first_refusal(sum, values) == last);
+    REQUIRE(bits(sum.value()) == bits(oracle.value()));
+    // An Adder refuses it too, with either add, and writes back the sum
+    // without it.
+    fft::ExactSum through;
+    {
+      fft::ExactSum::Adder adder(through);
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        REQUIRE((i % 2 == 0 ? adder.add(values[i]) : adder.add_short(values[i])) == (i < last));
+      }
+    }
+    REQUIRE(bits(through.value()) == bits(oracle.value()));
+    for (int i = 0; i < 2000; ++i) {
+      const double value = full(state, between(state, -60, 1000));
+      CAPTURE(i, value);
+      REQUIRE(sum.add(value));
+      REQUIRE(oracle.add(value));
+      REQUIRE(bits(sum.value()) == bits(oracle.value()));
+    }
+    REQUIRE(bits(sum.terms()) == bits(terms_of(oracle)));
+  }
+  // An infinity offered to an empty sum leaves nothing behind.
+  fft::ExactSum empty;
+  REQUIRE_FALSE(empty.add(kInfinity));
+  REQUIRE(bits(empty.value()) == bits(0.0));
+  REQUIRE(empty.add(1.5));
+  REQUIRE(empty.value() == 1.5);
+}
+
+TEST_CASE("ExactSum::clear after a wide sum starts the next sum from zero, ordinary or wide") {
+  // The largest double twice is past f64's range, which makes the sum wide.
+  fft::ExactSum sum = sum_of({kMax, kMax});
+  REQUIRE(sum.outside_range());
+  sum.clear();
+  // Ordinary again: the terms hold the sum, not the accumulator clear()
+  // kept, whichever reads or merges it.
+  REQUIRE(bits(sum.value()) == bits(0.0));
+  REQUIRE_FALSE(sum.outside_range());
+  REQUIRE(sum.add(1.5));
+  REQUIRE(sum.value() == 1.5);
+  REQUIRE(sum.terms() == std::vector<double>{1.5});
+  fft::ExactSum into = sum_of({0.25});
+  REQUIRE(into.merge(sum));
+  REQUIRE(into.value() == 1.75);
+  REQUIRE(sum.merge(sum_of({0.25})));
+  REQUIRE(sum.value() == 1.75);
+  // Wide again, from zero: nothing of the sum before clear() is left.
+  for (double big : {kMax, kMax, -kMax, -kMax}) REQUIRE(sum.add(big));
+  REQUIRE(sum.value() == 1.75);
+  REQUIRE(sum.terms() == std::vector<double>{1.75});
+  // The same through an Adder, which widens the sum while it holds the
+  // terms, and through a merge, which widens the sum it merges into.
+  sum.clear();
+  {
+    fft::ExactSum::Adder adder(sum);
+    for (double value : {3.0, 0x1p1023, 0x1p1023, -0x1p1023, -0x1p1023}) REQUIRE(adder.add(value));
+  }
+  REQUIRE(sum.value() == 3.0);
+  sum.clear();
+  REQUIRE(sum.add(-2.0));
+  REQUIRE(sum.merge(sum_of({kMax, kMax, -kMax, -kMax})));
+  REQUIRE(sum.value() == -2.0);
 }
 
 TEST_CASE("ExactSum terms depend on the sum's value alone") {

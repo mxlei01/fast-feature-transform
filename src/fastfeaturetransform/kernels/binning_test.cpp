@@ -430,6 +430,28 @@ TEST_CASE("k_bins_discretize's kmeans refuses a center midpoint that is not fini
   REQUIRE_THROWS_WITH(fit({-0.7e308, -0.7e308, 0.9e308, 1e308}, 3), ContainsSubstring(not_finite));
 }
 
+TEST_CASE("k_bins_discretize's kmeans refuses a column whose completed sum rounds past f64") {
+  const fft::Schema schema{{{"x", "f64"}}};
+  const auto fit = [&](const std::vector<double>& values) {
+    const nlohmann::json params{{"columns", {"x"}}, {"n_bins", 2}, {"encode", "ordinal"}, {"strategy", "kmeans"}};
+    return fit_binning("k_bins_discretize", params, schema, {make_batch({"x"}, {f64_column(values)})});
+  };
+  // The mean is the first thing the fit takes, and a sum past f64 has none:
+  // without this refusal the first fit fails later on an edge that is not
+  // finite, and the second on its span. scikit-learn 1.9.0 fits the first
+  // to the edges [1] and refuses the second ("Input contains NaN").
+  const std::string past = "column 'x' sums past the range of f64";
+  REQUIRE_THROWS_WITH(fit({1e308, 1e308, 1.0}), ContainsSubstring(past));
+  const double largest = std::numeric_limits<double>::max();
+  REQUIRE_THROWS_WITH(fit({largest, largest, -1e308}), ContainsSubstring(past));
+  // A running sum that passes f64 and comes back is no reason to refuse: the
+  // mean is 2.5e307, the clusters are the two pairs, and the inner edge is
+  // the midpoint of their centers. scikit-learn 1.9.0 keeps only the edge
+  // -5e307 here: numpy's running sum for the column's mean overflows.
+  const nlohmann::json state = fit({1e308, 1e308, -5e307, -5e307})->state();
+  REQUIRE(state.at("bin_edges").at("x").get<std::vector<double>>() == std::vector<double>{-5e307, 2.5e307, 1e308});
+}
+
 TEST_CASE("quantile_transform interpolates between quantiles too close for numpy's slope") {
   // REGRESSION: a rank between two quantiles closer than the reference step
   // over f64's largest is a number in [0, 1]. numpy's slope overflows there,

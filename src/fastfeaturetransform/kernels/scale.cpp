@@ -1223,9 +1223,11 @@ class Normalize final : public Kernel {
         held = held && adder.add(norm_ == Norm::L1 ? std::fabs(value) : value * value);
       }
     }
-    if (!held || total.outside_range())
-      throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
-    return handle_zeros(norm_ == Norm::L1 ? total.value() : std::sqrt(total.value()));
+    // Rounded once: a sum in the top binade of f64 is wide, and each reading
+    // rounds all its words.
+    const double sum = total.value();
+    if (!held || !std::isfinite(sum)) throw Error(stage + ": a row's " + norm_name() + " norm leaves the range of f64");
+    return handle_zeros(norm_ == Norm::L1 ? sum : std::sqrt(sum));
   }
 
   std::vector<std::string> columns_;

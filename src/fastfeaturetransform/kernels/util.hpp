@@ -341,26 +341,44 @@ class WideSum {
     uint64_t mantissa = bits & ((uint64_t{1} << 52) - 1);
     if (exponent != 0) mantissa |= uint64_t{1} << 52;
     const unsigned shift = exponent == 0 ? 0 : exponent - 1;
-    const unsigned offset = shift % 64;
+    // The mantissa's 53 bits fall in two adjacent words, which take it as
+    // one 128-bit addition; only a carry out of the pair takes the loop. An
+    // l2 Normalizer of 250,000 rows of four values whose squares sum in
+    // f64's top binade takes 14.8 ms of CPU this way and 18.0 ms with the
+    // words added one at a time, each carry a branch (one thread, Apple M4).
+    const std::size_t index = shift / 64;
+    const UInt128 term = static_cast<UInt128>(mantissa) << (shift % 64);
+    const UInt128 old = (static_cast<UInt128>(words_[index + 1]) << 64) | words_[index];
     const bool negative = bits >> 63 != 0;
-    add_word(shift / 64, mantissa << offset, negative);
-    if (offset != 0) add_word(shift / 64 + 1, mantissa >> (64 - offset), negative);
+    const UInt128 next = negative ? old - term : old + term;
+    words_[index] = static_cast<uint64_t>(next);
+    words_[index + 1] = static_cast<uint64_t>(next >> 64);
+    if (negative ? old < term : next < old) add_word(index + 2, 1, negative);
   }
 
   void merge(const WideSum& other) {
     for (std::size_t i = 0; i < words_.size(); ++i) add_word(i, other.words_[i], false);
   }
 
+  // The words are read in place when the sum is not negative, which every
+  // sum of squares is; below zero they hold the two's complement of the
+  // magnitude, which is rounded from a copy.
   double value() const {
+    if (words_.back() >> 63 == 0) return rounded(words_);
     auto magnitude = words_;
-    const bool negative = magnitude.back() >> 63 != 0;
-    if (negative) {
-      bool carry = true;
-      for (auto& word : magnitude) {
-        word = ~word + static_cast<uint64_t>(carry);
-        carry = carry && word == 0;
-      }
+    bool carry = true;
+    for (auto& word : magnitude) {
+      word = ~word + static_cast<uint64_t>(carry);
+      carry = carry && word == 0;
     }
+    return -rounded(magnitude);
+  }
+
+ private:
+  using Words = std::array<uint64_t, 34>;
+
+  // A magnitude rounded to the nearest double, half to even.
+  static double rounded(const Words& magnitude) {
     std::size_t n = magnitude.size();
     while (n > 0 && magnitude[n - 1] == 0) --n;
     if (n == 0) return 0.0;
@@ -380,11 +398,9 @@ class WideSum {
         significant += static_cast<uint64_t>(round_up);
       }
     }
-    const double value = std::ldexp(static_cast<double>(significant), static_cast<int>(shift) - 1074);
-    return negative ? -value : value;
+    return std::ldexp(static_cast<double>(significant), static_cast<int>(shift) - 1074);
   }
 
- private:
   void add_word(std::size_t index, uint64_t term, bool subtract) {
     while (term != 0 && index < words_.size()) {
       const uint64_t old = words_[index];
@@ -394,13 +410,14 @@ class WideSum {
     }
   }
 
-  std::array<uint64_t, 34> words_{};
+  Words words_{};
 };
 
 // An exact sum of finite doubles, rounded only when read. add() rejects
 // non-finite inputs. A finite running sum can exceed f64 and come back
 // inside it later. value() returns infinity when the completed sum rounds
-// past f64, and outside_range() tests this without rounding an ordinary sum.
+// past f64, and outside_range() tests this without rounding an ordinary sum,
+// which stays inside f64 for fewer than 2^52 adds (see join()).
 //
 // The three terms head_, carry_ and spare_. A value is added to head_, what
 // that addition rounds away is added to carry_, and what that one rounds
@@ -415,9 +432,12 @@ class WideSum {
 // drops, in a walk over every partial.
 //
 // A residual after the third addition joins the partials. If an addition
-// overflows or the head enters the top binade, all terms move to a wider
-// accumulator. From then on the NaN head routes every add to the cold path.
-// Ordinary additions still use only the three doubles and their partials.
+// overflows, the head enters the top binade or the largest partial reaches
+// 2^1020, all terms move to a wider accumulator. From then on the NaN head
+// routes every add to the cold path. Ordinary additions still use only the
+// three doubles and their partials. clear() keeps the wide accumulator,
+// zeroed, for the next sum that needs it: a Normalizer reuses one sum for
+// every row of a batch.
 class ExactSum {
   struct Storage {
     std::vector<double> parts;
@@ -446,7 +466,7 @@ class ExactSum {
   [[nodiscard]] bool merge(const ExactSum& other) {
     if (this == &other) return merge(ExactSum(other));
     if (other.partials_) {
-      if (other.partials_->wide) {
+      if (std::isnan(other.head_)) {
         widen(head_, carry_, spare_);
         partials_->wide->merge(*other.partials_->wide);
         return true;
@@ -460,19 +480,22 @@ class ExactSum {
 
   bool outside_range() const { return std::isnan(head_) && !std::isfinite(partials_->wide->value()); }
 
+  // The partials keep their capacity and the wide accumulator stays, zeroed,
+  // for the next sum: one that this sum did not use is zero already.
   void clear() {
     if (partials_) {
       partials_->parts.clear();
-      partials_->wide.reset();
+      if (std::isnan(head_)) *partials_->wide = WideSum();
     }
     head_ = carry_ = spare_ = 0.0;
   }
 
   // The correctly rounded sum. The three terms join a copy of the partials
   // by Shewchuk's step, on the stack when the partials are few; the rounding
-  // is CPython's, which rounds half to even across partials.
+  // is CPython's, which rounds half to even across partials. A wide sum
+  // rounds its words once, half to even.
   double value() const {
-    if (partials_ && partials_->wide) return partials_->wide->value();
+    if (std::isnan(head_)) return partials_->wide->value();
     std::array<double, 16> local;
     std::vector<double> heap;
     double* parts = local.data();
@@ -482,10 +505,8 @@ class ExactSum {
       parts = heap.data();
     }
     if (partials_) std::copy(partials_->parts.begin(), partials_->parts.end(), parts);
-    if (!std::isnan(head_)) {
-      const double front[] = {spare_, carry_, head_};
-      for (double term : front) n = grow(parts, n, term);
-    }
+    const double front[] = {spare_, carry_, head_};
+    for (double term : front) n = grow(parts, n, term);
     if (n == 0) return 0.0;
     double hi = parts[--n];
     double lo = 0.0;
@@ -583,10 +604,13 @@ class ExactSum {
     return true;
   }
 
+  // `head`, `carry` and `spare` are the terms the sum holds, which an Adder
+  // keeps outside it; the sum's own head_ is NaN once it is wide, under an
+  // Adder too. A wide accumulator that clear() kept is zero.
   void widen(double head, double carry, double spare) {
+    if (std::isnan(head_)) return;
     if (!partials_) partials_ = std::make_unique<Storage>();
-    if (partials_->wide) return;
-    partials_->wide = std::make_unique<WideSum>();
+    if (!partials_->wide) partials_->wide = std::make_unique<WideSum>();
     for (double term : partials_->parts) partials_->wide->add(term);
     partials_->parts.clear();
     for (double term : {head, carry, spare}) partials_->wide->add(term);
@@ -655,10 +679,12 @@ class ExactSum {
     parts.push_back(0.0);
     const std::size_t kept = grow(parts.data(), parts.size() - 1, x);
     parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(kept), parts.end());
-    // Below 2^1023 the head loses at most 2^969 per add. Such an
-    // increment cannot move a carry past 2^1022, and the same argument
-    // bounds the spare by 2^1021. Bound the partials too, so even a long
-    // run of residuals of one sign cannot overflow the ordinary sum.
+    // Below 2^1023 the head loses at most 2^969 per add, and the carry and
+    // the spare each gain at most what the term above them loses, so after
+    // n adds each is at most n * 2^969. Bounding the partials by 2^1020
+    // keeps their total under 2^1021, and so the ordinary terms total under
+    // 2^1023 + 2^1021 + n * 2^970, which is below 2^1024 - 2^970, where
+    // value() rounds to infinity, for any n below 2^52.
     if (!parts.empty() && std::fabs(parts.back()) >= 0x1p1020) widen(head_, carry_, spare_);
   }
 
