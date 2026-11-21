@@ -1,6 +1,8 @@
 """Tests for batched transforms: exact values, part order, batch sizing, and cleanup after a failure."""
 
 import json
+import subprocess  # nosec B404
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -167,6 +169,126 @@ def test_a_plain_list_keeps_its_footer_width_through_later_stages(tmp_path: Path
         metadata = pq.ParquetFile(pipeline.transform_parquet([source], output_dir=tmp_path / name)[0]).metadata
         largest[name] = max(metadata.row_group(group).num_rows for group in range(metadata.num_row_groups))
     assert largest["plain"] == largest["fixed"] < rows
+
+
+# A child process fits a LabelEncoder on a clean file and transforms it, then
+# fits one on, and transforms, a copy whose dictionary pages each state
+# CLAIMED_BYTES. It prints the two errors and how far they raised its peak
+# memory over the reads of the clean file.
+PAGE_CLAIM_CHILD: str = """
+import resource
+import sys
+
+from fast_feature_transform import EngineError, LabelEncoder
+
+
+def peak():
+    if sys.platform != "linux":
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # macOS reports bytes
+    # On Linux ru_maxrss starts at the peak of the process that started this
+    # one. The high-water mark in /proc belongs to this process alone.
+    with open("/proc/self/status", encoding="ascii") as status:
+        for line in status:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024  # kilobytes
+    raise RuntimeError("no VmHWM line in /proc/self/status")
+
+
+clean, damaged, threads, output = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+fitted = LabelEncoder(columns=["s"]).fit([clean], threads=threads)
+fitted.transform_parquet([clean], output_dir=output + "/clean")
+before = peak()
+try:
+    LabelEncoder(columns=["s"]).fit([damaged], threads=threads)
+except EngineError as error:
+    print(error)
+try:
+    fitted.transform_parquet([damaged], output_dir=output + "/damaged")
+except EngineError as error:
+    print(error)
+print(peak() - before)
+"""
+# Close to the most a page header's varint states in four bytes,
+# 134,217,727. Requested and filled with zeros, these bytes raised the child's
+# peak memory by 134 MB at one thread and by 537 MB at four, where each thread
+# read a damaged page (Apple M4).
+CLAIMED_BYTES: int = 134_000_000
+# Refused before the request, the damaged reads raise it by less than 0.4 MB
+# at one thread and at four. The bound sits between.
+MAX_CLAIM_PEAK_GROWTH_BYTES: int = 32_000_000
+
+
+def _restate_compressed_size(data: bytearray, header: int, value: int) -> None:
+    """Rewrite the compressed size that the page header at ``header`` states, in place.
+
+    Arrow's writer opens a page header with fields 1 (the type), 2 (the uncompressed size) and 3 (the compressed
+    size), each an i32 (a byte 0x15) that holds a zigzag varint.
+
+    Args:
+        data: The bytes of a Parquet file.
+        header: Where the page header starts.
+        value: The size to state, whose varint takes as many bytes as the one it replaces.
+
+    """
+    at = header
+    for field in (1, 2, 3):
+        assert data[at] == 0x15
+        end = at + 1
+        while data[end] & 0x80:
+            end += 1
+        end += 1
+        if field == 3:
+            varint = bytearray()
+            rest = value << 1
+            while True:
+                varint.append((rest & 0x7F) | (0x80 if rest > 0x7F else 0))
+                rest >>= 7
+                if not rest:
+                    break
+            assert len(varint) == end - at - 1
+            data[at + 1 : end] = varint
+        at = end
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_a_page_that_states_more_bytes_than_its_chunk_holds_is_refused_before_they_are_requested(
+    tmp_path: Path, threads: int
+) -> None:
+    # REGRESSION: the reader refuses such a page before it requests the
+    # stated bytes. It used to request them, and fill them with zeros, before
+    # Arrow refused the page.
+    # Four row groups, one for each thread, whose dictionary page holds a
+    # value of 1,100,000 bytes: the page's size takes four bytes.
+    clean = tmp_path / "clean.parquet"
+    pq.write_table(pa.table({"s": ["x" * 1_100_000, "a", "b"] * 4}), clean, row_group_size=3, compression="NONE")
+    data = bytearray(clean.read_bytes())
+    metadata = pq.ParquetFile(clean).metadata
+    assert metadata.num_row_groups == 4
+    for group in range(metadata.num_row_groups):
+        _restate_compressed_size(data, metadata.row_group(group).column(0).dictionary_page_offset, CLAIMED_BYTES)
+    damaged = tmp_path / "damaged.parquet"
+    damaged.write_bytes(bytes(data))
+    # A warning is an error in the child, as it is in this process.
+    command = [
+        sys.executable,
+        "-W",
+        "error",
+        "-c",
+        PAGE_CLAIM_CHILD,
+        str(clean),
+        str(damaged),
+        str(threads),
+        str(tmp_path),
+    ]
+    child = subprocess.run(command, check=True, capture_output=True, text=True, cwd=tmp_path)  # nosec B603
+    *errors, growth = child.stdout.splitlines()
+    assert int(growth) < MAX_CLAIM_PEAK_GROWTH_BYTES, f"the damaged reads raised the peak by {int(growth) / 1e6:.1f} MB"
+    assert len(errors) == 2
+    for error in errors:
+        assert error.startswith(f"{damaged}: failed to read row group ")
+        assert (
+            f": column 's' cannot be decoded: Invalid: a page states {CLAIMED_BYTES} bytes where its column " in error
+        )
 
 
 def test_late_transform_failures_clean_output_and_keep_previous_memmap(tmp_path: Path) -> None:

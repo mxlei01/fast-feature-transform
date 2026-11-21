@@ -378,8 +378,11 @@ std::optional<std::string_view> next_plain_value(const uint8_t*& at, const uint8
   return value;
 }
 
-// Tracks the dictionary count and data page encodings as Arrow reads them,
-// and bounds the indices of each data page by the dictionary page's count.
+// The pages of a column chunk as Arrow reads them. A dictionary page that
+// states more values than its bytes hold is refused before Arrow decodes it.
+// For a leaf that `chunks` watches, this also tracks the dictionary count
+// and data page encodings, and bounds the indices of each data page by the
+// dictionary page's count.
 //
 // Arrow's reader of strings as a dictionary decodes each page of indices
 // without a bounds check, and appends the values of the plain pages that a
@@ -394,14 +397,20 @@ class WatchedPages final : public parquet::PageReader {
  public:
   WatchedPages(std::unique_ptr<parquet::PageReader> pages, std::vector<DictionaryChunk>& chunks, std::size_t leaf,
                const parquet::ColumnDescriptor& column)
-      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf), column_(column) {
-    chunks_[leaf_] = DictionaryChunk{};
-    chunks_[leaf_].watched = true;
+      : pages_(std::move(pages)), chunks_(chunks), leaf_(leaf), column_(column), watched_(chunks[leaf].watched) {
+    if (watched_) {
+      chunks_[leaf_] = DictionaryChunk{};
+      chunks_[leaf_].watched = true;
+    }
   }
 
   std::shared_ptr<parquet::Page> NextPage() override {
     std::shared_ptr<parquet::Page> page = pages_->NextPage();
     if (page == nullptr) return page;
+    if (page->type() == parquet::PageType::DICTIONARY_PAGE) {
+      check_values(static_cast<const parquet::DictionaryPage&>(*page));
+    }
+    if (!watched_) return page;
     DictionaryChunk& chunk = chunks_[leaf_];
     if (page->type() == parquet::PageType::DICTIONARY_PAGE) {
       const auto& dictionary = static_cast<const parquet::DictionaryPage&>(*page);
@@ -433,6 +442,45 @@ class WatchedPages final : public parquet::PageReader {
   void set_max_page_header_size(uint32_t size) override { pages_->set_max_page_header_size(size); }
 
  private:
+  // Refuses `page` when its header states more values than its bytes hold.
+  // Arrow decodes only PLAIN dictionary pages, which format 1.0 marks
+  // PLAIN_DICTIONARY, into an array that it sizes by the count the header
+  // states before it decodes a value. A PLAIN value takes its type's width,
+  // a bool one bit, and a string or bytes value at least the 4 bytes of its
+  // length.
+  void check_values(const parquet::DictionaryPage& page) const {
+    if (page.encoding() != parquet::Encoding::PLAIN && page.encoding() != parquet::Encoding::PLAIN_DICTIONARY) return;
+    int64_t bits = 0;
+    switch (column_.physical_type()) {
+      case parquet::Type::BOOLEAN:
+        bits = 1;
+        break;
+      case parquet::Type::INT32:
+      case parquet::Type::FLOAT:
+      case parquet::Type::BYTE_ARRAY:
+        bits = 32;
+        break;
+      case parquet::Type::INT64:
+      case parquet::Type::DOUBLE:
+        bits = 64;
+        break;
+      case parquet::Type::INT96:
+        bits = 96;
+        break;
+      case parquet::Type::FIXED_LEN_BYTE_ARRAY:
+        bits = 8 * int64_t{column_.type_length()};
+        break;
+      default:
+        break;
+    }
+    if (bits <= 0) return;
+    const int64_t most = int64_t{page.size()} * 8 / bits;
+    if (page.num_values() <= most) return;
+    throw parquet::ParquetStatusException(arrow::Status::Invalid("a dictionary page states ", page.num_values(),
+                                                                 " values where its ", page.size(),
+                                                                 " bytes hold at most ", most));
+  }
+
   // The first index of data page `page` at or past `entries`, or nullopt.
   // Arrow decodes an index for each definition level that reaches the
   // leaf's maximum, so exactly those are checked. A page whose levels or
@@ -510,33 +558,104 @@ class WatchedPages final : public parquet::PageReader {
   std::vector<DictionaryChunk>& chunks_;
   std::size_t leaf_;
   const parquet::ColumnDescriptor& column_;
+  bool watched_;
   parquet::LevelDecoder repetitions_;
   parquet::LevelDecoder definitions_;
   std::unique_ptr<parquet::DictDecoder<parquet::ByteArrayType>> indices_;
   std::array<int32_t, 1024> decoded_{};
 };
 
-// A row group of a WatchedFile: the pages of each watched leaf pass through
-// WatchedPages.
+// The bytes of a column chunk as Arrow's page reader reads them, refusing a
+// read of more bytes than the chunk has left before the stream under it is
+// asked for them. The page reader reads a page by the size its header
+// states, up to 2 GiB, and the buffered stream under it requests that many
+// bytes and fills what the chunk does not hold with zeros before the page
+// is refused.
+class ChunkStream final : public arrow::io::InputStream {
+ public:
+  ChunkStream(std::shared_ptr<arrow::io::InputStream> stream, int64_t length)
+      : stream_(std::move(stream)), left_(length) {}
+
+  arrow::Status Close() override { return stream_->Close(); }
+  bool closed() const override { return stream_->closed(); }
+  arrow::Result<int64_t> Tell() const override { return stream_->Tell(); }
+  arrow::Result<std::string_view> Peek(int64_t nbytes) override { return stream_->Peek(nbytes); }
+
+  arrow::Result<int64_t> Read(int64_t nbytes, void* out) override {
+    ARROW_RETURN_NOT_OK(check(nbytes));
+    ARROW_ASSIGN_OR_RAISE(const int64_t read, stream_->Read(nbytes, out));
+    left_ -= read;
+    return read;
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
+    ARROW_RETURN_NOT_OK(check(nbytes));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> read, stream_->Read(nbytes));
+    left_ -= read->size();
+    return read;
+  }
+
+ private:
+  arrow::Status check(int64_t nbytes) const {
+    if (nbytes <= left_) return arrow::Status::OK();
+    return arrow::Status::Invalid("a page states ", nbytes, " bytes where its column chunk has ", left_, " left");
+  }
+
+  std::shared_ptr<arrow::io::InputStream> stream_;
+  int64_t left_;
+};
+
+// A row group of a WatchedFile. Each column chunk's pages are opened as
+// Arrow's row group reader opens them, except that they are read through a
+// ChunkStream, and pass through WatchedPages. An encrypted chunk, which
+// needs a key the engine never has, and a chunk that the footer places
+// outside the file are left to Arrow's reader, which refuses both before it
+// reads a page.
 class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
  public:
   WatchedRowGroup(std::shared_ptr<parquet::RowGroupReader> group, parquet::ReaderProperties properties,
-                  std::vector<DictionaryChunk>& chunks)
-      : group_(std::move(group)), properties_(std::move(properties)), chunks_(chunks) {}
+                  std::vector<DictionaryChunk>& chunks, std::shared_ptr<arrow::io::RandomAccessFile> input,
+                  int64_t size, bool short_chunks, bool always_compressed)
+      : group_(std::move(group)),
+        properties_(std::move(properties)),
+        chunks_(chunks),
+        input_(std::move(input)),
+        size_(size),
+        short_chunks_(short_chunks),
+        always_compressed_(always_compressed) {}
 
   std::unique_ptr<parquet::PageReader> GetColumnPageReader(int i) override {
-    std::unique_ptr<parquet::PageReader> pages = group_->GetColumnPageReader(i);
-    const auto leaf = static_cast<std::size_t>(i);
-    if (!chunks_[leaf].watched) return pages;
-    return std::make_unique<WatchedPages>(std::move(pages), chunks_, leaf, *group_->metadata()->schema()->Column(i));
+    return std::make_unique<WatchedPages>(open_pages(i), chunks_, static_cast<std::size_t>(i),
+                                          *group_->metadata()->schema()->Column(i));
   }
   const parquet::RowGroupMetaData* metadata() const override { return group_->metadata(); }
   const parquet::ReaderProperties* properties() const override { return &properties_; }
 
  private:
+  std::unique_ptr<parquet::PageReader> open_pages(int i) {
+    const std::unique_ptr<parquet::ColumnChunkMetaData> chunk = group_->metadata()->ColumnChunk(i);
+    int64_t start = chunk->data_page_offset();
+    if (chunk->has_dictionary_page() && chunk->dictionary_page_offset() > 0 &&
+        start > chunk->dictionary_page_offset()) {
+      start = chunk->dictionary_page_offset();
+    }
+    int64_t length = chunk->total_compressed_size();
+    if (chunk->crypto_metadata() != nullptr || start < 0 || length < 0 || start > size_ || length > size_ - start) {
+      return group_->GetColumnPageReader(i);
+    }
+    if (short_chunks_) length += std::min<int64_t>(100, size_ - start - length);
+    return parquet::PageReader::Open(
+        std::make_shared<ChunkStream>(properties_.GetStream(input_, start, length), length), chunk->num_values(),
+        chunk->compression(), properties_, *group_->metadata()->schema()->Column(i), always_compressed_);
+  }
+
   std::shared_ptr<parquet::RowGroupReader> group_;
   parquet::ReaderProperties properties_;
   std::vector<DictionaryChunk>& chunks_;
+  std::shared_ptr<arrow::io::RandomAccessFile> input_;
+  int64_t size_;  // of the file
+  bool short_chunks_;
+  bool always_compressed_;
 };
 
 // A Parquet file whose row groups are WatchedRowGroups. Arrow pre-buffers a
@@ -545,13 +664,26 @@ class WatchedRowGroup final : public parquet::RowGroupReader::Contents {
 class WatchedFile final : public parquet::ParquetFileReader::Contents {
  public:
   WatchedFile(std::unique_ptr<parquet::ParquetFileReader::Contents> file, parquet::ReaderProperties properties,
-              std::vector<DictionaryChunk>& chunks)
-      : file_(std::move(file)), properties_(std::move(properties)), chunks_(chunks) {}
+              std::vector<DictionaryChunk>& chunks, std::shared_ptr<arrow::io::RandomAccessFile> input, int64_t size)
+      : file_(std::move(file)),
+        properties_(std::move(properties)),
+        chunks_(chunks),
+        input_(std::move(input)),
+        size_(size) {
+    const std::shared_ptr<parquet::FileMetaData> metadata = file_->metadata();
+    // parquet-mr 1.2.8 and earlier left a dictionary page's header out of a
+    // column chunk's size, and Arrow reads up to 100 bytes past such a chunk.
+    short_chunks_ = metadata->writer_version().VersionLt(parquet::ApplicationVersion::PARQUET_816_FIXED_VERSION());
+    // parquet-cpp before Arrow 3.0.0 marked the data pages v2 it compressed
+    // as uncompressed, and Arrow decompresses them all the same.
+    always_compressed_ =
+        metadata->writer_version().VersionLt(parquet::ApplicationVersion::PARQUET_CPP_10353_FIXED_VERSION());
+  }
 
   void Close() override { file_->Close(); }
   std::shared_ptr<parquet::RowGroupReader> GetRowGroup(int i) override {
-    return std::make_shared<parquet::RowGroupReader>(
-        std::make_unique<WatchedRowGroup>(file_->GetRowGroup(i), properties_, chunks_));
+    return std::make_shared<parquet::RowGroupReader>(std::make_unique<WatchedRowGroup>(
+        file_->GetRowGroup(i), properties_, chunks_, input_, size_, short_chunks_, always_compressed_));
   }
   std::shared_ptr<parquet::FileMetaData> metadata() const override { return file_->metadata(); }
   std::shared_ptr<parquet::PageIndexReader> GetPageIndexReader() override { return file_->GetPageIndexReader(); }
@@ -561,19 +693,26 @@ class WatchedFile final : public parquet::ParquetFileReader::Contents {
   std::unique_ptr<parquet::ParquetFileReader::Contents> file_;
   parquet::ReaderProperties properties_;
   std::vector<DictionaryChunk>& chunks_;
+  std::shared_ptr<arrow::io::RandomAccessFile> input_;
+  int64_t size_;
+  bool short_chunks_ = false;
+  bool always_compressed_ = false;
 };
 
 // The file at `path`, opened as open_raw opens it, reading the pages of each
-// leaf that `chunks` watches through WatchedPages.
+// leaf through WatchedPages.
 std::unique_ptr<parquet::ParquetFileReader> open_watched(const std::string& path,
                                                          const std::shared_ptr<arrow::io::RandomAccessFile>& input,
                                                          std::shared_ptr<parquet::FileMetaData> metadata,
                                                          std::vector<DictionaryChunk>& chunks) {
   try {
     const parquet::ReaderProperties properties = buffered_properties();
+    auto size = input->GetSize();
+    if (!size.ok()) throw Error(path + ": " + size.status().ToString());
     auto file = std::make_unique<parquet::ParquetFileReader>();
     file->Open(std::make_unique<WatchedFile>(
-        parquet::ParquetFileReader::Contents::Open(input, properties, std::move(metadata)), properties, chunks));
+        parquet::ParquetFileReader::Contents::Open(input, properties, std::move(metadata)), properties, chunks, input,
+        *size));
     return file;
   } catch (const parquet::ParquetException& e) {
     throw Error(path + ": " + e.what());
@@ -1164,6 +1303,7 @@ class ParquetSource::Reader final : public TaskReader {
     const std::string where = file.path + ": failed to read row group " + std::to_string(task.row_group);
     if (!stream.ok()) throw Error(where + ": " + stream.status().ToString());
     bool emitted = false;
+    int64_t rows = 0;
     for (;;) {
       std::shared_ptr<arrow::RecordBatch> batch;
       const auto status = (*stream)->ReadNext(&batch);
@@ -1171,6 +1311,7 @@ class ParquetSource::Reader final : public TaskReader {
         throw Error(where + ": " + undecodable_column(file, task.row_group, *(*stream)->schema()) + status.ToString());
       }
       if (!batch) break;
+      rows += batch->num_rows();
       std::size_t leaf = 0;
       for (int i = 0; i < batch->num_columns(); ++i) {
         const std::string& name = batch->schema()->field(i)->name();
@@ -1178,6 +1319,13 @@ class ParquetSource::Reader final : public TaskReader {
       }
       emitted = true;
       consume(batch_from_arrow(*batch));
+    }
+    // Arrow's reader stops at the rows the footer states, and ends the row
+    // group early when the pages of a column read hold fewer.
+    const int64_t stated = file.metadata->RowGroup(task.row_group)->num_rows();
+    if (rows != stated) {
+      throw Error(where + ": the columns read hold " + std::to_string(rows) + " rows where the footer states " +
+                  std::to_string(stated));
     }
     if (!emitted) {
       auto empty = arrow::RecordBatch::MakeEmpty((*stream)->schema());
