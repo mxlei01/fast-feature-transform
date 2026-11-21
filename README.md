@@ -94,9 +94,10 @@ make cpp-sanitize  # the C++ tests under AddressSanitizer and UndefinedBehaviorS
   (a bare `3.14` can pick the free-threaded build). Any warning fails the tests.
 - **Arrow** builds through vcpkg into `~/.cache/fast-feature-transform/` (about 3 GB), outside the repository; set
   `FFT_DEPS_DIR` to move it. Deleting it is safe: the next `make vcpkg` rebuilds it. On macOS, `make vcpkg` uses
-  Homebrew to install `bison` and `pkg-config`, which Arrow's build needs. The triplets in `triplets/` are vcpkg's own
-  plus two settings: Parquet encryption is off, which keeps OpenSSL out of the extension, and macOS builds target macOS
-  26. Changing a triplet rebuilds every dependency.
+  Homebrew to install `bison` and `pkg-config`, which Arrow's build needs. vcpkg builds everything with the CMake and
+  ninja that its pinned checkout names, which it downloads, and not with the machine's. The triplets in `triplets/`
+  are vcpkg's own plus two settings: Parquet encryption is off, which keeps OpenSSL out of the extension, and macOS
+  builds target macOS 26. Changing a triplet rebuilds every dependency.
 - **The extension** links its own static Arrow and keeps it private, so it can share a process with pyarrow. It exports
   only the Python module initialization function on Linux and macOS.
 
