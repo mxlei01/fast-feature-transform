@@ -228,6 +228,316 @@ def test_an_interrupt_removes_the_temporary_directory_and_any_output(
     assert (tmp_path / "part-00000.parquet").read_bytes() == b"rows"
 
 
+# Each batch call that makes its own temporary directory runs once with Path
+# in its module replaced, so that the call raises the exception the test
+# names where it turns the first path the engine returned into a Path: the
+# engine has then written all of its output. From the second os.unlink after
+# that on, as many os.unlink calls as the test names raise KeyboardInterrupt
+# in place of removing their file, as Ctrl-C presses that land in the
+# removal do, numbered from 1 in their message. For each call the child
+# prints the files the directory held when the call raised, the lines of the
+# traceback of the exception that reached the caller that name an exception
+# or link two, whether an object in the caller's frame was freed once that
+# exception was dropped, with the garbage collector off so that a reference
+# cycle keeps it, and what is left in the temporary parent, which it then
+# empties. An interrupt that escaped a test would end the whole session, so
+# the calls run in a child process.
+_INTERRUPTED_CALLS_CHILD: str = """
+import gc
+import json
+import os
+import shutil
+import sys
+import tempfile
+import traceback
+import weakref
+from pathlib import Path
+
+import fast_feature_transform.pipeline
+import fast_feature_transform.transformers
+from fast_feature_transform import EngineError, Pipeline, Select, parquet_to_memmap
+
+source, parent, first, interrupts = sys.argv[1:]
+tempfile.tempdir = parent
+first_error = {"KeyboardInterrupt": KeyboardInterrupt, "EngineError": EngineError, "SystemExit": SystemExit}[first]
+interrupted_unlinks = range(2, 2 + int(interrupts))
+modules = (fast_feature_transform.pipeline, fast_feature_transform.transformers)
+real_path, real_unlink = Path, os.unlink
+held = []
+unlinks = [0]
+
+
+def output_path(*args):
+    path = real_path(*args)
+    if path.parent.name.startswith("fast_feature_transform_"):
+        held.extend(sorted(os.listdir(path.parent)))
+        raise first_error("after the output")
+    return path
+
+
+def unlink(path, *, dir_fd=None):
+    if held:
+        unlinks[0] += 1
+        if unlinks[0] in interrupted_unlinks:
+            raise KeyboardInterrupt(f"interrupt {unlinks[0] - 1} in the removal")
+    real_unlink(path, dir_fd=dir_fd)
+
+
+def printed(error):
+    text = "".join(traceback.format_exception(error))
+    return [line for line in text.splitlines() if line[:1].strip() and not line.startswith("Traceback")]
+
+
+class Local:
+    pass
+
+
+def caller(call, local):
+    in_the_frame = Local()
+    local.append(weakref.ref(in_the_frame))
+    call()
+
+
+gc.disable()
+pipeline = Pipeline([("select", Select(columns=["x"]))]).fit([source])
+selected = Select(columns=["x"]).fit([source])
+calls = {
+    "Pipeline.transform_parquet": lambda: pipeline.transform_parquet([source]),
+    "Pipeline.transform": lambda: pipeline.transform([source]),
+    "Pipeline.fit_transform": lambda: Pipeline([("select", Select(columns=["x"]))]).fit_transform([source]),
+    "Transformer.transform_parquet": lambda: selected.transform_parquet([source]),
+    "Transformer.transform": lambda: selected.transform([source]),
+    "parquet_to_memmap": lambda: parquet_to_memmap([source]),
+}
+results = {}
+for name, call in calls.items():
+    held.clear()
+    unlinks[0] = 0
+    raised = None
+    local = []
+    for module in modules:
+        module.Path = output_path
+    os.unlink = unlink
+    try:
+        caller(call, local)
+    except (KeyboardInterrupt, EngineError, SystemExit) as error:
+        raised = printed(error)
+    finally:
+        os.unlink = real_unlink
+        for module in modules:
+            module.Path = real_path
+    results[name] = [held[:], raised, local[0]() is None, sorted(os.listdir(parent))]
+    for entry in os.listdir(parent):
+        shutil.rmtree(os.path.join(parent, entry))
+print(json.dumps(results))
+"""
+
+
+def _interrupted_batch_calls(tmp_path: Path, first: str, interrupts: int) -> dict[str, list[Any]]:
+    source: Path = tmp_path / "numbers.parquet"
+    pq.write_table(pa.table({"x": [1.0, 2.0, 3.0]}), source, row_group_size=1)
+    parent: Path = tmp_path / "temporary"
+    parent.mkdir()
+    arguments: list[str] = [str(source), str(parent), first, str(interrupts)]
+    command: list[str] = [sys.executable, "-c", _INTERRUPTED_CALLS_CHILD, *arguments]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=60, check=False)  # nosec B603
+    assert child.returncode == 0, child.stderr
+    return json.loads(child.stdout)
+
+
+# What each call's directory held when the call raised.
+_PARTS: list[str] = ["part-00000.parquet", "part-00001.parquet", "part-00002.parquet"]
+_HELD: dict[str, list[str]] = {
+    "Pipeline.transform_parquet": _PARTS,
+    "Pipeline.transform": _PARTS,
+    "Pipeline.fit_transform": _PARTS,
+    "Transformer.transform_parquet": _PARTS,
+    "Transformer.transform": _PARTS,
+    "parquet_to_memmap": ["data.mmap", "index.json"],
+}
+
+
+def _removed_after_the_output(raised: list[str]) -> dict[str, list[Any]]:
+    # For each call: what its directory held when the call raised, the
+    # traceback lines the test names, the caller's frame freed without the
+    # garbage collector, and the empty temporary parent.
+    return {name: [held, raised, True, []] for name, held in _HELD.items()}
+
+
+def test_an_interrupt_after_a_batch_call_wrote_its_output_removes_the_directory_with_the_output(
+    tmp_path: Path,
+) -> None:
+    # A batch call given no output_dir removes the temporary directory it
+    # made, with all the output the engine wrote, when an interrupt keeps it
+    # from returning the paths: the caller never learns where they are. A
+    # call that removed only an empty directory would leave every file here.
+    raised: list[str] = ["KeyboardInterrupt: after the output"]
+    assert _interrupted_batch_calls(tmp_path, "KeyboardInterrupt", 0) == _removed_after_the_output(raised)
+
+
+@pytest.mark.parametrize(
+    ("first", "raised"),
+    [
+        ("KeyboardInterrupt", ["KeyboardInterrupt: after the output"]),
+        (
+            "EngineError",
+            [
+                "fast_feature_transform._core.EngineError: after the output",
+                "During handling of the above exception, another exception occurred:",
+                "KeyboardInterrupt: interrupt 1 in the removal",
+            ],
+        ),
+        (
+            "SystemExit",
+            [
+                "SystemExit: after the output",
+                "During handling of the above exception, another exception occurred:",
+                "KeyboardInterrupt: interrupt 1 in the removal",
+            ],
+        ),
+    ],
+    ids=["KeyboardInterrupt", "EngineError", "SystemExit"],
+)
+def test_interrupts_that_land_in_the_removal_start_it_over_and_the_call_raises_an_interrupt(
+    first: str, raised: list[str], tmp_path: Path
+) -> None:
+    # REGRESSION: a KeyboardInterrupt that lands in the removal of the
+    # temporary directory starts the removal over, however often one lands.
+    # The call then raises the interrupt that made it remove the directory,
+    # or, when an exception that is not an interrupt made it, the first
+    # interrupt that landed, with that exception as its context, so that
+    # code that catches the exception does not lose a Ctrl-C. That holds for
+    # an EngineError and for a SystemExit, which is not an Exception. The
+    # exception that reaches the caller does not keep the caller's frames
+    # alive once the caller drops it. A second Ctrl-C during the removal used
+    # to stop it with the rest of the output left. Ten interrupts in a row
+    # need eleven attempts, so a removal that gives up after ten attempts or
+    # fewer leaves files here.
+    assert _interrupted_batch_calls(tmp_path, first, 10) == _removed_after_the_output(raised)
+
+
+# The pipeline writes one part per row group of a file of 512 rows in 512 row
+# groups, and the call raises KeyboardInterrupt where Path in its module
+# turns the first part's path into a Path. A watcher thread then sends a real
+# SIGINT as soon as the directory loses a file, which is the removal running,
+# and a wrapper around shutil.rmtree records an interrupt that passes through
+# it. On a loaded machine the signal can land after the removal, so the child
+# makes up to three attempts and stops at the first whose signal landed in
+# the removal or that left something. For each attempt it prints whether the
+# signal landed in the removal, the message of the exception that reached the
+# caller, and the number of files in each directory left in the temporary
+# parent.
+_SECOND_INTERRUPT_CHILD: str = """
+import json
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import fast_feature_transform.pipeline
+from fast_feature_transform import Pipeline, Select
+
+source, parent = sys.argv[1:]
+tempfile.tempdir = parent
+# Python leaves SIGINT ignored in a process that starts with it ignored, as
+# a background job of a shell script does; this installs the handler that
+# Python installs otherwise.
+signal.signal(signal.SIGINT, signal.default_int_handler)
+# The standard build passes the GIL from thread to thread every 0.1 ms here
+# rather than every 5 ms, so the watcher sees the removal start in time.
+sys.setswitchinterval(0.0001)
+real_path, real_rmtree = Path, shutil.rmtree
+pipeline = Pipeline([("select", Select(columns=["x"]))]).fit([source], threads=1)
+
+
+def attempt():
+    written = []
+    landed = []
+    raised_first = threading.Event()
+    done = threading.Event()
+
+    def output_path(*args):
+        path = real_path(*args)
+        written.extend([path.parent, len(os.listdir(path.parent))])
+        raised_first.set()
+        raise KeyboardInterrupt("first")
+
+    def rmtree(*args, **kwargs):
+        try:
+            real_rmtree(*args, **kwargs)
+        except KeyboardInterrupt:
+            landed.append(True)
+            raise
+
+    def watch():
+        raised_first.wait()
+        while written and not done.is_set():
+            try:
+                if len(os.listdir(written[0])) < written[1]:
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+            except FileNotFoundError:
+                return
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    raised = None
+    try:
+        fast_feature_transform.pipeline.Path = output_path
+        shutil.rmtree = rmtree
+        try:
+            pipeline.transform_parquet([source])
+        except KeyboardInterrupt as error:
+            raised = str(error)
+        finally:
+            shutil.rmtree = real_rmtree
+            fast_feature_transform.pipeline.Path = real_path
+        done.set()
+        raised_first.set()
+        watcher.join()
+        # A signal sent just before the call raised lands here at the latest.
+        time.sleep(0.05)
+    except KeyboardInterrupt:
+        done.set()
+        raised_first.set()
+        watcher.join()
+    left = {name: len(os.listdir(os.path.join(parent, name))) for name in os.listdir(parent)}
+    return {"landed": bool(landed), "raised": raised, "left": left}
+
+
+attempts = [attempt()]
+while len(attempts) < 3 and not attempts[-1]["landed"] and not attempts[-1]["left"]:
+    attempts.append(attempt())
+print(json.dumps(attempts))
+"""
+
+
+def test_a_second_ctrl_c_during_the_removal_of_the_temporary_directory_leaves_nothing(tmp_path: Path) -> None:
+    # REGRESSION: a SIGINT that lands while a batch call removes its
+    # temporary directory starts the removal over, and the call raises the
+    # first interrupt once the directory is gone. It used to stop the
+    # removal with most of the 512 parts left.
+    source: Path = tmp_path / "rows.parquet"
+    pq.write_table(pa.table({"x": [float(row) for row in range(512)]}), source, row_group_size=1)
+    parent: Path = tmp_path / "temporary"
+    parent.mkdir()
+    command: list[str] = [sys.executable, "-c", _SECOND_INTERRUPT_CHILD, str(source), str(parent)]
+    child = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, timeout=120, check=False)  # nosec B603
+    assert child.returncode == 0, child.stderr
+    attempts: list[dict[str, Any]] = json.loads(child.stdout)
+    # Nothing is left, whether the signal landed in the removal or after it.
+    assert [attempt["left"] for attempt in attempts] == [{}] * len(attempts)
+    if not attempts[-1]["landed"]:
+        # A loaded machine can deliver the signal after the removal in all
+        # three attempts. That shows nothing about the removal.
+        pytest.skip("the second interrupt landed outside the removal in all three attempts")
+    assert attempts[-1]["raised"] == "first"
+
+
 class _PathLike:
     """An os.PathLike that is not a pathlib.Path, so str() of it is not its path."""
 
