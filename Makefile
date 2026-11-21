@@ -14,6 +14,10 @@ VCPKG_INSTALLED_DIR := $(FFT_DEPS_DIR)/vcpkg_installed
 # exact version. CMakeLists.txt pins the header-only libraries and Catch2 by
 # hash, and pyproject.toml pins nanobind with the other build requirements.
 VCPKG_COMMIT := 61d7eaeb094a6acbc23d9c2e54de9208175fda47
+# vcpkg builds its ports with the CMake and ninja that this checkout names
+# (scripts/vcpkg-tools.json), not with the machine's: a newer CMake on the
+# machine can fail to configure a port that the named one configures.
+VCPKG_INSTALL := VCPKG_FORCE_DOWNLOADED_BINARIES=1 "$(VCPKG_ROOT)/vcpkg" install
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_S),Darwin)
@@ -135,4 +139,4 @@ vcpkg:  ## one-time C++ dependency setup into $(FFT_DEPS_DIR): pinned vcpkg chec
 	git -C "$(VCPKG_ROOT)" fetch --depth 1 origin $(VCPKG_COMMIT)
 	git -C "$(VCPKG_ROOT)" checkout --quiet $(VCPKG_COMMIT)
 	"$(VCPKG_ROOT)/bootstrap-vcpkg.sh" -disableMetrics
-	"$(VCPKG_ROOT)/vcpkg" install --triplet $(VCPKG_TRIPLET) --x-install-root="$(VCPKG_INSTALLED_DIR)"
+	$(VCPKG_INSTALL) --triplet $(VCPKG_TRIPLET) --x-install-root="$(VCPKG_INSTALLED_DIR)"
