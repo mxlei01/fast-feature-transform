@@ -454,7 +454,7 @@ class Transformer:
         # pipeline step first, so a thread that used it before it was marked
         # standalone was refused, and a copy taken then was unfitted.
         stage: str = type(self).__name__.lower()
-        plan: str = json.dumps(Pipeline([(stage, self)])._to_tree())
+        plan: str = json.dumps(Pipeline([(stage, self)])._to_tree({}))
         self._bind(_fit_engine(threads, temp_dir).fit(plan, _source_paths(X)), stage, standalone=True)
         return self
 
