@@ -249,6 +249,103 @@ TEST_CASE("spline sparse outputs preserve record bits at knots and extrapolation
   }
 }
 
+TEST_CASE("spline_transform extrapolates only the boundary functions sklearn carries over") {
+  // 'constant' and 'linear' set only the first `degree` basis functions below
+  // the knots and the last `degree` above them, one more under 'linear' at
+  // degree 0 and 1. At degree 0, and where quantile knots repeat the minimum,
+  // the boundary basis or its slope can be non-zero past that reach, and
+  // those entries are dropped. Every expected row is the output of
+  // scikit-learn 1.9.0's SplineTransformer for the same fit, parameters and
+  // value, compared bit for bit in every generated column, on both paths.
+  struct Case {
+    std::vector<double> fit;
+    int degree;
+    const char* knots;
+    const char* extrapolation;
+    bool include_bias;
+    double value;
+    std::vector<double> expected;
+  };
+  const std::vector<double> even{0.0, 1.0, 2.0, 3.0, 4.0};  // knots 0, 1, 2, 3, 4
+  std::vector<double> lopsided(10, 0.0);                    // quantile knots 0, 0, 0, 0, 4
+  lopsided.push_back(4.0);
+  const std::vector<double> five_low{0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0};  // quantile knots 0, 0, 0, 2, 4
+  const std::vector<double> lopsided_held{0.0, 0.0, 0.0, 0.0, 0.25, 0.5833333333333333, 0.16666666666666666};
+  const std::vector<double> lopsided_above{0.0, 0.0, 0.0, 0.0, 0.0625, 0.6458333333333333, 0.29166666666666663};
+  const std::vector<Case> cases{
+      {even, 0, "uniform", "constant", true, -1.0, {0.0, 0.0, 0.0, 0.0}},
+      {even, 0, "uniform", "linear", true, -1.0, {1.0, 0.0, 0.0, 0.0}},
+      {even, 0, "uniform", "linear", true, 5.0, {0.0, 0.0, 0.0, 1.0}},
+      {lopsided, 0, "quantile", "constant", true, -1.0, {0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 0, "quantile", "linear", true, -1.0, {0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 1, "quantile", "constant", true, -1.0, {0.0, 0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 1, "quantile", "linear", true, -1.0, {0.0, 0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 1, "quantile", "linear", true, 5.0, {0.0, 0.0, 0.0, -0.25, 1.25}},
+      {lopsided, 3, "quantile", "constant", true, -1.0, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 3, "quantile", "constant", true, 5.0, lopsided_held},
+      {lopsided, 3, "quantile", "linear", true, -1.0, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}},
+      {lopsided, 3, "quantile", "linear", true, 5.0, lopsided_above},
+      {five_low, 3, "quantile", "constant", true, -1.0, {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0}},
+      {five_low, 3, "quantile", "linear", true, -1.0, {0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0}},
+      {five_low, 3, "quantile", "linear", false, 5.0, {0.0, 0.0, 0.0, 0.0, -0.08333333333333334, 0.6666666666666666}},
+  };
+  const fft::Schema schema{{{"x", "f64"}}};
+  const auto spline = [&](const std::vector<double>& fit, int degree, const char* knots, const char* extrapolation,
+                          bool include_bias) {
+    return fitted("spline_transform",
+                  {{"columns", {"x"}},
+                   {"n_knots", 5},
+                   {"degree", degree},
+                   {"knots", knots},
+                   {"extrapolation", extrapolation},
+                   {"include_bias", include_bias}},
+                  schema, {make_batch({"x"}, {f64_column(fit)})});
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.fit, c.degree, c.knots, c.extrapolation, c.include_bias, c.value);
+    auto kernel = spline(c.fit, c.degree, c.knots, c.extrapolation, c.include_bias);
+    const fft::Batch out = kernel->transform(make_batch({"x"}, {f64_column({c.value})}));
+    const fft::Row row = kernel->transform_row({{"x", c.value}});
+    REQUIRE(out.cols.size() == c.expected.size());
+    REQUIRE(row.size() == c.expected.size());
+    for (std::size_t j = 0; j < c.expected.size(); ++j) {
+      CAPTURE(j);
+      const auto& column = static_cast<const arrow::DoubleArray&>(*out.cols[j]);
+      REQUIRE(std::bit_cast<uint64_t>(column.Value(0)) == std::bit_cast<uint64_t>(c.expected[j]));
+      REQUIRE(row[j].first == out.names[j]);
+      REQUIRE(std::bit_cast<uint64_t>(std::get<double>(row[j].second)) == std::bit_cast<uint64_t>(c.expected[j]));
+    }
+  }
+
+  // At degree 0, 'constant' carries nothing over above the knots either, so
+  // a value there is all zeros, as below them. scikit-learn 1.9.0 raises a
+  // ValueError for it instead (its slice of the last `degree` columns is
+  // empty), so these zeros are this package's own answer, kept so that a
+  // saved pipeline keeps answering as it did.
+  auto above = spline(even, 0, "uniform", "constant", true);
+  const fft::Batch above_out = above->transform(make_batch({"x"}, {f64_column({5.0})}));
+  const fft::Row above_row = above->transform_row({{"x", 5.0}});
+  REQUIRE(above_out.cols.size() == 4);
+  for (std::size_t j = 0; j < 4; ++j) {
+    CAPTURE(j);
+    REQUIRE(std::bit_cast<uint64_t>(static_cast<const arrow::DoubleArray&>(*above_out.cols[j]).Value(0)) == 0U);
+    REQUIRE(std::bit_cast<uint64_t>(std::get<double>(above_row[j].second)) == 0U);
+  }
+
+  // 'linear' at degree 0 continues the first basis function along its slope,
+  // which is 0. When the distance below the knots overflows to -inf, that is
+  // 0 times infinity: scikit-learn 1.9.0 writes NaN, and a generated value
+  // that is not finite is an error here.
+  auto far =
+      fitted("spline_transform", {{"columns", {"x"}}, {"n_knots", 3}, {"degree", 0}, {"extrapolation", "linear"}},
+             schema, {make_batch({"x"}, {f64_column({1e306, 3e306, 8e306})})});
+  const double lowest = std::numeric_limits<double>::lowest();
+  REQUIRE_THROWS_WITH(far->transform(make_batch({"x"}, {f64_column({lowest})})),
+                      Equals("expand: column 'x_sp_0' generates the value nan, which is not finite"));
+  REQUIRE_THROWS_WITH(far->transform_row({{"x", lowest}}),
+                      Equals("expand: column 'x_sp_0' generates the value nan, which is not finite"));
+}
+
 TEST_CASE("spline_transform finds a value's knot interval alike in its scan and its search") {
   // At degree 0 each output column is the indicator of one knot interval, so
   // the output shows the interval found: the one that starts at the last knot
@@ -1089,40 +1186,4 @@ TEST_CASE("polynomial_features refuses interaction_only ranges that generate no 
       "polynomial_features",
       {{"columns", {"a", "b"}}, {"degree", {3, 4}}, {"interaction_only", true}, {"include_bias", true}});
   REQUIRE(bias_only->outputs == std::vector<std::string>{"1"});
-}
-
-TEST_CASE("spline_transform extrapolates degree 0 and tied boundary knots faithfully") {
-  const fft::Schema schema{{{"x", "f64"}}};
-
-  // degree=0 with extrapolation="constant" holds the boundary basis functions.
-  auto zero_const =
-      fitted("spline_transform", {{"columns", {"x"}}, {"n_knots", 5}, {"degree", 0}, {"extrapolation", "constant"}},
-             schema, {make_batch({"x"}, {f64_column({0.0, 1.0, 2.0, 3.0, 4.0})})});
-  const fft::Batch zero_out = zero_const->transform(make_batch({"x"}, {f64_column({-1.0, 0.0, 4.0, 5.0})}));
-  REQUIRE(column_of(zero_out, "x_sp_0") == std::vector<double>{1.0, 1.0, 0.0, 0.0});
-  REQUIRE(column_of(zero_out, "x_sp_1") == std::vector<double>{0.0, 0.0, 0.0, 0.0});
-  REQUIRE(column_of(zero_out, "x_sp_2") == std::vector<double>{0.0, 0.0, 0.0, 0.0});
-  REQUIRE(column_of(zero_out, "x_sp_3") == std::vector<double>{0.0, 0.0, 1.0, 1.0});
-  auto low_row = zero_const->transform_row({{"x", -1.0}});
-  REQUIRE(std::get<double>(*fft::row_find(low_row, "x_sp_0")) == 1.0);
-  auto high_row = zero_const->transform_row({{"x", 5.0}});
-  REQUIRE(std::get<double>(*fft::row_find(high_row, "x_sp_3")) == 1.0);
-
-  // Quantile knots [0, 0, 0, 0, 4] at degree=3 place the non-zero boundary
-  // basis function at index 3 (>= degree) with slope -3/4.
-  std::vector<double> skewed(10, 0.0);
-  skewed.push_back(4.0);
-  for (const std::string mode : {"constant", "linear"}) {
-    CAPTURE(mode);
-    auto tied =
-        fitted("spline_transform",
-               {{"columns", {"x"}}, {"n_knots", 5}, {"degree", 3}, {"knots", "quantile"}, {"extrapolation", mode}},
-               schema, {make_batch({"x"}, {f64_column(skewed)})});
-    const fft::Batch out = tied->transform(make_batch({"x"}, {f64_column({-1.0, 0.0})}));
-    const double expected_extrap = mode == "constant" ? 1.0 : 1.0 + (-1.0) * (-0.75);
-    REQUIRE(column_of(out, "x_sp_3")[0] == Catch::Approx(expected_extrap));
-    REQUIRE(column_of(out, "x_sp_3")[1] == Catch::Approx(1.0));
-    auto row = tied->transform_row({{"x", -1.0}});
-    REQUIRE(std::get<double>(*fft::row_find(row, "x_sp_3")) == Catch::Approx(expected_extrap));
-  }
 }

@@ -1022,27 +1022,26 @@ class SplineTransform final : public Kernel {
       (void)basis_at(spline.knots, degree, value, false, 0, out, scratch);
       return;
     }
+    // Outside the knots, 'constant' and 'linear' set only the first `degree`
+    // basis functions below the knots and the last `degree` above them (one
+    // more under 'linear' at degree 0 and 1), and every other column is 0,
+    // because sklearn's transform does so. The boundary basis or its slope can
+    // be non-zero beyond that reach, at degree 0 and where knots repeat the
+    // minimum, and sklearn drops those entries all the same. At degree 0,
+    // 'constant' therefore writes zeros on both sides; above the knots,
+    // sklearn raises instead when n_knots is 3 or more.
     std::fill(out.begin(), out.end(), 0.0);
-    const auto& boundary = value < low ? spline.low_values : spline.high_values;
+    const std::size_t reach = extrapolation_ == Extrapolation::Linear && degree <= 1 ? degree + 1 : degree;
+    const std::size_t first = value < low ? 0 : width - reach;
+    const std::vector<double>& boundary = value < low ? spline.low_values : spline.high_values;
     if (extrapolation_ == Extrapolation::Constant) {
-      // Copy every boundary basis function: at degree 0 (where degree is 0)
-      // and at tied boundary knots, non-zero entries sit outside the first or
-      // last `degree` positions.
-      std::copy_n(boundary.data(), width, out.data());
+      std::copy_n(boundary.data() + first, reach, out.data() + first);
       return;
     }
-    // 'linear': continue every boundary basis function along its own slope.
-    // Skip zero slopes so a far value whose delta overflows does not multiply
-    // infinity by zero.
-    const auto& slopes = value < low ? spline.low_slopes : spline.high_slopes;
+    // 'linear' continues each of them along its own slope at the boundary.
+    const std::vector<double>& slopes = value < low ? spline.low_slopes : spline.high_slopes;
     const double delta = value < low ? value - low : value - high;
-    for (std::size_t j = 0; j < width; ++j) {
-      if (slopes[j] != 0.0) {
-        out[j] = boundary[j] + delta * slopes[j];
-      } else if (boundary[j] != 0.0) {
-        out[j] = boundary[j];
-      }
-    }
+    for (std::size_t j = first; j < first + reach; ++j) out[j] = boundary[j] + delta * slopes[j];
   }
 
   bool expanded(const std::string& name) const { return is_expanded(columns_, name); }

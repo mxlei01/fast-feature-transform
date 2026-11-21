@@ -593,6 +593,42 @@
         9.0
       ]
     },
+    "expand-single-below": {
+      "price": [
+        -4.0,
+        0.5,
+        0.7,
+        3.0,
+        -1.0,
+        8.1,
+        0.0,
+        6.3
+      ]
+    },
+    "expand-low-ties": {
+      "price": [
+        1.0,
+        3.0,
+        1.0,
+        1.0,
+        5.0,
+        1.0,
+        2.0,
+        1.0
+      ]
+    },
+    "expand-low-ties-wide": {
+      "price": [
+        -3.0,
+        0.5,
+        1.0,
+        4.0,
+        5.0,
+        7.0,
+        -0.25,
+        12.0
+      ]
+    },
     "expand-ties": {
       "price": [
         1.0,
@@ -6412,6 +6448,442 @@
           0.4054054054054055,
           0.0,
           1.4864864864864868
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-constant-degree-0",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "constant",
+        "degree": 0
+      },
+      "fit": "expand-single",
+      "transform": "expand-single-below",
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-linear-degree-0-low-ties",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "linear",
+        "degree": 0,
+        "knots": "quantile"
+      },
+      "fit": "expand-low-ties",
+      "transform": "expand-low-ties-wide",
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          1.0,
+          1.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-constant-degree-1-low-ties",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "constant",
+        "degree": 1,
+        "knots": "quantile"
+      },
+      "fit": "expand-low-ties",
+      "transform": "expand-low-ties-wide",
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          0.0,
+          0.36363636363636365,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_4": [
+          0.0,
+          0.0,
+          0.0,
+          0.6363636363636364,
+          1.0,
+          1.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-linear-degree-1-low-ties",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "linear",
+        "degree": 1,
+        "knots": "quantile"
+      },
+      "fit": "expand-low-ties",
+      "transform": "expand-low-ties-wide",
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          0.0,
+          0.36363636363636365,
+          0.0,
+          -0.7272727272727273,
+          0.0,
+          -2.5454545454545454
+        ],
+        "price_sp_4": [
+          0.0,
+          0.0,
+          0.0,
+          0.6363636363636364,
+          1.0,
+          1.7272727272727273,
+          0.0,
+          3.5454545454545454
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-constant-low-ties",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "constant",
+        "knots": "quantile",
+        "n_knots": 7
+      },
+      "fit": "expand-low-ties",
+      "transform": "expand-low-ties-wide",
+      "tolerance": 5e-13,
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_4": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_5": [
+          0.0,
+          0.0,
+          0.0,
+          0.0346153846153846,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_6": [
+          0.0,
+          0.0,
+          0.0,
+          0.5164156356464048,
+          0.19696969696969696,
+          0.19696969696969696,
+          0.0,
+          0.19696969696969696
+        ],
+        "price_sp_7": [
+          0.0,
+          0.0,
+          0.0,
+          0.42294864898415196,
+          0.6363636363636364,
+          0.6363636363636364,
+          0.0,
+          0.6363636363636364
+        ],
+        "price_sp_8": [
+          0.0,
+          0.0,
+          0.0,
+          0.02602033075405857,
+          0.16666666666666666,
+          0.16666666666666666,
+          0.0,
+          0.16666666666666666
+        ]
+      }
+    },
+    {
+      "name": "spline/extrapolation-linear-low-ties",
+      "transformer": "SplineTransformer",
+      "params": {
+        "columns": [
+          "price"
+        ],
+        "extrapolation": "linear",
+        "knots": "quantile"
+      },
+      "fit": "expand-low-ties",
+      "transform": "expand-low-ties-wide",
+      "tolerance": 5e-13,
+      "expected": {
+        "price_sp_0": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_1": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_2": [
+          10.6,
+          2.2,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          4.0,
+          0.0
+        ],
+        "price_sp_3": [
+          0.0,
+          0.0,
+          0.0,
+          0.022727272727272728,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "price_sp_4": [
+          0.0,
+          0.0,
+          0.0,
+          0.4607438016528926,
+          0.2037037037037037,
+          -0.24074074074074073,
+          0.0,
+          -1.3518518518518516
+        ],
+        "price_sp_5": [
+          0.0,
+          0.0,
+          0.0,
+          0.4735787628349612,
+          0.6296296296296297,
+          0.7104377104377104,
+          0.0,
+          0.9124579124579124
+        ],
+        "price_sp_6": [
+          0.0,
+          0.0,
+          0.0,
+          0.04295016278487353,
+          0.16666666666666669,
+          0.5303030303030303,
+          0.0,
+          1.4393939393939394
         ]
       }
     },
