@@ -195,8 +195,8 @@ Publishing runs `.github/workflows/release.yaml`:
    pre-release box matches it, and the tag's commit is on `master`, with no other tag there that setuptools-scm would
    take the version from.
 2. cibuildwheel builds the six wheels, CPython 3.14 standard and free-threaded on Linux x86_64 and arm64 (in
-   manylinux_2_28 containers) and on macOS 26 arm64, and runs the test suite against each. Each run builds Arrow from
-   scratch, about 45 minutes on Linux.
+   manylinux_2_28 containers) and on macOS 26 arm64, and runs the test suite against each. Each runner builds Arrow
+   from scratch, and a wheel job usually takes 15 to 30 minutes.
 3. A check job records each file's sha256 and confirms the wheels' tags, version and license files; another job runs
    `twine check`.
 4. The wheels go to PyPI through trusted publishing: PyPI trusts this repository's `release.yaml` running in the `pypi`
@@ -206,7 +206,7 @@ Publishing runs `.github/workflows/release.yaml`:
 5. The same files are attached to the release, and the job confirms by sha256 that the release and PyPI hold exactly
    the wheels that were built.
 
-The wheels appear on the release after they reach PyPI, about an hour after publishing. The release page also lists
+The wheels appear on the release after they reach PyPI, about half an hour after publishing. The release page also lists
 GitHub's Source code zip and tar.gz, which GitHub makes from the tag when they are downloaded; they aren't uploaded
 files, and PyPI has no copy of them. Keep the repository's immutable releases off: an immutable release takes no files
 once published.
@@ -219,10 +219,11 @@ release on the same tag and commit is published before it reaches Publish to PyP
 Once Publish to PyPI has started, use Re-run failed jobs, which reuses the built wheels: Re-run all jobs builds new
 ones, and PyPI refuses a file name it already has with different contents. Finish within 14 days of the first upload,
 after which PyPI takes no new files for the version. Don't delete or unpublish the release then: publishing it again
-starts a run that rebuilds and fails at Publish to PyPI. If it happens anyway, publish the release again on the same
-tag, cancel that run, and re-run the first run's "Attach to the release and compare" job (GitHub allows re-runs for 30
-days; after that, attach the six files PyPI lists by hand). If that job finds a wheel on the release that differs from
-the build, delete that file from the release and re-run the job.
+starts a run that rebuilds, and once PyPI holds a file of the first build, that run fails at Publish to PyPI with
+nothing attached. If it happens anyway, publish the release again on the same tag, cancel that run, and use Re-run
+failed jobs on the first run, or re-run its "Attach to the release and compare" job if none failed (GitHub allows
+re-runs for 30 days; after that, attach the six files PyPI lists by hand). If that job finds a wheel on the release
+that differs from the build, delete that file from the release and re-run the job.
 
 Running the workflow by hand (Actions, Release, Run workflow) builds and checks the wheels without the release check or
 any upload, so try a release that way first.

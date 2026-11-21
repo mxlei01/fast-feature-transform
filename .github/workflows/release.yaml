@@ -108,7 +108,8 @@ jobs:
     name: Wheels (${{ matrix.os }})
     needs: release
     runs-on: ${{ matrix.os }}
-    # Each runner builds Arrow cold: about 45 minutes on Linux.
+    # Each runner builds Arrow cold. Up to the 0.0.3 release, a wheel job that
+    # passed took 16 to 28 minutes on GitHub's hosted runners, and once 50.
     timeout-minutes: 150
     permissions:
       contents: read
@@ -215,6 +216,9 @@ jobs:
         else:
             release = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?"
             assert re.fullmatch(rf"{release}(?:\.dev\d+\+g[0-9a-f]+)?", version), version
+            # 0.0.0 is the version setuptools-scm falls back to when a build
+            # has no git metadata (fallback_version in pyproject.toml).
+            assert version != "0.0.0", "0.0.0 is setuptools-scm's fallback version: the build lost the git metadata"
         # Every wheel ships the license files its metadata declares, the same
         # set in all six, including LICENSE and THIRD_PARTY_NOTICES.txt.
         shipped = set()
@@ -297,11 +301,12 @@ jobs:
                      f"nothing.\nrecorded: {recorded}\ndownloaded: {downloaded}")
         print(f"the {len(downloaded)} files the check job recorded")
         PY
-    # The build took about an hour, and this may be a re-run days later. Upload
-    # only while the release is published and its tag still names the commit
-    # this run built. The check is in this job, not one before it, because
-    # Re-run failed jobs would skip a job that passed. It runs no third-party
-    # code next to the OIDC token: only gh and Python's standard library.
+    # The release can change while the wheels build, and this can be a re-run
+    # days later. Upload only while the release is published and its tag still
+    # names the commit this run built. The check is in this job, not one
+    # before it, because Re-run failed jobs would skip a job that passed. It
+    # runs no third-party code next to the OIDC token: only gh and Python's
+    # standard library.
     - name: Check the release is still there
       env:
         GH_TOKEN: ${{ github.token }}
@@ -334,11 +339,14 @@ jobs:
                      "run uploads nothing.")
         print(f"{tag} is still a published release of {built}")
         PY
+    # No skip-existing. PyPI answers 200 to a file it already holds with the
+    # same bytes, so Re-run failed jobs completes a partial upload without it.
+    # PyPI refuses the same name with other bytes, and that refusal stops a
+    # rebuild (Re-run all jobs, or the release published again) here, before
+    # anything is attached to the release. With skip-existing, twine skips
+    # every file whose name PyPI lists, whatever its bytes, and passes over
+    # the refusal.
     - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
-      with:
-        # A re-run after a partial upload skips wheels PyPI already took; the
-        # attach job verifies every file on PyPI by sha256 against the build.
-        skip-existing: true
 
   attach:
     name: Attach to the release and compare
