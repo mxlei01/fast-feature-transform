@@ -523,10 +523,11 @@ class Transformer:
             X: A list or tuple of Parquet file paths.
             output_dir: Directory for output part files; a temporary directory
                 is created when omitted and removed with its files if the call raises.
-                Existing numbered ``part-*.parquet`` files are replaced once
-                the run starts, and a run that fails midway leaves none.
-                Each number has the width of the last part number,
-                with at least five digits.
+                Once the run starts, the files named ``part-<number>.parquet``
+                whose number has five or more digits, and the same names
+                ending in ``.tmp``, are deleted, and a run that fails midway
+                leaves none. Each part number has the width of the last part
+                number, with at least five digits.
 
         Returns:
             The paths of the part files written, one per input row group, in
