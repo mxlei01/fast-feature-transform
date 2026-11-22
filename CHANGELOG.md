@@ -1,5 +1,147 @@
 # Changelog
 
+## 0.0.4
+
+Pipelines and pickles saved by 0.0.1, 0.0.2 or 0.0.3 load in this version and answer as they do in 0.0.3, and versions
+0.0.3 and 0.0.2 load pipelines and pickles saved by this version and answer as it does, except that the version that
+runs a transform decides its answer in the cases below that changed, and 0.0.2 also in those of the 0.0.3 entry, such as
+a `Normalizer` row that 0.0.2 refuses and this version normalizes. A saved `KBinsDiscretizer` keeps its edges; only a
+new fit gets the k-means edges below. A `CountEncoder` saved by 0.0.1 or 0.0.2 that sets `min_group_name` or a
+nondefault `combine_min_nan_groups` without `min_group_size` still cannot be fitted again, with a new message (see
+Changed). Loading refuses some `KBinsDiscretizer` edge lists and `QuantileTransformer` grids that no fit writes (see
+Changed). Measurements compare the published macOS wheels of 0.0.2 and 0.0.3 with the macOS wheel that the release
+workflow builds from this version's source, for free-threaded CPython 3.14 on one thread of an Apple M4: CPU time, the
+median of 11 pairs of fresh processes unless a line says otherwise. The Linux wheels were not measured.
+
+Fixed:
+
+- A string or binary column chunk that holds a dictionary page, pages of indices and then plain pages, with an index at
+  or past the number of values its dictionary page states, raises an `EngineError` naming the column when a fit or a
+  transform reads it, at the top level and in nested columns, such as "<file>: failed to read row group 0: column 'c'
+  has a dictionary index outside its dictionary: Index 10 out of bounds". 0.0.3 raised this error only for an index that
+  also lay past the values that the plain pages read by the end of its batch had added, naming the first index past
+  them, and read the rows that hold any other such index as the values of later rows, without an error. A read takes a
+  row group in batches of at most 65,536 rows, and fewer when its rows are wide, such as 41,120 for a transform that
+  passes four string columns and an f64 column through. Such an index in a page of indices that follows a plain page and
+  ends its indices before its count of values gets the same error when a batch ends inside that page no later than its
+  indices end, and "cannot be decoded: IOError: Unexpected end of stream" otherwise, which 0.0.3 raised in both cases
+  unless its check of the batch refused the index first. The pages of indices before the chunk's first plain page are
+  checked by a second read, so a file written over in place between the two reads, damaged when first read and valid
+  when read again, still passes such an index on without the error. A file cut short in place inside those pages between
+  the two reads raises an `EngineError` naming the column, such as "has fewer pages of indices than when it was first
+  read: the file changed while it was read", where 0.0.3, which read them once, read on to the cut and raised "IOError:
+  Unexpected end of stream".
+- A page whose header states more bytes than its column chunk has left is refused before those bytes are requested.
+  0.0.3 requested the stated bytes and filled with zeros what the chunk did not hold before it refused the page: a
+  transform of a 40 KB file whose dictionary page states 300,000,000 bytes peaked at 374 MB of resident memory, against
+  74 MB for the undamaged file, where both peak at 74 to 75 MB here (three runs each).
+- A record datetime whose `utcoffset()` moves it outside the range of int64 microseconds, such as a `datetime` subclass
+  whose `utcoffset()` returns `timedelta(days=999_999_999)`, raises `EngineError` "record value for 't' is outside the
+  range of int64 microseconds"; 0.0.3 returned a wrapped, wrong integer. Offsets that keep it inside the range answer as
+  before.
+- `output_dir` and the path of `save` and `load` given as a `str` subclass whose truth test or `in` operator hides an
+  empty text or a NUL raise `ValueError` before anything is written, as a plain `str` does. 0.0.3 created the directory
+  named by the text before the NUL, read from the path cut there in `load`, and raised `EngineError` for an empty text.
+  A `temp_dir` given such a NUL raises "temp_dir must not hold a NUL character", where 0.0.3 said it "must be an
+  existing directory".
+- Assigning `Pipeline.steps` after a fit of that pipeline, or of a pipeline that holds it, has read that pipeline's
+  steps, and before that fit returns or raises, raises `RuntimeError` "Pipeline is being fitted, so its steps cannot be
+  reassigned; build a new Pipeline with the steps you want and fit that". 0.0.3 took the new steps and bound them to the
+  plan compiled from the old ones, so the pipeline listed the new steps and ran the old ones. A fit reads the steps of
+  the pipeline it fits as it starts, and those of a nested pipeline when it reaches that pipeline among the steps: an
+  assignment that lands before that read is taken, and the fit runs the new steps, as in 0.0.3. After a fit that raised,
+  an assignment is taken, as before.
+- A batch call without `output_dir`, such as `transform_parquet`, `fit_transform` or `parquet_to_memmap`, whose removal
+  of its temporary directory is hit by a `KeyboardInterrupt` starts the removal over, so the directory and its parts are
+  gone; 0.0.3 stopped the removal and left them. When the call's own exception was a `KeyboardInterrupt`, the call then
+  raises that one, with no other interrupt as its context, where 0.0.3 raised the second interrupt with the first as its
+  context; after another exception, such as an `EngineError`, it raises the first interrupt that hit the removal with
+  that exception as its context, as 0.0.3 did. An interrupt that lands between two attempts still stops the removal, as
+  in 0.0.3, and is raised with the call's own exception as its context.
+- `KBinsDiscretizer(strategy="kmeans")` no longer stops after its first center update on a column whose farthest value
+  lies 2^512 (about 1.34e154) or more from its mean, while the column's squared deviations, scaled down by a power of
+  two, sum within f64: it runs such a column to convergence, as 0.0.2 did. On the 140 columns of 10 to 100 values at one
+  scale between 1e155 and 1e300 that the 0.0.3 entry names, at 2 to 8 bins, the edges equal 0.0.2's in all 980 fits, and
+  the bins differ from 0.0.3's in 428, of which 420 equal scikit-learn 1.9.0's bins for the column scaled down by a
+  power of two and none of 0.0.3's did. `[-a, -a, a, a]` with `a = 2^600` at 4 bins gets the edges `[-a, -a, 0, a]` and
+  puts its values in bins 1 and 2, where 0.0.3 gave `[-a, 0, 1.5a]` and bins 0 and 1, and from
+  `a = 0x1.5555555555555p+1022` (about 5.99e307) it still raises, as in 0.0.3. Columns closer than 2^512 to their mean
+  keep 0.0.3's edges. Such fits take longer (see Costs more).
+
+Changed:
+
+- `Pipeline.load`, and the first use of an unpickled pipeline, raise `EngineError` for a `KBinsDiscretizer` whose edges
+  decrease where no fit lets them, or whose `strategy="uniform"` table holds neither `n_bins + 1` edges nor the two
+  equal edges of a constant column, naming the step and the column, such as "bin_edges['x'] must not decrease from its
+  first edge to its second", and for a `QuantileTransformer` whose `references` hold more points than its
+  `n_quantiles`, naming the step: "'references' holds 5 points, more than the 3 that 'n_quantiles' allows". 0.0.3
+  loaded them and answered: a uniform table of `n_bins=5` with an edge deleted gave 4 one-hot columns instead of 5. A
+  fit of `"kmeans"` can write its first edge above its second, and one of `"uniform"` its last edge below the one
+  before, and those load; so does a `"quantile"` or `"kmeans"` table with an edge deleted.
+- `KBinsDiscretizer(strategy="kmeans")` raises "fits a bin edge that is not finite; its values are too large" when the
+  edge midway between two centers overflows, as on `[-1.7e308, -1.6e308]` followed by twenty values of `9e306` at 3, 4
+  or 8 bins, which 0.0.3 binned by dropping that edge and scikit-learn 1.9.0 refuses. A `"quantile"` fit left with fewer
+  than two edges because a computed edge overflowed raises the same error, as `[-1e308, -1e308, 1e308, 1e308]` at 3 or 8
+  bins does, where 0.0.3 said the column "has no bin left" and to use `strategy='uniform'`; a column whose computed
+  edges are all finite keeps 0.0.3's text.
+- `LabelEncoder.vocab_size` of a column name that holds a lone surrogate, such as `"\ud800"`, raises `KeyError`, as for
+  any name the encoder does not hold; 0.0.3 raised the binding's `TypeError` "incompatible function arguments".
+- Messages: a page that states more bytes than its column chunk has left reads "column 'n' cannot be decoded: Invalid: a
+  page states 1048575 bytes where its column chunk has 16007 left", where 0.0.3 gave Arrow's "IOError: Unexpected end of
+  stream: Page was smaller (16007) than expected (1048575)"; a dictionary page that states more values than its bytes
+  hold, "Invalid: a dictionary page states 60 values where its 60 bytes hold at most 15", where 0.0.3 said "IOError:
+  Unexpected end of stream"; a row group whose pages hold fewer rows than its footer states, "<file>: failed to read row
+  group 0: the columns read hold 300 rows where the footer states 400", where 0.0.3 said "input task row count changed
+  while reading"; a `CountEncoder` fit without `min_group_size` names the option that needs it and the fix, as in
+  "min_group_name needs min_group_size; set min_group_size, or leave min_group_name unset" and
+  "combine_min_nan_groups=False needs min_group_size; set min_group_size, or leave combine_min_nan_groups at True",
+  where 0.0.3 said "min_group_name and nondefault combine_min_nan_groups require min_group_size"; and the refusal of an
+  extension column stored as a dictionary ends "; leave it out with a Select step".
+- For those who build or release from a checkout: `make vcpkg` builds the C++ dependencies with the CMake 4.4.3 and
+  ninja 1.13.2 that the pinned vcpkg checkout names, which vcpkg downloads, and not with a CMake or ninja found on the
+  machine, which 0.0.3's `make vcpkg` let vcpkg use.
+
+Faster:
+
+- A string column whose dictionary page fills up, so that the rest of a row group is in plain pages, and whose page ends
+  in a value over 256 bytes is read in about 0.0.2's time again: passing 12 row groups of 8,000 distinct random 300-byte
+  strings through takes 29.1 -> 24.6 ms (0.84 of 0.0.3's time, 1.01 of 0.0.2's), 8 row groups of 6,000 distinct 384-byte
+  strings 17.2 -> 15.1 ms (0.88 and 1.01), and 16 such row groups whose dictionary is in sorted order 0.95 and 1.00 of
+  the time (21 pairs each).
+- Passing a dictionary string column with nulls and many distinct values through takes 0.95 to 0.96 of 0.0.3's time and
+  still 1.01 to 1.02 of 0.0.2's: 4,000,000 rows of 20,000 values, 90% of them null, in 16 row groups, take
+  120.0 -> 115.4 ms, and 1,000,000 rows of 30,000 values with 30% null 76.4 -> 72.9 ms, where 0.0.2 takes 114.1 and
+  71.6 ms (21 pairs each).
+- A top-level `string_view` column in delta pages is converted on its buffers: passing 1,048,576 rows of 8-byte strings,
+  90% of them null, in 16 row groups, through takes 31.4 -> 26.6 ms, 0.85 of 0.0.3's time and still 1.05 of 0.0.2's,
+  which passed the column through without converting it (21 pairs).
+- `Normalizer(norm="l2")` on rows of three or more values whose sum of squares lies above 2^1023 takes less time than in
+  0.0.3, and on rows of three or four such values less than in 0.0.2: 250,000 rows of four f64 near 6.2e153 take
+  23.8 -> 14.5 ms, 0.61 of 0.0.3's time and 0.86 to 0.87 of 0.0.2's (three sessions of 21 pairs). Rows of 8, 16 and 32
+  such values take 0.62 to 0.82 of 0.0.3's time, and 0.94 to 0.96 of 0.0.2's when their squares sum near 1.5e308, as
+  those four values do, but 1.02 when they sum near 1e308 (21 pairs each). A `StandardScaler` fit of 1,000,000 values
+  near 1.2e151, whose squares sum past 2^1023 after 62% of the rows, takes 12.5 -> 9.5 ms (0.76); 0.0.2 refuses that
+  column.
+
+Costs more:
+
+- `KBinsDiscretizer(strategy="kmeans")` fits take longer. A column 2^512 or more from its mean runs its updates to
+  convergence again, in about 0.0.2's time: 1,000,000 values in 16 row groups at 8 bins take 40.1 -> 427 ms when they
+  are lognormal times 1e200, and 40.0 -> 120.9 ms when they are normal times 1e200, where 0.0.2, with the same edges,
+  takes 427 and 121.0 ms. The same lognormal values at their own scale, whose edges do not change, take 418 -> 426 ms,
+  1.02 of 0.0.3's time and 1.00 of 0.0.2's (21 pairs each).
+- Reading a string or binary column keeps a copy of the last value of each dictionary page, whatever its length, until
+  the thread that read the page reads the column's next row group or the read ends; 0.0.3 kept it only up to 256 bytes.
+  Passing through one row group of 10 strings whose dictionary page ends in a 64 MB value takes 26.9 -> 28.4 ms (21
+  pairs) and peaks at 579 -> 643 MB of resident memory, and with an 8 MB value peaks at 115 -> 123 MB; a page that ends
+  in a value of up to 256 bytes peaks as before. Each thread and each such column keeps its own copy: two such row
+  groups read on two threads peak at 1,092 -> 1,220 MB, and one row group of two such columns at 771 -> 899 MB (three
+  runs each).
+- On a million rows in 16 row groups, fitting `JamesSteinEncoder` over 1,000 categories with an integer target from
+  2^53 takes 1.02 times as long: 28.7 -> 29.1 ms (21 pairs), where 0.0.2 takes 16.2 ms.
+- Assigning two steps to `Pipeline.steps` of an unfitted pipeline takes 299 -> 563 ns, and `copy.copy` of a fitted
+  pipeline 252 -> 276 ns.
+
 ## 0.0.3
 
 Pipelines and pickles saved by 0.0.1 or 0.0.2 load in this version and answer as before; a `CountEncoder` among them
